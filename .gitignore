@@ -1,0 +1,9 @@
+/target/
+.DS_Store
+*.cctrace
+*.log
+theater/node_modules/
+theater/dist/
+/artifacts/
+/ccdb-data/
+bench/results/*.json
