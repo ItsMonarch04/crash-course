@@ -1,0 +1,20 @@
+name: Feature request
+description: Propose a scoped improvement to the laboratory.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and teaching value
+      description: What failure mode, workflow, or reader need does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed design
+      description: Mention determinism, compatibility, tests, and any needed ADR.
+    validations:
+      required: true
+

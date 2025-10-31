@@ -8,4 +8,3 @@ Please do not disclose a suspected vulnerability in a public issue before I have
 security contact and include the affected build, command, reproduction, and
 whether data loss or code execution is possible. Reproducible simulator seeds
 may be shared publicly after triage.
-
