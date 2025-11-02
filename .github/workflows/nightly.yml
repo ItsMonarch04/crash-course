@@ -1,0 +1,28 @@
+name: nightly-campaigns
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  long-campaigns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo run -p cc-swarm -- --determinism-seeds 1000
+      - run: cargo test -p cc-wal --release -- --ignored prefix_durability_campaign_1m
+      - run: cargo test -p cc-store --release -- --ignored oracle_differential_campaign_1k_x_200k
+      - run: cargo test -p cc-store --release -- --ignored corruption_campaign_has_no_silent_wrong_answers
+      - run: cargo test -p cc-sim --release -- --ignored wipe_profile_campaign_500k
+      - run: cargo test -p cc-raft --release -- --ignored message_soup_campaign_100k_schedules
+      - run: cargo run -p cc-swarm -- run --profile rough --seeds 100000 --jobs 16
+

@@ -1,0 +1,22 @@
+name: campaign-pr
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bounded-campaigns:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo test --workspace --release
+      - run: cargo run -p cc-swarm -- --determinism-seeds 100
+      - run: cargo run -p cc-swarm -- run --profile calm --seeds 1000 --jobs 2
+      - run: cargo test -p cc-wal --release -- --ignored prefix_durability_campaign_1m
+
