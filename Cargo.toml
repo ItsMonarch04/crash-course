@@ -2,10 +2,12 @@
 resolver = "3"
 members = [
     "crates/cc-core",
+    "crates/cc-env",
+    "crates/cc-sim",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false

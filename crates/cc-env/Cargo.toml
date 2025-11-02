@@ -1,0 +1,13 @@
+[package]
+name = "cc-env"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+cc-core = { path = "../cc-core" }
+
+[lints]
+workspace = true
+
