@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cc-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "allow"
+pedantic = "allow"
