@@ -4,18 +4,18 @@ version = 4
 
 [[package]]
 name = "cc-core"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "cc-env"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cc-core",
 ]
 
 [[package]]
 name = "cc-sim"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cc-core",
  "cc-env",
