@@ -1,0 +1,19 @@
+[package]
+name = "cc-swarm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+cc-checker = { path = "../cc-checker" }
+cc-core = { path = "../cc-core" }
+cc-sim = { path = "../cc-sim" }
+
+[[bin]]
+name = "cc-swarm"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
