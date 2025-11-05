@@ -12,10 +12,11 @@ members = [
     "crates/cc-resp",
     "crates/cc-checker",
     "crates/cc-swarm",
+    "crates/cc-node",
 ]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false

@@ -1,0 +1,8 @@
+[node]
+id = 1
+data_dir = "./ccdb-data/n1"
+listen_client = "127.0.0.1:7101"
+listen_peer = "127.0.0.1:7201"
+
+[storage]
+fsync = "always"

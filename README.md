@@ -47,4 +47,4 @@ AGPL-3.0-only. See [LICENSE](LICENSE).
 
 ---
 
-**Version:** v0.4.2
+**Version:** v0.5.0

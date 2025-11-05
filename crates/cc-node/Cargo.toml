@@ -1,0 +1,21 @@
+[package]
+name = "cc-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+cc-cluster = { path = "../cc-cluster" }
+cc-core = { path = "../cc-core" }
+cc-env = { path = "../cc-env" }
+cc-kv = { path = "../cc-kv" }
+cc-resp = { path = "../cc-resp" }
+cc-store = { path = "../cc-store" }
+
+[[bin]]
+name = "ccdb"
+path = "src/main.rs"
+
+[lints]
+workspace = true
