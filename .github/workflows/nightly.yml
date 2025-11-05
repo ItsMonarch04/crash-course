@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 720
     steps:
       - uses: actions/checkout@v4
+      - run: node scripts/check-version-coherence.mjs
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -25,4 +26,3 @@ jobs:
       - run: cargo test -p cc-sim --release -- --ignored wipe_profile_campaign_500k
       - run: cargo test -p cc-raft --release -- --ignored message_soup_campaign_100k_schedules
       - run: cargo run -p cc-swarm -- run --profile rough --seeds 100000 --jobs 16
-

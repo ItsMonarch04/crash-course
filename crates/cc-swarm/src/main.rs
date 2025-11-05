@@ -288,11 +288,9 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn print_help() {
-    println!(
-        concat!(
-            "cc-swarm ",
-            env!("CARGO_PKG_VERSION"),
-            "\n\nCommands:\n  run --profile rough --seeds N --jobs N\n  one --seed 0x... --profile rough [--export-json]\n  regress\n  shrink --failure PATH\n  check-history --file PATH\n  --selfcheck\n  --determinism\n  --determinism-seeds N"
-        )
-    );
+    println!(concat!(
+        "cc-swarm ",
+        env!("CARGO_PKG_VERSION"),
+        "\n\nCommands:\n  run --profile rough --seeds N --jobs N\n  one --seed 0x... --profile rough [--export-json]\n  regress\n  shrink --failure PATH\n  check-history --file PATH\n  --selfcheck\n  --determinism\n  --determinism-seeds N"
+    ));
 }

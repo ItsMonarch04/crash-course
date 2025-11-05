@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: node scripts/check-version-coherence.mjs
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -19,4 +20,3 @@ jobs:
       - run: cargo run -p cc-swarm -- --determinism-seeds 100
       - run: cargo run -p cc-swarm -- run --profile calm --seeds 1000 --jobs 2
       - run: cargo test -p cc-wal --release -- --ignored prefix_durability_campaign_1m
-
