@@ -1,0 +1,14 @@
+[package]
+name = "cc-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+cc-core = { path = "../cc-core" }
+cc-wal = { path = "../cc-wal" }
+
+[lints]
+workspace = true
+
