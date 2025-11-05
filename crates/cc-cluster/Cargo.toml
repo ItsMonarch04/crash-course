@@ -1,0 +1,18 @@
+[package]
+name = "cc-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+cc-core = { path = "../cc-core" }
+cc-env = { path = "../cc-env" }
+cc-kv = { path = "../cc-kv" }
+cc-raft = { path = "../cc-raft" }
+cc-store = { path = "../cc-store" }
+cc-wal = { path = "../cc-wal" }
+
+[lints]
+workspace = true
+

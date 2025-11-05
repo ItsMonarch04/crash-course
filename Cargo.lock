@@ -3,19 +3,54 @@
 version = 4
 
 [[package]]
+name = "cc-cluster"
+version = "0.4.0"
+dependencies = [
+ "cc-core",
+ "cc-env",
+ "cc-kv",
+ "cc-raft",
+ "cc-store",
+ "cc-wal",
+]
+
+[[package]]
 name = "cc-core"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "cc-env"
-version = "0.3.0"
+version = "0.4.0"
+dependencies = [
+ "cc-core",
+]
+
+[[package]]
+name = "cc-kv"
+version = "0.4.0"
+dependencies = [
+ "cc-core",
+ "cc-store",
+]
+
+[[package]]
+name = "cc-raft"
+version = "0.4.0"
+dependencies = [
+ "cc-core",
+ "cc-env",
+]
+
+[[package]]
+name = "cc-resp"
+version = "0.4.0"
 dependencies = [
  "cc-core",
 ]
 
 [[package]]
 name = "cc-sim"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cc-core",
  "cc-env",
@@ -23,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "cc-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cc-core",
  "cc-wal",
@@ -31,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "cc-wal"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cc-core",
 ]
