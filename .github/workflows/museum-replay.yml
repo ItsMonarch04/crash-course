@@ -1,0 +1,26 @@
+name: museum-replay
+
+on:
+  pull_request:
+    paths:
+      - "exhibits/**"
+      - "crates/cc-swarm/**"
+      - "theater/public/fixtures/**"
+  schedule:
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: node scripts/check-version-coherence.mjs
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - run: ./scripts/ci/museum-replay.sh
+      - run: cargo run -p cc-swarm -- one --seed 0x2a --profile calm --export-json

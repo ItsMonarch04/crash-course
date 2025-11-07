@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "build", "exhibits"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "build": { "type": "string", "minLength": 1 },
+    "exhibits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "kind", "seed", "trace", "verdict", "chapters"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+          "title": { "type": "string" },
+          "kind": { "enum": ["raft", "wal", "store", "membership", "checker"] },
+          "seed": { "type": "string" },
+          "trace": { "type": "string" },
+          "verdict": { "enum": ["fixed", "known-failure", "inconclusive"] },
+          "chapters": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}
