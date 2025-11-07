@@ -1,0 +1,25 @@
+name: perf-smoke
+
+on:
+  pull_request:
+    paths:
+      - "crates/cc-bench/**"
+      - "bench/**"
+      - "scripts/ci/perf-smoke.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: node scripts/check-version-coherence.mjs
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - run: ./scripts/ci/perf-smoke.sh
+      - run: test -s bench/results/perf-smoke.json

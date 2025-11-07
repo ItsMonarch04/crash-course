@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Crash Course benchmark report</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, monospace; }
+      body { background: #0d131c; color: #e6edf5; margin: 0; padding: 32px; }
+      main { max-width: 920px; margin: auto; }
+      h1 { color: #58d6b2; font-size: 22px; }
+      .card { border: 1px solid #334354; background: #131d29; padding: 20px; margin: 16px 0; }
+      canvas { width: 100%; height: 260px; border: 1px solid #263546; }
+      input { color: inherit; background: #0d131c; border: 1px solid #334354; padding: 8px; }
+      .muted { color: #9aabbd; }
+      pre { white-space: pre-wrap; line-height: 1.5; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>CRASH COURSE / BENCHMARK HONESTY VIEW</h1>
+      <p class="muted">Numbers are only meaningful with their config hash and environment caveat.</p>
+      <div class="card">
+        <label>Report JSON <input id="file" type="file" accept="application/json" /></label>
+        <pre id="summary">Choose a report JSON file.</pre>
+      </div>
+      <div class="card"><canvas id="chart" width="880" height="260" aria-label="Latency percentile chart"></canvas></div>
+    </main>
+    <script>
+      const file = document.querySelector("#file");
+      const summary = document.querySelector("#summary");
+      const canvas = document.querySelector("#chart");
+      const ctx = canvas.getContext("2d");
+      file.addEventListener("change", async () => {
+        const report = JSON.parse(await file.files[0].text());
+        summary.textContent = JSON.stringify(report, null, 2);
+        const points = [report.latency_ns.p50, report.latency_ns.p95, report.latency_ns.p99, report.latency_ns.p999, report.latency_ns.max];
+        const max = Math.max(...points, 1);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = "#58d6b2";
+        ctx.fillStyle = "#58d6b2";
+        ctx.beginPath();
+        points.forEach((point, index) => {
+          const x = 60 + index * ((canvas.width - 100) / (points.length - 1));
+          const y = canvas.height - 30 - (point / max) * (canvas.height - 70);
+          index ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+          ctx.fillText(String(point), x - 10, y - 10);
+          ctx.fillText(["p50", "p95", "p99", "p99.9", "max"][index], x - 15, canvas.height - 10);
+        });
+        ctx.stroke();
+      });
+    </script>
+  </body>
+</html>
