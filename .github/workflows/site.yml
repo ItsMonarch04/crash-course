@@ -1,0 +1,57 @@
+name: theater-site
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "theater/**"
+      - "exhibits/**"
+      - ".github/workflows/site.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: node scripts/check-version-coherence.mjs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: theater/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: theater
+      - run: cargo test -p cc-wasm
+      - run: npm run build
+        working-directory: theater
+      - run: ./scripts/ci/site-budget.sh
+      # Playwright ships no browser with the npm package, and the runner image
+      # has none it can use. Without this the whole e2e suite fails to launch,
+      # which fails `build` and so never reaches the Pages deployment below.
+      - run: npx playwright install --with-deps chromium
+        working-directory: theater
+      - run: npm run test:e2e
+        working-directory: theater
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: theater/dist
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
