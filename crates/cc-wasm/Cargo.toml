@@ -5,12 +5,17 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 cc-checker = { path = "../cc-checker" }
 cc-cluster = { path = "../cc-cluster" }
 cc-core = { path = "../cc-core" }
+cc-raft = { path = "../cc-raft" }
 cc-sim = { path = "../cc-sim" }
+cc-swarm = { path = "../cc-swarm" }
+wasm-bindgen = "0.2"
 
 [lints]
 workspace = true
-
