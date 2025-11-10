@@ -6,7 +6,8 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
 use std::path::Path;
 use std::time::Instant;
 
@@ -59,6 +60,7 @@ struct Options {
     value_bytes: usize,
     repetitions: u64,
     output: Option<String>,
+    addr: Option<String>,
 }
 
 #[derive(Debug)]
@@ -96,6 +98,7 @@ fn main() -> io::Result<()> {
                 .unwrap_or(DEFAULT_VALUE_BYTES),
             repetitions: 1,
             output: None,
+            addr: None,
         };
         let report = run(&options);
         println!("{}", report_json(&report));
@@ -103,8 +106,12 @@ fn main() -> io::Result<()> {
     }
 
     let options = parse_options(&args)?;
-    let report = run(&options);
-    let json = report_json(&report);
+    let json = if let Some(address) = options.addr.as_deref() {
+        run_remote(&options, address)?
+    } else {
+        let report = run(&options);
+        report_json(&report)
+    };
     if let Some(output) = options.output {
         if let Some(parent) = Path::new(&output).parent() {
             fs::create_dir_all(parent)?;
@@ -146,6 +153,7 @@ fn parse_options(args: &[String]) -> io::Result<Options> {
         value_bytes,
         repetitions,
         output: flag(args, "--output"),
+        addr: flag(args, "--addr"),
     })
 }
 
@@ -224,6 +232,118 @@ fn run(options: &Options) -> Report {
         samples,
         config_hash,
     }
+}
+
+fn run_remote(options: &Options, initial_address: &str) -> io::Result<String> {
+    let total_operations = options.ops.saturating_mul(options.repetitions);
+    let mut samples = Vec::with_capacity(usize::try_from(total_operations).unwrap_or(0));
+    let mut address = initial_address.to_owned();
+    let started = Instant::now();
+    let mut acknowledged = 0_u64;
+    for repetition in 0..options.repetitions {
+        for operation in 0..options.ops {
+            let operation_number = repetition
+                .saturating_mul(options.ops)
+                .saturating_add(operation);
+            let key = format!("bench-{}", operation % 64);
+            let write = match options.workload {
+                Workload::A => operation % 2 == 0,
+                Workload::B => operation % 20 == 0,
+                Workload::C | Workload::Scan => false,
+                Workload::W => operation % 20 != 0,
+                Workload::Cas => operation % 2 == 0,
+            };
+            let command = if write {
+                vec![
+                    String::from("SET"),
+                    key,
+                    format!("value-{operation_number}"),
+                ]
+            } else {
+                vec![String::from("GET"), key]
+            };
+            let operation_started = Instant::now();
+            let reply = remote_request_follow(&mut address, &command)?;
+            if reply.starts_with(b"-") {
+                return Err(io::Error::other(format!(
+                    "real-host benchmark command failed: {}",
+                    String::from_utf8_lossy(&reply)
+                )));
+            }
+            acknowledged = acknowledged.saturating_add(1);
+            samples.push(u64::try_from(operation_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+    }
+    samples.sort_unstable();
+    let elapsed_ns = started.elapsed().as_nanos();
+    let throughput = if elapsed_ns == 0 {
+        0
+    } else {
+        u128::from(acknowledged).saturating_mul(1_000_000_000) / elapsed_ns
+    };
+    Ok(format!(
+        "{{\n  \"schema\": 1,\n  \"mode\": \"real-host\",\n  \"address\": \"{}\",\n  \"workload\": \"{}\",\n  \"clients\": {},\n  \"ops\": {},\n  \"repetitions\": {},\n  \"seed\": {},\n  \"acked\": {},\n  \"throughput_ops_per_sec\": {},\n  \"latency_ns\": {{\"p50\": {}, \"p95\": {}, \"p99\": {}, \"max\": {}}}\n}}",
+        json_escape(&address),
+        options.workload.as_str(),
+        options.clients,
+        options.ops,
+        options.repetitions,
+        options.seed,
+        acknowledged,
+        throughput,
+        percentile(&samples, 50, 100),
+        percentile(&samples, 95, 100),
+        percentile(&samples, 99, 100),
+        samples.last().copied().unwrap_or(0),
+    ))
+}
+
+fn remote_request_follow(address: &mut String, command: &[String]) -> io::Result<Vec<u8>> {
+    for _ in 0..4 {
+        let response = remote_request(address, command)?;
+        if !response.starts_with(b"-NOTLEADER") {
+            return Ok(response);
+        }
+        let text = String::from_utf8_lossy(&response);
+        let Some(next) = text
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("addr="))
+        else {
+            return Ok(response);
+        };
+        if next == address {
+            return Ok(response);
+        }
+        *address = next.to_owned();
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "real-host benchmark leader redirect exceeded hop limit",
+    ))
+}
+
+fn remote_request(address: &str, command: &[String]) -> io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(address)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    stream.write_all(&encode_resp_command(command))?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    Ok(response)
+}
+
+fn encode_resp_command(command: &[String]) -> Vec<u8> {
+    let mut frame = format!("*{}\r\n", command.len()).into_bytes();
+    for part in command {
+        frame.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        frame.extend_from_slice(part.as_bytes());
+        frame.extend_from_slice(b"\r\n");
+    }
+    frame
+}
+
+fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn value(size: usize, operation: u64) -> Vec<u8> {

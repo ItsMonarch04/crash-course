@@ -7,100 +7,182 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 demo_dir="$(mktemp -d "${TMPDIR:-/tmp}/ccdb-demo.XXXXXX")"
-node_pid=""
+declare -a node_pids=()
 cleanup() {
-  if [[ -n "$node_pid" ]]; then
-    kill "$node_pid" 2>/dev/null || true
-    wait "$node_pid" 2>/dev/null || true
-  fi
+  for pid in "${node_pids[@]:-}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${node_pids[@]:-}"; do
+    wait "$pid" 2>/dev/null || true
+  done
   rm -rf "$demo_dir"
 }
 trap cleanup EXIT INT TERM
 
-echo "[1/5] initialize an isolated one-node cluster"
-cargo run --quiet -p cc-node --bin ccdb -- init --cluster demo --nodes 1 --base-dir "$demo_dir"
-config="$demo_dir/n1/ccdb.toml"
+cargo build --quiet -p cc-node --bin ccdb
+ccdb_bin="$repo_root/target/debug/ccdb"
+ccdb() {
+  "$ccdb_bin" "$@"
+}
 
-start_node() {
-  cargo run --quiet -p cc-node --bin ccdb -- run --config "$config" >"$demo_dir/node.log" 2>&1 &
-  node_pid=$!
-  for _ in {1..50}; do
-    if python3 - "$demo_dir" <<'PY'
+echo "[1/7] initialize an isolated three-node cluster"
+ccdb init --cluster demo --nodes 3 --base-dir "$demo_dir"
+
+wait_for_port() {
+  local port="$1"
+  for _ in {1..80}; do
+    if python3 - "$port" <<'PY'
 import socket
+import sys
 
 with socket.socket() as sock:
     sock.settimeout(0.1)
     try:
-        sock.connect(("127.0.0.1", 7101))
+        sock.connect(("127.0.0.1", int(sys.argv[1])))
     except OSError:
         raise SystemExit(1)
 PY
     then
       return 0
     fi
-    sleep 0.1
+    sleep 0.05
   done
-  echo "node did not become ready" >&2
+  echo "port $port did not become ready" >&2
   return 1
 }
 
-send_commands() {
-  python3 - <<'PY'
+start_node() {
+  local node="$1"
+  local config="$demo_dir/n${node}/ccdb.toml"
+  "$ccdb_bin" run --config "$config" >"$demo_dir/n${node}.log" 2>&1 &
+  node_pids[node]="$!"
+  wait_for_port "$((7100 + node))"
+}
+
+start_node 1
+start_node 2
+start_node 3
+
+echo "[2/7] verify bounded peer frames on every node"
+for node in 1 2 3; do
+  ccdb peer --addr "127.0.0.1:$((7200 + node))" --retries 5
+done
+
+echo "[3/7] exercise SET/GET and twenty acknowledged INCR operations"
+python3 - "$demo_dir" <<'PY'
 import socket
+import sys
+import time
+
 
 def frame(*parts):
     encoded = [f"*{len(parts)}\r\n".encode()]
     for part in parts:
-        value = part.encode()
+        value = str(part).encode()
         encoded.extend([f"${len(value)}\r\n".encode(), value, b"\r\n"])
     return b"".join(encoded)
 
-request = b"".join([
-    frame("PING"),
-    frame("SET", "course", "durable"),
-    frame("GET", "course"),
-])
-with socket.create_connection(("127.0.0.1", 7101), timeout=2) as sock:
-    sock.sendall(request)
-    sock.shutdown(socket.SHUT_WR)
-    print(sock.recv(4096).decode("utf-8", "replace"), end="")
+
+def command(port, *parts):
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
+        sock.sendall(frame(*parts))
+        sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                return b"".join(chunks)
+            chunks.append(data)
+
+
+def ensure_ok(reply, label):
+    if reply.startswith(b"-"):
+        raise SystemExit(f"{label} failed: {reply!r}")
+
+
+ensure_ok(command(7101, "SET", "counter", "0"), "SET")
+for index in range(20):
+    reply = command(7101, "INCR", "counter")
+    ensure_ok(reply, f"INCR {index + 1}")
+    time.sleep(0.05)
+reply = command(7101, "GET", "counter")
+ensure_ok(reply, "GET")
+if b"20" not in reply:
+    raise SystemExit(f"counter did not reach 20: {reply!r}")
+print("acknowledged=20 counter=20")
 PY
-}
 
-cat >"$demo_dir/history.tsv" <<'EOF'
-# CC-HISTORY v1: KIND KEY OBSERVED_VALUE INVOKE_NS COMPLETE_NS
-SET	course	durable	1	2
-GET	course	durable	3	4
-EOF
-
-echo "[2/5] start the real host and exercise pipelined RESP"
-start_node
-cargo run --quiet -p cc-node --bin ccdb -- peer --addr 127.0.0.1:7201 --retries 3
-send_commands
-cargo run --quiet -p cc-swarm -- check-history --file "$demo_dir/history.tsv"
-
-echo "[3/5] kill and restart: the command journal is the recovery source"
-kill "$node_pid"
-wait "$node_pid" 2>/dev/null || true
-node_pid=""
-start_node
-python3 - <<'PY'
+echo "[4/7] kill the elected leader and verify sub-two-second failover"
+kill -9 "${node_pids[1]}"
+node_pids[1]=""
+python3 <<'PY'
 import socket
+import time
 
-request = b"*2\r\n$3\r\nGET\r\n$6\r\ncourse\r\n"
-with socket.create_connection(("127.0.0.1", 7101), timeout=2) as sock:
-    sock.sendall(request)
-    sock.shutdown(socket.SHUT_WR)
-    answer = sock.recv(1024)
-print("recovered:", answer.decode("utf-8", "replace").strip())
+
+def frame(*parts):
+    encoded = [f"*{len(parts)}\r\n".encode()]
+    for part in parts:
+        value = str(part).encode()
+        encoded.extend([f"${len(value)}\r\n".encode(), value, b"\r\n"])
+    return b"".join(encoded)
+
+
+started = time.monotonic()
+last = b""
+while time.monotonic() - started < 2:
+    try:
+        with socket.create_connection(("127.0.0.1", 7102), timeout=0.2) as sock:
+            sock.sendall(frame("INCR", "counter"))
+            sock.shutdown(socket.SHUT_WR)
+            last = sock.recv(4096)
+        if not last.startswith(b"-"):
+            print(f"failover_ms={(time.monotonic() - started) * 1000:.1f} reply={last!r}")
+            raise SystemExit(0)
+    except OSError:
+        pass
+    time.sleep(0.05)
+raise SystemExit(f"failover did not produce an acknowledgement: {last!r}")
 PY
 
-echo "[4/5] inspect journal and metrics surfaces"
-cargo run --quiet -p cc-node --bin ccdb -- selfcheck --data-dir "$demo_dir/n1"
-if [[ -f "$demo_dir/n1/metrics.prom" ]]; then
-  sed -n '1,20p' "$demo_dir/n1/metrics.prom"
-else
-  echo "metrics file is written by the host heartbeat; it was not observed before teardown"
-fi
+echo "[5/7] restart the killed node and verify TCP snapshot catch-up"
+rm -f "$demo_dir/n1/commands.log" "$demo_dir/n1/trace.log" "$demo_dir/n1/metrics.prom"
+echo "wiped n1 journal and trace; identity marker remains"
+start_node 1
+python3 <<'PY'
+import socket
+import time
 
-echo "[5/5] demo: PASS (single-node real-host restart path)"
+
+def frame(*parts):
+    encoded = [f"*{len(parts)}\r\n".encode()]
+    for part in parts:
+        value = str(part).encode()
+        encoded.extend([f"${len(value)}\r\n".encode(), value, b"\r\n"])
+    return b"".join(encoded)
+
+
+started = time.monotonic()
+while time.monotonic() - started < 2:
+    try:
+        with socket.create_connection(("127.0.0.1", 7101), timeout=0.2) as sock:
+            sock.sendall(frame("GET", "counter"))
+            sock.shutdown(socket.SHUT_WR)
+            reply = sock.recv(4096)
+        if b"21" in reply:
+            print(f"catchup_ms={(time.monotonic() - started) * 1000:.1f} counter=21")
+            raise SystemExit(0)
+    except OSError:
+        pass
+    time.sleep(0.05)
+raise SystemExit("restarted node did not catch up to counter=21")
+PY
+
+echo "[6/7] inspect live admin status and durable journals"
+ccdb admin --addr 127.0.0.1:7102 status
+ccdb admin --config "$demo_dir/n1/ccdb.toml" members
+for node in 1 2 3; do
+  ccdb selfcheck --data-dir "$demo_dir/n${node}"
+done
+
+echo "[7/7] demo: PASS (three-node replication, failover, restart, snapshot catch-up)"

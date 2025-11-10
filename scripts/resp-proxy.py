@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2025 Sidakpreet Singh
-"""Small userspace RESP byte proxy for local fault experiments."""
+"""Small userspace byte proxy for RESP and peer-frame fault experiments."""
 
 import argparse
 import select
@@ -18,14 +18,22 @@ def relay(client, upstream, drop_every, delay_ms):
     sockets = [client, upstream]
     forwarded = 0
     try:
-        while True:
+        while sockets:
             ready, _, _ = select.select(sockets, [], [], 1.0)
             if not ready:
                 continue
             for source in ready:
+                if source not in sockets:
+                    continue
                 data = source.recv(65536)
                 if not data:
-                    return
+                    sockets.remove(source)
+                    target = upstream if source is client else client
+                    try:
+                        target.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    continue
                 target = upstream if source is client else client
                 forwarded += 1
                 if drop_every and forwarded % drop_every == 0:
@@ -52,7 +60,12 @@ def main():
     print(f"resp-proxy listening={args.listen} upstream={args.upstream}", flush=True)
     while True:
         client, _ = listener.accept()
-        upstream = socket.create_connection(parse_endpoint(args.upstream), timeout=2)
+        try:
+            upstream = socket.create_connection(parse_endpoint(args.upstream), timeout=2)
+        except OSError as error:
+            print(f"upstream unavailable: {error}", flush=True)
+            client.close()
+            continue
         relay(client, upstream, args.drop_every, args.delay_ms)
 
 
