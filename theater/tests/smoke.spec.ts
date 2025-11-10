@@ -2,11 +2,38 @@
 // Copyright (c) 2025 Sidakpreet Singh
 import { expect, test } from "@playwright/test";
 
-test("flight recorder shell exposes the core controls", async ({ page }) => {
+test("hero scenario elects, survives a leader kill, and shares its run", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByText("CRASH COURSE")).toBeVisible();
-  await expect(page.getByRole("button", { name: /KILL LEADER/ })).toBeVisible();
-  await page.getByRole("button", { name: /KILL LEADER/ }).click();
-  await expect(page.getByText("SAFE")).toBeVisible();
-});
 
+  // The engine must actually be live. Without this the whole suite passes
+  // against the recorded fixture when the WASM blob fails to load.
+  await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM", { timeout: 15_000 });
+
+  // Run until a leader exists, rather than asserting a role string that any
+  // node satisfies at any time.
+  await page.getByRole("button", { name: "PLAY" }).click();
+  await expect(page.getByTestId("leader-id")).not.toHaveText("none", { timeout: 15_000 });
+  const firstLeader = await page.getByTestId("leader-id").textContent();
+  await expect(page.getByTestId("virtual-time")).not.toHaveText("0s / 60s");
+
+  // Killing the leader must produce a *different* leader within bounded
+  // virtual time — the §1.5 hero claim, actually asserted.
+  await page.getByRole("button", { name: /KILL LEADER/ }).click();
+  await expect
+    .poll(async () => page.getByTestId("leader-id").textContent(), { timeout: 30_000 })
+    .not.toBe(firstLeader);
+  await expect(page.getByTestId("leader-id")).not.toHaveText("none");
+
+  await expect(page.getByText("No verified failure exhibits are published yet.")).toBeVisible();
+
+  // The share link must carry the injected fault, not just the seed.
+  await page.getByRole("button", { name: /Share this scenario/ }).click();
+  const sharedUrl = page.url();
+  expect(sharedUrl).toContain("#seed=");
+  expect(decodeURIComponent(sharedUrl)).toContain("crash");
+
+  await page.goto(sharedUrl);
+  await expect(page.getByLabel("Seed")).toHaveValue(/0x/);
+  await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM", { timeout: 15_000 });
+});

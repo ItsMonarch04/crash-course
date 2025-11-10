@@ -28,6 +28,7 @@ button { color: inherit; cursor: pointer; }
 .brand-mark { display: grid; place-items: center; width: 32px; height: 32px; border: 1px solid var(--teal); color: var(--teal); font: 700 11px ui-monospace, monospace; }
 .verdict { margin-left: auto; color: var(--teal); font: 11px ui-monospace, monospace; letter-spacing: .12em; }
 .verdict b { color: var(--muted); font-weight: 400; margin-left: 8px; letter-spacing: 0; }
+.engine-state { margin-left: 14px; font: 10px ui-monospace, monospace; letter-spacing: .12em; color: var(--muted); }
 .led { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 12px var(--teal); margin-right: 7px; }
 .quiet-button, .outline-button, .accent-button, .link-button { border: 0; background: none; }
 .quiet-button { color: var(--muted); font: 11px ui-monospace, monospace; }
