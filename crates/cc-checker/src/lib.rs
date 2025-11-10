@@ -31,6 +31,10 @@ pub enum OperationKind {
         expected: Option<Vec<u8>>,
         value: Vec<u8>,
     },
+    Scan {
+        prefix: Option<Vec<u8>>,
+        limit: usize,
+    },
 }
 
 impl OperationKind {
@@ -41,6 +45,7 @@ impl OperationKind {
             | Self::Del { key }
             | Self::Incr { key }
             | Self::Cas { key, .. } => key,
+            Self::Scan { prefix, .. } => prefix.as_deref().unwrap_or_default(),
         }
     }
 }
@@ -51,6 +56,7 @@ pub enum Outcome {
     Value(Option<Vec<u8>>),
     Integer(i64),
     Cas(bool),
+    Scan(Vec<(Vec<u8>, Vec<u8>)>),
     Error,
     Timeout,
 }
@@ -163,6 +169,51 @@ enum SearchResult {
 /// Check a per-key register history with an open-operation branch.
 #[must_use]
 pub fn check(history: &History, config: CheckerConfig) -> Verdict {
+    if history
+        .operations
+        .iter()
+        .any(|operation| matches!(operation.kind, OperationKind::Scan { .. }))
+    {
+        return check_single(history, config);
+    }
+    let mut per_key = BTreeMap::<Vec<u8>, History>::new();
+    for operation in &history.operations {
+        per_key
+            .entry(operation.kind.key().to_vec())
+            .or_default()
+            .push(operation.clone());
+    }
+    if per_key.len() > 1 {
+        let mut visited = 0_u64;
+        let mut undecided = false;
+        for key_history in per_key.values() {
+            match check_single(key_history, config) {
+                Verdict::Linearizable { visited: count } => visited = visited.saturating_add(count),
+                Verdict::Undecided { visited: count } => {
+                    visited = visited.saturating_add(count);
+                    undecided = true;
+                }
+                Verdict::NotLinearizable {
+                    operation_ids,
+                    visited: count,
+                } => {
+                    return Verdict::NotLinearizable {
+                        operation_ids,
+                        visited: visited.saturating_add(count),
+                    };
+                }
+            }
+        }
+        return if undecided {
+            Verdict::Undecided { visited }
+        } else {
+            Verdict::Linearizable { visited }
+        };
+    }
+    check_single(history, config)
+}
+
+fn check_single(history: &History, config: CheckerConfig) -> Verdict {
     if history.operations.is_empty() {
         return Verdict::Linearizable { visited: 0 };
     }
@@ -292,8 +343,13 @@ fn eligible(index: usize, remaining: &[usize], history: &History) -> bool {
             if other_index == index {
                 return true;
             }
+            // Real-time precedence must be strict. With `<=`, two operations
+            // that share an instant each require the other to be linearized
+            // first, which no order can satisfy — the search then reports a
+            // perfectly legal history as non-linearizable. Operations that
+            // merely touch at the same timestamp are concurrent.
             match other.complete {
-                Some(completion) if completion <= candidate.invoke => {
+                Some(completion) if completion < candidate.invoke => {
                     !remaining.contains(&other_index)
                 }
                 _ => true,
@@ -350,6 +406,15 @@ fn apply_operation(model: &Model, operation: &OperationKind) -> Option<(Model, O
             } else {
                 Outcome::Cas(false)
             }
+        }
+        OperationKind::Scan { prefix, limit } => {
+            let mut values = next
+                .iter()
+                .filter(|(key, _)| prefix.as_ref().is_none_or(|prefix| key.starts_with(prefix)))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            values.truncate(*limit);
+            Outcome::Scan(values)
         }
     };
     Some((next, outcome))
@@ -439,6 +504,92 @@ impl LivenessReport {
     }
 }
 
+#[cfg(test)]
+mod same_instant_tests {
+    use super::*;
+
+    /// Two zero-duration reads at the same instant are concurrent, not mutually
+    /// preceding. Under the old `<=` precedence rule this history was reported
+    /// as non-linearizable.
+    #[test]
+    fn operations_sharing_an_instant_are_concurrent() {
+        let key = b"k".to_vec();
+        let mut history = History::default();
+
+        let mut write = Operation::open(
+            1,
+            OperationKind::Set {
+                key: key.clone(),
+                value: vec![7],
+            },
+            Time::from_nanos(10),
+        );
+        write.complete = Some(Time::from_nanos(20));
+        write.outcome = Outcome::Ok;
+        history.push(write);
+
+        for id in 2..=3 {
+            let mut read = Operation::open(
+                id,
+                OperationKind::Get { key: key.clone() },
+                Time::from_nanos(30),
+            );
+            read.complete = Some(Time::from_nanos(30));
+            read.outcome = Outcome::Value(Some(vec![7]));
+            history.push(read);
+        }
+
+        assert!(matches!(
+            check(
+                &history,
+                CheckerConfig {
+                    max_states: 100_000
+                }
+            ),
+            Verdict::Linearizable { .. }
+        ));
+    }
+
+    /// The strict rule must still enforce genuine precedence: a read that
+    /// completes before a write starts cannot observe that write.
+    #[test]
+    fn genuine_precedence_is_still_enforced() {
+        let key = b"k".to_vec();
+        let mut history = History::default();
+
+        let mut read = Operation::open(
+            1,
+            OperationKind::Get { key: key.clone() },
+            Time::from_nanos(10),
+        );
+        read.complete = Some(Time::from_nanos(20));
+        read.outcome = Outcome::Value(Some(vec![7]));
+        history.push(read);
+
+        let mut write = Operation::open(
+            2,
+            OperationKind::Set {
+                key,
+                value: vec![7],
+            },
+            Time::from_nanos(30),
+        );
+        write.complete = Some(Time::from_nanos(40));
+        write.outcome = Outcome::Ok;
+        history.push(write);
+
+        assert!(matches!(
+            check(
+                &history,
+                CheckerConfig {
+                    max_states: 100_000
+                }
+            ),
+            Verdict::NotLinearizable { .. }
+        ));
+    }
+}
+
 #[must_use]
 pub fn check_liveness(report: LivenessReport) -> InvariantReport {
     if report.is_ok() {
@@ -456,30 +607,106 @@ pub fn check_liveness(report: LivenessReport) -> InvariantReport {
 #[must_use]
 pub fn export_porcupine_json(history: &History) -> String {
     let mut output = String::from("[");
-    for (index, operation) in history.operations.iter().enumerate() {
-        if index != 0 {
+    let mut event_index = 0_usize;
+    for operation in &history.operations {
+        if event_index != 0 {
             output.push(',');
         }
         output.push_str(&format!(
-            "{{\"process\":{},\"id\":{},\"time\":{},\"type\":\"{}\"}}",
+            "{{\"process\":{},\"type\":\"invoke\",\"value\":{},\"time\":{}}}",
             operation.client,
-            operation.id,
-            operation.invoke.as_nanos(),
-            operation_name(&operation.kind)
+            operation_value(&operation.kind),
+            operation.invoke.as_nanos()
         ));
+        event_index += 1;
+        if let Some(complete) = operation.complete {
+            output.push(',');
+            output.push_str(&format!(
+                "{{\"process\":{},\"type\":\"{}\",\"value\":{},\"time\":{}}}",
+                operation.client,
+                if operation.outcome == Outcome::Timeout {
+                    "fail"
+                } else {
+                    "ok"
+                },
+                outcome_value(&operation.outcome),
+                complete.as_nanos()
+            ));
+            event_index += 1;
+        }
     }
     output.push(']');
     output
 }
 
-fn operation_name(operation: &OperationKind) -> &'static str {
+fn operation_value(operation: &OperationKind) -> String {
     match operation {
-        OperationKind::Set { .. } => "set",
-        OperationKind::Get { .. } => "get",
-        OperationKind::Del { .. } => "del",
-        OperationKind::Incr { .. } => "incr",
-        OperationKind::Cas { .. } => "cas",
+        OperationKind::Set { key, value } => {
+            format!("[\"set\",{},{}]", json_bytes(key), json_bytes(value))
+        }
+        OperationKind::Get { key } => format!("[\"get\",{}]", json_bytes(key)),
+        OperationKind::Del { key } => format!("[\"del\",{}]", json_bytes(key)),
+        OperationKind::Incr { key } => format!("[\"incr\",{}]", json_bytes(key)),
+        OperationKind::Cas {
+            key,
+            expected,
+            value,
+        } => format!(
+            "[\"cas\",{},{},{}]",
+            json_bytes(key),
+            expected
+                .as_deref()
+                .map_or_else(|| String::from("null"), json_bytes),
+            json_bytes(value)
+        ),
+        OperationKind::Scan { prefix, limit } => format!(
+            "[\"scan\",{},{}]",
+            prefix
+                .as_deref()
+                .map_or_else(|| String::from("null"), json_bytes),
+            limit
+        ),
     }
+}
+
+fn outcome_value(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Ok => String::from("\"ok\""),
+        Outcome::Value(value) => value
+            .as_deref()
+            .map_or_else(|| String::from("null"), json_bytes),
+        Outcome::Integer(value) => value.to_string(),
+        Outcome::Cas(value) => value.to_string(),
+        Outcome::Scan(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|(key, value)| format!("[{},{}]", json_bytes(key), json_bytes(value)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Outcome::Error => String::from("\"error\""),
+        Outcome::Timeout => String::from("\"timeout\""),
+    }
+}
+
+fn json_bytes(value: &[u8]) -> String {
+    let text = String::from_utf8_lossy(value);
+    format!("\"{}\"", json_escape(&text))
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '"' => ['\\', '"'].into_iter().collect::<Vec<_>>(),
+            '\\' => ['\\', '\\'].into_iter().collect::<Vec<_>>(),
+            '\n' => ['\\', 'n'].into_iter().collect::<Vec<_>>(),
+            '\r' => ['\\', 'r'].into_iter().collect::<Vec<_>>(),
+            '\t' => ['\\', 't'].into_iter().collect::<Vec<_>>(),
+            other => [other].into_iter().collect::<Vec<_>>(),
+        })
+        .collect()
 }
 
 impl fmt::Display for Verdict {
@@ -573,6 +800,250 @@ mod tests {
             check(&history, CheckerConfig::default()),
             Verdict::Linearizable { .. }
         ));
+    }
+
+    #[test]
+    fn trap_open_op_can_be_dropped_in_the_other_direction() {
+        let mut history = History::default();
+        history.push(Operation::open(
+            1,
+            OperationKind::Set {
+                key: b"a".to_vec(),
+                value: b"one".to_vec(),
+            },
+            Time::from_nanos(0),
+        ));
+        history.push(Operation::completed(
+            2,
+            OperationKind::Get { key: b"a".to_vec() },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Value(None),
+        ));
+        assert!(matches!(
+            check(&history, CheckerConfig::default()),
+            Verdict::Linearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn scan_is_checked_as_a_snapshot_legal_operation() {
+        let mut history = History::default();
+        history.push(Operation::completed(
+            1,
+            OperationKind::Set {
+                key: b"a".to_vec(),
+                value: b"one".to_vec(),
+            },
+            Time::from_nanos(0),
+            Time::from_nanos(1),
+            Outcome::Ok,
+        ));
+        history.push(Operation::completed(
+            2,
+            OperationKind::Set {
+                key: b"b".to_vec(),
+                value: b"two".to_vec(),
+            },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Ok,
+        ));
+        history.push(Operation::completed(
+            3,
+            OperationKind::Scan {
+                prefix: None,
+                limit: 8,
+            },
+            Time::from_nanos(3),
+            Time::from_nanos(4),
+            Outcome::Scan(vec![
+                (b"a".to_vec(), b"one".to_vec()),
+                (b"b".to_vec(), b"two".to_vec()),
+            ]),
+        ));
+        assert!(matches!(
+            check(&history, CheckerConfig::default()),
+            Verdict::Linearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn porcupine_export_contains_invoke_and_completion_events() {
+        let mut history = History::default();
+        history.push(Operation::completed(
+            7,
+            OperationKind::Set {
+                key: b"a".to_vec(),
+                value: b"one".to_vec(),
+            },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Ok,
+        ));
+        let exported = export_porcupine_json(&history);
+        assert!(exported.contains("\"type\":\"invoke\""));
+        assert!(exported.contains("\"type\":\"ok\""));
+        assert!(exported.contains("[\"set\",\"a\",\"one\"]"));
+    }
+
+    #[test]
+    fn independent_keys_are_partitioned_before_search() {
+        let mut history = History::default();
+        for (id, key, value) in [(1, b"a".as_slice(), b"one".as_slice()), (2, b"b", b"two")] {
+            history.push(Operation::completed(
+                id,
+                OperationKind::Set {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                },
+                Time::from_nanos(0),
+                Time::from_nanos(1),
+                Outcome::Ok,
+            ));
+        }
+        assert!(matches!(
+            check(&history, CheckerConfig { max_states: 1 }),
+            Verdict::Linearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn budget_exhaustion_is_explicitly_undecided() {
+        let mut history = History::default();
+        for id in 1..=8 {
+            history.push(Operation::completed(
+                id,
+                OperationKind::Set {
+                    key: b"hot".to_vec(),
+                    value: id.to_string().into_bytes(),
+                },
+                Time::from_nanos(0),
+                Time::from_nanos(1),
+                Outcome::Ok,
+            ));
+        }
+        assert!(matches!(
+            check(&history, CheckerConfig { max_states: 1 }),
+            Verdict::Undecided { .. }
+        ));
+    }
+
+    #[test]
+    fn wing_gong_search_matches_a_brute_force_eight_operation_oracle() {
+        let mut legal = History::default();
+        legal.push(Operation::completed(
+            1,
+            OperationKind::Set {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+            },
+            Time::from_nanos(0),
+            Time::from_nanos(8),
+            Outcome::Ok,
+        ));
+        legal.push(Operation::completed(
+            2,
+            OperationKind::Get { key: b"a".to_vec() },
+            Time::from_nanos(0),
+            Time::from_nanos(8),
+            Outcome::Value(Some(b"1".to_vec())),
+        ));
+        legal.push(Operation::completed(
+            3,
+            OperationKind::Incr { key: b"a".to_vec() },
+            Time::from_nanos(0),
+            Time::from_nanos(8),
+            Outcome::Integer(2),
+        ));
+        legal.push(Operation::completed(
+            4,
+            OperationKind::Get { key: b"a".to_vec() },
+            Time::from_nanos(0),
+            Time::from_nanos(8),
+            Outcome::Value(Some(b"2".to_vec())),
+        ));
+        legal.push(Operation::completed(
+            5,
+            OperationKind::Set {
+                key: b"b".to_vec(),
+                value: b"x".to_vec(),
+            },
+            Time::from_nanos(0),
+            Time::from_nanos(8),
+            Outcome::Ok,
+        ));
+        legal.push(Operation::completed(
+            6,
+            OperationKind::Get { key: b"b".to_vec() },
+            Time::from_nanos(0),
+            Time::from_nanos(8),
+            Outcome::Value(Some(b"x".to_vec())),
+        ));
+        legal.push(Operation::completed(
+            7,
+            OperationKind::Del { key: b"b".to_vec() },
+            Time::from_nanos(0),
+            Time::from_nanos(8),
+            Outcome::Ok,
+        ));
+        legal.push(Operation::completed(
+            8,
+            OperationKind::Get { key: b"b".to_vec() },
+            Time::from_nanos(0),
+            Time::from_nanos(8),
+            Outcome::Value(None),
+        ));
+        let checker_is_legal = matches!(
+            check(&legal, CheckerConfig::default()),
+            Verdict::Linearizable { .. }
+        );
+        assert_eq!(checker_is_legal, brute_force(&legal));
+
+        let mut illegal = legal.clone();
+        illegal.operations[1].outcome = Outcome::Value(None);
+        let checker_is_legal = matches!(
+            check(&illegal, CheckerConfig::default()),
+            Verdict::Linearizable { .. }
+        );
+        assert_eq!(checker_is_legal, brute_force(&illegal));
+    }
+
+    fn brute_force(history: &History) -> bool {
+        fn search(history: &History, remaining: Vec<usize>, model: Model) -> bool {
+            if remaining.is_empty() {
+                return true;
+            }
+            for (position, index) in remaining.iter().enumerate() {
+                if !eligible(*index, &remaining, history) {
+                    continue;
+                }
+                let operation = &history.operations[*index];
+                let mut next_remaining = remaining.clone();
+                next_remaining.remove(position);
+                if operation.outcome == Outcome::Timeout {
+                    if search(history, next_remaining.clone(), model.clone()) {
+                        return true;
+                    }
+                    if let Some((next, _)) = apply_operation(&model, &operation.kind)
+                        && search(history, next_remaining, next)
+                    {
+                        return true;
+                    }
+                } else if let Some((next, expected)) = apply_operation(&model, &operation.kind)
+                    && expected == operation.outcome
+                    && search(history, next_remaining, next)
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        search(
+            history,
+            (0..history.operations.len()).collect(),
+            BTreeMap::new(),
+        )
     }
 
     #[test]

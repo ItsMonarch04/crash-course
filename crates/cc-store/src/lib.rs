@@ -753,6 +753,32 @@ mod tests {
     }
 
     #[test]
+    fn golden_byte_layout_vectors() {
+        let table = SstTable::from_entries(
+            7,
+            vec![
+                (
+                    InternalKey::new(b"a".to_vec(), 1, ValueKind::Put),
+                    b"one".to_vec(),
+                ),
+                (
+                    InternalKey::new(b"b".to_vec(), 2, ValueKind::Delete),
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("table");
+        assert_eq!(
+            hex_bytes(table.bytes()),
+            "4343535401000700000000000000020000000100000061010000000000000001030000006f6e65010000006202000000000000000200000000360c63d6"
+        );
+        assert_eq!(
+            hex_bytes(&encode_meta(7)),
+            "43434d54010007000000000000008b275acd"
+        );
+    }
+
+    #[test]
     fn flush_checkpoint_boot_and_restore() {
         let mut store = Store::new(config()).expect("store");
         store.put(b"a", b"one").expect("put");
@@ -851,10 +877,10 @@ mod tests {
                 let key = vec![b'a' + u8::try_from(rng.range_u64(0, 32)).expect("small")];
                 if rng.chance(cc_core::P16::new(40_000)) {
                     let value = rng.u64().to_le_bytes().to_vec();
-                    store.put(&key, &value).expect("put");
+                    retry_after_flush(&mut store, |store| store.put(&key, &value)).expect("put");
                     oracle.insert(key, value);
                 } else {
-                    store.delete(&key).expect("delete");
+                    retry_after_flush(&mut store, |store| store.delete(&key)).expect("delete");
                     oracle.remove(&key);
                 }
             }
@@ -881,5 +907,26 @@ mod tests {
                 bytes[offset] ^= 1;
             }
         }
+    }
+
+    fn retry_after_flush<T>(
+        store: &mut Store,
+        mut operation: impl FnMut(&mut Store) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        match operation(store) {
+            Err(StoreError::Busy) => {
+                store.flush()?;
+                operation(store)
+            }
+            result => result,
+        }
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .flat_map(|byte| [format!("{byte:02x}")])
+            .collect::<Vec<_>>()
+            .join("")
     }
 }

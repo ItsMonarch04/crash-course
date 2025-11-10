@@ -9,7 +9,7 @@ use std::fmt;
 
 use cc_core::{ClientId, Dec, Enc, LogIndex, NodeId, Seed, Time};
 use cc_kv::{Kv, KvCommand, KvError, KvReply, KvSnapshot, decode_command, encode_command};
-use cc_raft::{Entry, Message, RaftConfig, RaftEffect, RaftError, RaftNode, Role};
+use cc_raft::{Entry, HardState, Message, RaftConfig, RaftEffect, RaftError, RaftNode, Role};
 use cc_store::StoreConfig;
 
 pub const CLUSTER_VERSION: u16 = 1;
@@ -28,6 +28,14 @@ pub enum NodeInput {
         now: Time,
     },
     Message(Message),
+    MessageAt {
+        now: Time,
+        message: Message,
+    },
+    Timer {
+        now: Time,
+        kind: cc_raft::TimerKind,
+    },
     ClientRequest {
         client: ClientId,
         sequence: u64,
@@ -36,6 +44,7 @@ pub enum NodeInput {
     },
     Read {
         client: ClientId,
+        sequence: u64,
         command: KvCommand,
         at: Time,
     },
@@ -49,10 +58,12 @@ pub enum NodeEffect {
     TruncateSuffix(LogIndex),
     ClientReply {
         client: ClientId,
+        sequence: u64,
         reply: KvReply,
     },
     ReadReply {
         client: ClientId,
+        sequence: u64,
         reply: KvReply,
     },
     ArmTimer {
@@ -105,6 +116,16 @@ pub struct Node {
     pub raft: RaftNode,
     pub kv: Kv,
     config: NodeConfig,
+    pending_reads: Vec<PendingRead>,
+    read_barrier_ready: Option<LogIndex>,
+}
+
+struct PendingRead {
+    client: ClientId,
+    sequence: u64,
+    command: KvCommand,
+    at: Time,
+    index: LogIndex,
 }
 
 impl Node {
@@ -113,7 +134,30 @@ impl Node {
             raft: RaftNode::new(config.id, voters, config.seed, config.raft),
             kv: Kv::new(config.store)?,
             config,
+            pending_reads: Vec::new(),
+            read_barrier_ready: None,
         })
+    }
+
+    /// Rebuild a node from durable state alone, as a restarting process does.
+    ///
+    /// Only the hard state and the recovered log survive. Role, commit index,
+    /// applied index, the state machine, and session table all start empty and
+    /// are re-derived by replaying the log once a leader re-establishes the
+    /// commit index. A caller that hands back volatile state here is modelling
+    /// a pause, not a crash.
+    pub fn recover(
+        config: NodeConfig,
+        voters: BTreeSet<NodeId>,
+        hard_state: HardState,
+        log: Vec<Entry>,
+        now: Time,
+    ) -> Result<Self, NodeError> {
+        let mut node = Self::new(config, voters)?;
+        node.raft.hard_state = hard_state;
+        node.raft.log = log;
+        node.raft.rearm_election(now);
+        Ok(node)
     }
 
     #[must_use]
@@ -170,6 +214,14 @@ impl Node {
                 let effects = self.raft.on_message(message);
                 Ok(self.map_effects(effects, None))
             }
+            NodeInput::MessageAt { now, message } => {
+                let effects = self.raft.on_message_at(message, now);
+                Ok(self.map_effects(effects, None))
+            }
+            NodeInput::Timer { now, kind } => {
+                let effects = self.raft.on_timer(now, kind);
+                Ok(self.map_effects(effects, None))
+            }
             NodeInput::ClientRequest {
                 client,
                 sequence,
@@ -186,14 +238,20 @@ impl Node {
             }
             NodeInput::Read {
                 client,
+                sequence,
                 command,
                 at,
             } => {
-                self.raft.request_read()?;
-                Ok(vec![NodeEffect::ReadReply {
+                let effects = self.raft.request_read()?;
+                self.read_barrier_ready = None;
+                self.pending_reads.push(PendingRead {
                     client,
-                    reply: self.kv.read(command, at)?,
-                }])
+                    sequence,
+                    command,
+                    at,
+                    index: self.raft.commit_index,
+                });
+                Ok(self.map_effects(effects, None))
             }
         }
     }
@@ -220,7 +278,11 @@ impl Node {
                                 .kv
                                 .apply(entry.index, entry.term, client, sequence, command, time)
                                 .unwrap_or_else(KvReply::Error);
-                            output.push(NodeEffect::ClientReply { client, reply });
+                            output.push(NodeEffect::ClientReply {
+                                client,
+                                sequence,
+                                reply,
+                            });
                         }
                     }
                 }
@@ -228,7 +290,36 @@ impl Node {
                     output.push(NodeEffect::ArmTimer { id, at, kind })
                 }
                 RaftEffect::ReadBarrier { .. } => {}
+                RaftEffect::ReadBarrierReady { index } => {
+                    self.read_barrier_ready = Some(index);
+                }
                 RaftEffect::Trace { name, .. } => output.push(NodeEffect::Trace(name)),
+            }
+        }
+        output.extend(self.drain_pending_reads());
+        output
+    }
+
+    fn drain_pending_reads(&mut self) -> Vec<NodeEffect> {
+        let Some(ready) = self.read_barrier_ready else {
+            return Vec::new();
+        };
+        let applied = self.raft.applied_index;
+        let pending = std::mem::take(&mut self.pending_reads);
+        let mut output = Vec::new();
+        for read in pending {
+            if ready >= read.index && applied >= read.index {
+                let reply = self
+                    .kv
+                    .read(read.command, read.at)
+                    .unwrap_or_else(KvReply::Error);
+                output.push(NodeEffect::ReadReply {
+                    client: read.client,
+                    sequence: read.sequence,
+                    reply,
+                });
+            } else {
+                self.pending_reads.push(read);
             }
         }
         output
@@ -295,6 +386,7 @@ fn decode_proposal(entry: &Entry) -> Result<Option<(ClientId, u64, KvCommand, Ti
 mod tests {
     use super::*;
     use cc_core::Term;
+    use cc_raft::{AppendResponse, MessageKind, PROTOCOL_VERSION};
 
     fn config(id: u64) -> NodeConfig {
         NodeConfig {
@@ -373,5 +465,78 @@ mod tests {
         restored.install_snapshot(snapshot).expect("install");
         assert_eq!(restored.kv.applied_index, LogIndex::new(5));
         assert_eq!(restored.kv.store.get(b"a", None), Some(b"one".to_vec()));
+    }
+
+    #[test]
+    fn read_waits_for_quorum_barrier_and_applied_index() {
+        let voters: BTreeSet<NodeId> = [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+            .into_iter()
+            .collect();
+        let mut node = Node::new(config(1), voters).expect("node");
+        node.raft.role = Role::Leader;
+        node.raft.hard_state.term = Term::new(1);
+        node.raft.log.push(Entry {
+            term: Term::new(1),
+            index: LogIndex::new(1),
+            kind: cc_raft::EntryKind::Noop,
+            payload: Vec::new(),
+        });
+        node.raft.commit_index = LogIndex::new(1);
+        node.raft.applied_index = LogIndex::new(1);
+        let effects = node
+            .on_input(NodeInput::Read {
+                sequence: 1,
+                client: ClientId::new(8),
+                command: KvCommand::Get { key: b"a".to_vec() },
+                at: Time::from_nanos(1),
+            })
+            .expect("read request");
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, NodeEffect::ReadReply { .. }))
+        );
+        // An ack that predates the read round is not evidence of current
+        // leadership, so it must not release the barrier.
+        let stale = node
+            .on_input(NodeInput::Message(Message {
+                proto_version: PROTOCOL_VERSION,
+                from: NodeId::new(2),
+                to: NodeId::new(1),
+                term: Term::new(1),
+                kind: MessageKind::AppendResp(AppendResponse {
+                    success: true,
+                    match_index: LogIndex::new(1),
+                    conflict_term: None,
+                    conflict_index: LogIndex::new(0),
+                    read_round: 0,
+                }),
+            }))
+            .expect("stale response");
+        assert!(
+            !stale
+                .iter()
+                .any(|effect| matches!(effect, NodeEffect::ReadReply { .. })),
+            "a pre-read ack must not confirm the read quorum"
+        );
+
+        let effects = node
+            .on_input(NodeInput::Message(Message {
+                proto_version: PROTOCOL_VERSION,
+                from: NodeId::new(2),
+                to: NodeId::new(1),
+                term: Term::new(1),
+                kind: MessageKind::AppendResp(AppendResponse {
+                    success: true,
+                    match_index: LogIndex::new(1),
+                    conflict_term: None,
+                    conflict_index: LogIndex::new(0),
+                    read_round: 1,
+                }),
+            }))
+            .expect("quorum response");
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, NodeEffect::ReadReply { client, .. } if *client == ClientId::new(8))));
     }
 }

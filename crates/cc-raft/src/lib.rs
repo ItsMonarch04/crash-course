@@ -9,7 +9,9 @@ use std::fmt;
 
 use cc_core::{Duration, LogIndex, NodeId, Seed, Term, Time, TimerId, Xoshiro256pp};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Bumped to 2 when append requests and responses gained `read_round`, which
+/// scopes a ReadIndex confirmation to the round that raised it.
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_ELECTION_MIN: Duration = Duration::from_millis(150);
 pub const DEFAULT_ELECTION_MAX: Duration = Duration::from_millis(300);
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_millis(50);
@@ -75,6 +77,10 @@ pub struct AppendRequest {
     pub prev_term: Term,
     pub entries: Vec<Entry>,
     pub leader_commit: LogIndex,
+    /// Identifies the leadership-confirmation round this append belongs to.
+    /// Followers echo it so the leader can tell a fresh ack from one that was
+    /// already in flight when the read index was fixed.
+    pub read_round: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +89,7 @@ pub struct AppendResponse {
     pub match_index: LogIndex,
     pub conflict_term: Option<Term>,
     pub conflict_index: LogIndex,
+    pub read_round: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,6 +150,9 @@ pub enum RaftEffect {
         kind: TimerKind,
     },
     ReadBarrier {
+        index: LogIndex,
+    },
+    ReadBarrierReady {
         index: LogIndex,
     },
     Trace {
@@ -213,6 +223,9 @@ pub struct RaftNode {
     votes: BTreeSet<NodeId>,
     pre_votes: BTreeSet<NodeId>,
     heard_quorum: BTreeSet<NodeId>,
+    read_acks: BTreeSet<NodeId>,
+    read_round: u64,
+    read_index: Option<LogIndex>,
     snapshot_buffer: Vec<u8>,
     snapshot_index: LogIndex,
     snapshot_term: Term,
@@ -248,6 +261,9 @@ impl RaftNode {
             votes: BTreeSet::new(),
             pre_votes: BTreeSet::new(),
             heard_quorum: BTreeSet::new(),
+            read_acks: BTreeSet::new(),
+            read_round: 0,
+            read_index: None,
             snapshot_buffer: Vec::new(),
             snapshot_index: LogIndex::new(0),
             snapshot_term: Term::new(0),
@@ -329,7 +345,7 @@ impl RaftNode {
         Ok(effects)
     }
 
-    pub fn request_read(&self) -> Result<Vec<RaftEffect>, RaftError> {
+    pub fn request_read(&mut self) -> Result<Vec<RaftEffect>, RaftError> {
         if self.role != Role::Leader {
             return Err(RaftError::NotLeader);
         }
@@ -341,9 +357,21 @@ impl RaftNode {
         {
             return Err(RaftError::ReadBarrierNotReady);
         }
-        Ok(vec![RaftEffect::ReadBarrier {
+        self.read_round = self.read_round.saturating_add(1);
+        self.read_acks.clear();
+        self.read_acks.insert(self.id);
+        self.read_index = Some(self.commit_index);
+        let mut effects = vec![RaftEffect::ReadBarrier {
             index: self.commit_index,
-        }])
+        }];
+        effects.extend(self.broadcast_append());
+        if self.has_majority(&self.read_acks) {
+            self.read_index = None;
+            effects.push(RaftEffect::ReadBarrierReady {
+                index: self.commit_index,
+            });
+        }
+        Ok(effects)
     }
 
     pub fn add_learner(&mut self, node: NodeId) -> Result<(), RaftError> {
@@ -476,6 +504,15 @@ impl RaftNode {
     }
 
     pub fn on_message(&mut self, message: Message) -> Vec<RaftEffect> {
+        self.on_message_at(message, Time::from_nanos(0))
+    }
+
+    /// Deliver a message at the host's virtual time.
+    ///
+    /// The original sans-IO surface remains available through `on_message`;
+    /// the timestamped entry is the integration hook used by the simulator so
+    /// election deadlines are reset relative to delivery, not the epoch.
+    pub fn on_message_at(&mut self, message: Message, now: Time) -> Vec<RaftEffect> {
         if message.proto_version != PROTOCOL_VERSION {
             return vec![RaftEffect::Trace {
                 name: "proto_version_rejected",
@@ -483,11 +520,21 @@ impl RaftNode {
             }];
         }
         let mut effects = Vec::new();
-        if message.term > self.hard_state.term {
+        if message.term > self.hard_state.term
+            && !matches!(
+                message.kind,
+                MessageKind::PreVoteReq { .. } | MessageKind::PreVoteResp { .. }
+            )
+        {
             self.hard_state.term = message.term;
             self.hard_state.voted_for = None;
             self.role = Role::Follower;
             self.leader_id = None;
+            // A tally belongs to the election it was raised in. Carrying it
+            // into a new term lets an abandoned majority elect this node in a
+            // term it never won.
+            self.votes.clear();
+            self.pre_votes.clear();
             effects.push(RaftEffect::PersistHard(self.hard_state));
         }
         match message.kind.clone() {
@@ -498,10 +545,14 @@ impl RaftNode {
                 effects.push(self.pre_vote_response(&message, last_index, last_term));
             }
             MessageKind::PreVoteResp { granted } => {
-                if self.role == Role::Follower || self.role == Role::Candidate {
-                    if granted {
-                        self.pre_votes.insert(message.from);
-                    }
+                // Pre-votes are solicited for `term + 1`, so that is the only
+                // round a reply can belong to. A straggler from an earlier
+                // attempt would otherwise start an election off stale consent.
+                if (self.role == Role::Follower || self.role == Role::Candidate)
+                    && message.term.get() == self.hard_state.term.get() + 1
+                    && granted
+                {
+                    self.pre_votes.insert(message.from);
                     if self.has_majority(&self.pre_votes) {
                         effects.extend(self.start_election());
                     }
@@ -511,20 +562,25 @@ impl RaftNode {
                 last_index,
                 last_term,
             } => {
-                effects.extend(self.vote_request(&message, last_index, last_term));
+                effects.extend(self.vote_request(&message, last_index, last_term, now));
             }
             MessageKind::VoteResp { granted } => {
-                if self.role == Role::Candidate {
-                    if granted {
-                        self.votes.insert(message.from);
-                    }
+                // A grant raised for an election this node has already left is
+                // not a vote in the current one. `append_response` has always
+                // rejected off-term replies; without the same rule here a
+                // candidate can reach quorum on votes cast for an earlier term
+                // and become a second leader in a term another node has won.
+                // Only a grant can complete a quorum, so a denial must never be
+                // the event that promotes this node.
+                if self.role == Role::Candidate && message.term == self.hard_state.term && granted {
+                    self.votes.insert(message.from);
                     if self.has_majority(&self.votes) {
                         effects.extend(self.become_leader());
                     }
                 }
             }
             MessageKind::AppendReq(request) => {
-                effects.extend(self.append_request(&message, request))
+                effects.extend(self.append_request(&message, request, now))
             }
             MessageKind::AppendResp(response) => {
                 effects.extend(self.append_response(&message, response))
@@ -576,6 +632,7 @@ impl RaftNode {
         message: &Message,
         last_index: LogIndex,
         last_term: Term,
+        now: Time,
     ) -> Vec<RaftEffect> {
         let member = self.voters.contains(&message.from);
         let can_vote = self
@@ -590,7 +647,7 @@ impl RaftNode {
         if granted {
             self.hard_state.voted_for = Some(message.from);
             effects.push(RaftEffect::PersistHard(self.hard_state));
-            self.reset_election(Time::from_nanos(0));
+            self.reset_election(now);
         }
         effects.push(RaftEffect::Send(Message {
             proto_version: PROTOCOL_VERSION,
@@ -606,6 +663,10 @@ impl RaftNode {
         self.role = Role::Candidate;
         self.pre_votes.clear();
         self.pre_votes.insert(self.id);
+        // The vote tally belongs to the previous attempt. Leaving it in place
+        // means a single stray `VoteResp` in the new term finds a majority
+        // that was never cast for it.
+        self.votes.clear();
         self.reset_election(now);
         self.voters
             .iter()
@@ -674,7 +735,12 @@ impl RaftNode {
         effects
     }
 
-    fn append_request(&mut self, message: &Message, request: AppendRequest) -> Vec<RaftEffect> {
+    fn append_request(
+        &mut self,
+        message: &Message,
+        request: AppendRequest,
+        now: Time,
+    ) -> Vec<RaftEffect> {
         if message.term < self.hard_state.term {
             return vec![self.make_append_response(
                 message,
@@ -693,7 +759,6 @@ impl RaftNode {
             Role::Learner
         };
         self.leader_id = Some(message.from);
-        self.reset_election(Time::from_nanos(0));
         if self.term_at(request.prev_index) != Some(request.prev_term) {
             let conflict_index = self
                 .log
@@ -708,6 +773,7 @@ impl RaftNode {
                 conflict_index,
             )];
         }
+        self.reset_election(now);
         let mut effects = Vec::new();
         let mut appended = Vec::new();
         for entry in request.entries {
@@ -759,6 +825,12 @@ impl RaftNode {
         conflict_term: Option<Term>,
         conflict_index: LogIndex,
     ) -> RaftEffect {
+        // Echo the round the leader stamped on this append, so it can tell a
+        // fresh confirmation ack from one that predates the read.
+        let read_round = match &message.kind {
+            MessageKind::AppendReq(request) => request.read_round,
+            _ => 0,
+        };
         RaftEffect::Send(Message {
             proto_version: PROTOCOL_VERSION,
             from: self.id,
@@ -769,6 +841,7 @@ impl RaftNode {
                 match_index,
                 conflict_term,
                 conflict_index,
+                read_round,
             }),
         })
     }
@@ -784,7 +857,24 @@ impl RaftNode {
                 .insert(peer, LogIndex::new(response.match_index.get() + 1));
             self.heard_quorum.insert(peer);
             let mut effects = self.advance_commit();
-            effects.extend(self.send_append(peer));
+            // A response carrying an older round was already in flight when the
+            // read index was fixed, so it is not evidence of current leadership.
+            if response.read_round == self.read_round {
+                self.read_acks.insert(peer);
+            }
+            if let Some(index) = self.read_index
+                && self.has_majority(&self.read_acks)
+            {
+                self.read_index = None;
+                effects.push(RaftEffect::ReadBarrierReady { index });
+            }
+            if self
+                .next_index
+                .get(&peer)
+                .is_some_and(|next| *next <= self.last_index())
+            {
+                effects.extend(self.send_append(peer));
+            }
             effects
         } else {
             let next = response.conflict_index.get().max(1);
@@ -825,6 +915,7 @@ impl RaftNode {
                 prev_term,
                 entries,
                 leader_commit: self.commit_index,
+                read_round: self.read_round,
             }),
         })]
     }
@@ -923,6 +1014,13 @@ impl RaftNode {
                     + u64::try_from(data.len()).expect("invariant: snapshot chunk length fits u64"),
             },
         })]
+    }
+
+    /// Arm the election timer from `now`. A process that restarts mid-run must
+    /// call this, or it inherits a deadline measured from time zero and
+    /// campaigns on its first tick.
+    pub fn rearm_election(&mut self, now: Time) {
+        self.reset_election(now);
     }
 
     fn reset_election(&mut self, now: Time) {
@@ -1089,6 +1187,7 @@ mod tests {
                 prev_term: Term::new(0),
                 entries: Vec::new(),
                 leader_commit: LogIndex::new(0),
+                read_round: 0,
             }),
         });
         assert_eq!(follower.role, Role::Follower);
@@ -1119,6 +1218,144 @@ mod tests {
         ));
         leader.commit_index = leader.last_index();
         assert!(leader.request_read().is_ok());
+    }
+
+    #[test]
+    fn trap_readindex_noop() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(1);
+        assert_eq!(leader.request_read(), Err(RaftError::ReadBarrierNotReady));
+
+        leader.log.push(Entry {
+            term: Term::new(1),
+            index: LogIndex::new(1),
+            kind: EntryKind::Noop,
+            payload: Vec::new(),
+        });
+        leader.commit_index = LogIndex::new(1);
+        leader.applied_index = LogIndex::new(1);
+        let effects = leader.request_read().expect("read barrier");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RaftEffect::ReadBarrier { index } if *index == LogIndex::new(1)
+        )));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RaftEffect::ReadBarrierReady { .. }))
+        );
+        // An ack that was already in flight when the read index was fixed
+        // carries the previous round and proves nothing about leadership now.
+        let stale = leader.on_message(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(2),
+            to: NodeId::new(1),
+            term: Term::new(1),
+            kind: MessageKind::AppendResp(AppendResponse {
+                success: true,
+                match_index: LogIndex::new(1),
+                conflict_term: None,
+                conflict_index: LogIndex::new(0),
+                read_round: 0,
+            }),
+        });
+        assert!(
+            !stale
+                .iter()
+                .any(|effect| matches!(effect, RaftEffect::ReadBarrierReady { .. })),
+            "a pre-read ack must not confirm the read quorum"
+        );
+
+        let effects = leader.on_message(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(2),
+            to: NodeId::new(1),
+            term: Term::new(1),
+            kind: MessageKind::AppendResp(AppendResponse {
+                success: true,
+                match_index: LogIndex::new(1),
+                conflict_term: None,
+                conflict_index: LogIndex::new(0),
+                read_round: 1,
+            }),
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RaftEffect::ReadBarrierReady { index } if *index == LogIndex::new(1)
+        )));
+    }
+
+    #[test]
+    fn trap_timer_reset_discipline() {
+        let mut follower = node(2);
+        let before = follower.election_deadline;
+        let effects = follower.on_message_at(
+            Message {
+                proto_version: PROTOCOL_VERSION,
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                term: Term::new(0),
+                kind: MessageKind::AppendReq(AppendRequest {
+                    prev_index: LogIndex::new(1),
+                    prev_term: Term::new(0),
+                    entries: Vec::new(),
+                    leader_commit: LogIndex::new(0),
+                    read_round: 0,
+                }),
+            },
+            Time::from_nanos(1_000_000_000),
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, RaftEffect::Send(_)))
+        );
+        assert_eq!(follower.election_deadline, before);
+
+        follower.on_message_at(
+            Message {
+                proto_version: PROTOCOL_VERSION,
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                term: Term::new(0),
+                kind: MessageKind::AppendReq(AppendRequest {
+                    prev_index: LogIndex::new(0),
+                    prev_term: Term::new(0),
+                    entries: Vec::new(),
+                    leader_commit: LogIndex::new(0),
+                    read_round: 0,
+                }),
+            },
+            Time::from_nanos(1_000_000_000),
+        );
+        assert!(follower.election_deadline > Time::from_nanos(1_000_000_000));
+    }
+
+    #[test]
+    fn trap_snapshot_ordering() {
+        let mut follower = node(2);
+        follower.commit_index = LogIndex::new(2);
+        follower.applied_index = LogIndex::new(2);
+        let effects = follower.on_message(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(1),
+            to: NodeId::new(2),
+            term: Term::new(1),
+            kind: MessageKind::SnapshotChunk {
+                last_included_index: LogIndex::new(3),
+                last_included_term: Term::new(1),
+                offset: 0,
+                data: vec![1, 2, 3],
+                done: true,
+            },
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, RaftEffect::Send(_)))
+        );
+        assert!(follower.applied_index <= follower.commit_index);
     }
 
     #[test]
@@ -1178,6 +1415,56 @@ mod tests {
     #[test]
     fn invariants_hold_for_empty_node() {
         assert!(node(1).invariants().is_ok());
+    }
+
+    #[test]
+    fn trap_stale_vote_tally_cannot_elect_in_a_later_term() {
+        // Found by the message-soup campaign at seed 0x66a: a node kept the
+        // vote tally from an election it had already left, so one stray
+        // response in a later term promoted it on consent nobody gave —
+        // two leaders in one term.
+        let mut n3 = node(3);
+        n3.on_timer(Time::from_nanos(1_000_000), TimerKind::Election);
+        let grant = |from: u64, term: u64, granted: bool, kind_is_pre: bool| Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(from),
+            to: NodeId::new(3),
+            term: Term::new(term),
+            kind: if kind_is_pre {
+                MessageKind::PreVoteResp { granted }
+            } else {
+                MessageKind::VoteResp { granted }
+            },
+        };
+        n3.on_message(grant(2, 1, true, true));
+        n3.on_message(grant(2, 1, true, false));
+        assert_eq!(n3.role, Role::Leader, "the honest term-1 win still works");
+        assert_eq!(n3.hard_state.term, Term::new(1));
+
+        // A higher term knocks it down; the term-1 tally must not survive.
+        n3.on_message(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(1),
+            to: NodeId::new(3),
+            term: Term::new(2),
+            kind: MessageKind::VoteReq {
+                last_index: LogIndex::new(0),
+                last_term: Term::new(0),
+            },
+        });
+        assert_eq!(n3.role, Role::Follower);
+        assert!(n3.votes.is_empty(), "tally survived a term change");
+
+        // Re-entering the pre-vote phase must not resurrect it either, and a
+        // lone denial must never be the event that promotes a candidate.
+        n3.on_timer(Time::from_nanos(2_000_000), TimerKind::Election);
+        assert!(n3.votes.is_empty(), "tally survived a new pre-vote round");
+        n3.on_message(grant(1, 2, false, false));
+        assert_ne!(
+            n3.role,
+            Role::Leader,
+            "a denial elected a leader on a stale tally"
+        );
     }
 
     #[test]
@@ -1241,18 +1528,328 @@ mod tests {
         assert!(leader.joint_active());
     }
 
+    /// Beacons proving a schedule reached the states the soup exists to
+    /// stress. A campaign that quietly stops electing leaders or committing
+    /// entries has decayed into a smoke test; asserting on these at the end
+    /// makes that decay a failure instead of a fast green run.
+    #[derive(Default)]
+    struct Coverage {
+        elections: u64,
+        committed_indices: u64,
+        truncations: u64,
+        duplicates: u64,
+        drops: u64,
+    }
+
+    /// Three real nodes, a pool of in-flight messages, and a scheduler free to
+    /// deliver them late, twice, or never.
+    ///
+    /// Only messages a node actually emitted ever enter the pool. Raft promises
+    /// nothing against forged traffic, so injecting a synthetic message would
+    /// manufacture a failure rather than find one; reordering, duplication and
+    /// loss are the whole legal fault palette of an asynchronous network.
+    struct Soup {
+        nodes: BTreeMap<NodeId, RaftNode>,
+        inflight: Vec<Message>,
+        rng: Xoshiro256pp,
+        now: Time,
+        /// The entry some node had already committed at an index, with the term
+        /// it was committed in, so a later disagreement is a safety violation
+        /// while a stale leader from an earlier term is not.
+        committed: BTreeMap<u64, (Entry, u64)>,
+        leader_for_term: BTreeMap<u64, NodeId>,
+        coverage: Coverage,
+    }
+
+    impl Soup {
+        fn new(seed: u64) -> Self {
+            let mut nodes = BTreeMap::new();
+            for id in 1..=3_u64 {
+                nodes.insert(
+                    NodeId::new(id),
+                    RaftNode::new(
+                        NodeId::new(id),
+                        voters(),
+                        Seed::new(seed.wrapping_mul(3).wrapping_add(id)),
+                        RaftConfig::default(),
+                    ),
+                );
+            }
+            Self {
+                nodes,
+                inflight: Vec::new(),
+                rng: Xoshiro256pp::stream(Seed::new(seed), "message-soup", 0),
+                now: Time::from_nanos(0),
+                committed: BTreeMap::new(),
+                leader_for_term: BTreeMap::new(),
+                coverage: Coverage::default(),
+            }
+        }
+
+        fn pick_node(&mut self) -> NodeId {
+            NodeId::new(self.rng.range_u64(1, 4))
+        }
+
+        /// Queue what a node emitted. The pool is bounded because an unbounded
+        /// one turns a long schedule into a memory test; shedding the oldest
+        /// message is just one more legal loss.
+        fn route(&mut self, effects: Vec<RaftEffect>) {
+            for effect in effects {
+                match effect {
+                    RaftEffect::Send(message) => self.inflight.push(message),
+                    RaftEffect::TruncateSuffix(_) => self.coverage.truncations += 1,
+                    _ => {}
+                }
+            }
+            while self.inflight.len() > 64 {
+                self.inflight.remove(0);
+                self.coverage.drops += 1;
+            }
+        }
+
+        fn deliver(&mut self, position: usize, keep: bool) {
+            let message = if keep {
+                self.coverage.duplicates += 1;
+                self.inflight[position].clone()
+            } else {
+                self.inflight.remove(position)
+            };
+            let now = self.now;
+            let Some(node) = self.nodes.get_mut(&message.to) else {
+                return;
+            };
+            let effects = node.on_message_at(message, now);
+            self.route(effects);
+        }
+
+        fn step(&mut self) {
+            // 1-20ms of jitter per step, so heartbeat and election deadlines
+            // interleave differently from one schedule to the next.
+            self.now = Time::from_nanos(
+                self.now
+                    .as_nanos()
+                    .saturating_add(self.rng.range_u64(1_000_000, 20_000_000)),
+            );
+            let choice = self.rng.range_u64(0, 100);
+            let pending = self.inflight.len();
+            if pending > 0 && choice < 70 {
+                // Deliver from anywhere in the pool, not the head: arrival order
+                // is the thing under test.
+                let position =
+                    usize::try_from(self.rng.range_u64(0, pending as u64)).expect("in range");
+                if choice < 8 {
+                    self.deliver(position, true);
+                } else if choice < 14 {
+                    self.inflight.remove(position);
+                    self.coverage.drops += 1;
+                } else {
+                    self.deliver(position, false);
+                }
+                return;
+            }
+            let now = self.now;
+            if choice < 84 {
+                let id = self.pick_node();
+                let effects = self
+                    .nodes
+                    .get_mut(&id)
+                    .expect("invariant: soup nodes are 1..=3")
+                    .on_timer(now, TimerKind::Election);
+                self.route(effects);
+            } else if choice < 93 {
+                let id = self.pick_node();
+                let effects = self
+                    .nodes
+                    .get_mut(&id)
+                    .expect("invariant: soup nodes are 1..=3")
+                    .on_timer(now, TimerKind::Heartbeat);
+                self.route(effects);
+            } else {
+                let id = self.pick_node();
+                let payload = self.now.as_nanos().to_le_bytes().to_vec();
+                let node = self
+                    .nodes
+                    .get_mut(&id)
+                    .expect("invariant: soup nodes are 1..=3");
+                // A non-leader answering `NotLeader` is the correct outcome, not
+                // a harness error.
+                if let Ok(effects) = node.propose(payload) {
+                    self.route(effects);
+                }
+            }
+        }
+
+        /// The four cross-node safety properties. Each assertion carries the
+        /// seed and step so a failure reproduces from the message alone.
+        fn check(&mut self, seed: u64, step: usize) {
+            let where_ = || format!("seed {seed:#018x} step {step}");
+
+            for node in self.nodes.values() {
+                let report = node.invariants();
+                assert!(
+                    report.is_ok(),
+                    "{}: node {} local invariants {:?}",
+                    where_(),
+                    node.id,
+                    report.violations
+                );
+            }
+
+            // Election safety: at most one leader per term.
+            let leaders: Vec<(u64, NodeId)> = self
+                .nodes
+                .values()
+                .filter(|node| node.role == Role::Leader)
+                .map(|node| (node.hard_state.term.get(), node.id))
+                .collect();
+            for (term, id) in leaders {
+                match self.leader_for_term.get(&term) {
+                    Some(existing) => assert_eq!(
+                        *existing,
+                        id,
+                        "{}: term {term} had leaders {existing} and {id}",
+                        where_()
+                    ),
+                    None => {
+                        self.leader_for_term.insert(term, id);
+                        self.coverage.elections += 1;
+                    }
+                }
+            }
+
+            let ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+            for (position, left_id) in ids.iter().enumerate() {
+                for right_id in &ids[position + 1..] {
+                    let left = &self.nodes[left_id];
+                    let right = &self.nodes[right_id];
+                    for left_entry in &left.log {
+                        let Some(right_entry) = right
+                            .log
+                            .iter()
+                            .find(|entry| entry.index == left_entry.index)
+                        else {
+                            continue;
+                        };
+                        // Log matching: agreement on (index, term) is agreement
+                        // on the entry.
+                        if left_entry.term == right_entry.term {
+                            assert_eq!(
+                                left_entry,
+                                right_entry,
+                                "{}: log matching at {} between {left_id} and {right_id}",
+                                where_(),
+                                left_entry.index
+                            );
+                        }
+                        // State machine safety: two nodes cannot commit
+                        // different entries at one index.
+                        if left_entry.index <= left.commit_index
+                            && right_entry.index <= right.commit_index
+                        {
+                            assert_eq!(
+                                left_entry,
+                                right_entry,
+                                "{}: committed divergence at {} between {left_id} and {right_id}",
+                                where_(),
+                                left_entry.index
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Record what is now committed anywhere, and hold it immutable.
+            let mut seen: Vec<(Entry, u64)> = Vec::new();
+            for node in self.nodes.values() {
+                for entry in &node.log {
+                    if entry.index <= node.commit_index {
+                        seen.push((entry.clone(), node.hard_state.term.get()));
+                    }
+                }
+            }
+            for (entry, term) in seen {
+                match self.committed.get(&entry.index.get()) {
+                    Some((previous, _)) => assert_eq!(
+                        *previous,
+                        entry,
+                        "{}: committed entry at {} changed",
+                        where_(),
+                        entry.index
+                    ),
+                    None => {
+                        self.committed.insert(entry.index.get(), (entry, term));
+                        self.coverage.committed_indices += 1;
+                    }
+                }
+            }
+
+            // Leader completeness: a leader of a strictly later term than the
+            // one an entry committed in must carry that entry. Earlier-term
+            // leaders are excluded because a partitioned stale leader that has
+            // not yet stepped down is legal Raft.
+            for node in self.nodes.values() {
+                if node.role != Role::Leader {
+                    continue;
+                }
+                for (index, (entry, commit_term)) in &self.committed {
+                    if node.hard_state.term.get() <= *commit_term {
+                        continue;
+                    }
+                    let held = node
+                        .log
+                        .iter()
+                        .find(|candidate| candidate.index.get() == *index);
+                    assert_eq!(
+                        held,
+                        Some(entry),
+                        "{}: leader {} of term {} lacks entry {index} committed in term {commit_term}",
+                        where_(),
+                        node.id,
+                        node.hard_state.term
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "G4 message-soup campaign; run explicitly in release mode"]
     fn message_soup_campaign_100k_schedules() {
+        let mut total = Coverage::default();
         for seed in 0..100_000_u64 {
-            let mut candidate = RaftNode::new(
-                NodeId::new(1),
-                voters(),
-                Seed::new(seed),
-                RaftConfig::default(),
-            );
-            let _ = candidate.on_timer(Time::from_nanos(1_000_000_000), TimerKind::Election);
-            assert!(candidate.invariants().is_ok());
+            let mut soup = Soup::new(seed);
+            for step in 0..64 {
+                soup.step();
+                soup.check(seed, step);
+            }
+            total.elections += soup.coverage.elections;
+            total.committed_indices += soup.coverage.committed_indices;
+            total.truncations += soup.coverage.truncations;
+            total.duplicates += soup.coverage.duplicates;
+            total.drops += soup.coverage.drops;
         }
+        // A gate run should be able to show what it exercised, not just that it
+        // returned zero.
+        println!(
+            "message soup: schedules=100000 elections={} committed_indices={} truncations={} duplicates={} drops={}",
+            total.elections,
+            total.committed_indices,
+            total.truncations,
+            total.duplicates,
+            total.drops
+        );
+        // Without these the campaign could pass by never reaching a leader,
+        // which is exactly how the previous version of this test stayed green.
+        assert!(total.elections > 0, "no leader was ever elected");
+        assert!(
+            total.committed_indices > 0,
+            "no entry was ever committed under reordering"
+        );
+        assert!(
+            total.truncations > 0,
+            "no follower ever truncated a conflicting suffix"
+        );
+        assert!(total.duplicates > 0, "no message was ever redelivered");
+        assert!(total.drops > 0, "no message was ever lost");
     }
 }

@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn trap_sessions_in_snapshot_and_applied_index_atomicity() {
+    fn trap_sessions_in_snapshot() {
         let mut kv = kv();
         kv.apply(
             LogIndex::new(4),
@@ -696,5 +696,25 @@ mod tests {
             restored.read(KvCommand::Get { key: b"a".to_vec() }, Time::from_nanos(1)),
             Ok(KvReply::Value(Some(b"one".to_vec())))
         );
+    }
+
+    #[test]
+    fn trap_applied_index_atomicity() {
+        let mut kv = kv();
+        kv.apply(
+            LogIndex::new(4),
+            Term::new(2),
+            ClientId::new(7),
+            1,
+            KvCommand::Set {
+                key: b"a".to_vec(),
+                value: b"one".to_vec(),
+                ttl: None,
+            },
+            Time::from_nanos(1),
+        )
+        .expect("apply");
+        assert_eq!(kv.applied_index, LogIndex::new(4));
+        assert_eq!(kv.applied_term, Term::new(2));
     }
 }
