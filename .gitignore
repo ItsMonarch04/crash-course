@@ -4,6 +4,7 @@
 *.log
 theater/node_modules/
 theater/dist/
+theater/public/wasm/
 /artifacts/
 /ccdb-data/
 bench/results/*.json
