@@ -7,15 +7,24 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Instant;
 
 use cc_checker::{
     CheckerConfig, History, Operation, OperationKind, Outcome, Verdict, check,
-    check_trace_invariants,
+    export_porcupine_json,
 };
-use cc_core::{Seed, Time};
+use cc_core::{Duration, NodeId, Seed, Time};
 use cc_sim::{
-    FaultProfile, RecorderLevel, RunSpec, Sim, canonicalize_fault_plan, deterministic_trace,
-    selfcheck, shrink_fault_plan,
+    FaultAction, FaultAt, FaultPlan, FaultProfile, LinkConfig, RecorderLevel, RunSpec,
+    WorkloadSpec, materialize_fault_plan,
+};
+
+use cc_swarm::{
+    ClusterRun, DETERMINISM_PROFILES, deterministic_cluster_trace, deterministic_cluster_trace_for,
+    reproduces_failure, run_spec, shrink_cluster_plan,
 };
 
 fn main() -> io::Result<()> {
@@ -24,7 +33,7 @@ fn main() -> io::Result<()> {
         Some("--determinism") => emit_determinism_trace(),
         Some("--determinism-seeds") => run_determinism_seeds(parse_u64(&args, 1, 1_000)),
         Some("--selfcheck") => {
-            selfcheck(Seed::new(0xcc)).map_err(io::Error::other)?;
+            selfcheck_cluster(Seed::new(0xcc)).map_err(io::Error::other)?;
             println!("selfcheck: PASS");
             Ok(())
         }
@@ -33,6 +42,7 @@ fn main() -> io::Result<()> {
         Some("regress") => run_regressions(),
         Some("shrink") => run_shrink(&args[1..]),
         Some("check-history") => check_history(&args[1..]),
+        Some("export-porcupine") => export_porcupine(&args[1..]),
         _ => {
             print_help();
             Ok(())
@@ -41,67 +51,133 @@ fn main() -> io::Result<()> {
 }
 
 fn emit_determinism_trace() -> io::Result<()> {
-    io::stdout().write_all(&deterministic_trace(Seed::new(0xcc)))
+    io::stdout().write_all(&deterministic_cluster_trace(Seed::new(0xcc)))
 }
 
 fn run_determinism_seeds(count: u64) -> io::Result<()> {
     for seed in 0..count {
-        selfcheck(Seed::new(seed)).map_err(io::Error::other)?;
+        selfcheck_cluster(Seed::new(seed)).map_err(io::Error::other)?;
     }
     println!("determinism: PASS seeds={count}");
     Ok(())
 }
 
+fn selfcheck_cluster(seed: Seed) -> Result<(), &'static str> {
+    for profile in DETERMINISM_PROFILES {
+        let first = deterministic_cluster_trace_for(seed, profile);
+        let second = deterministic_cluster_trace_for(seed, profile);
+        if first != second {
+            return Err("cluster determinism divergence");
+        }
+    }
+    let first = deterministic_cluster_trace(seed);
+    let second = deterministic_cluster_trace(seed);
+    if first == second {
+        Ok(())
+    } else {
+        Err("cluster trace diverged on the second run")
+    }
+}
+
 fn run_one(args: &[String]) -> io::Result<()> {
     let seed = parse_seed(args, 0);
     let profile = parse_profile(args, FaultProfile::Calm);
-    let spec = RunSpec::standard(seed, profile);
-    let mut sim = Sim::new(seed, spec.config, RecorderLevel::Campaign);
-    sim.seed_toy_ticks();
-    let trace = sim.run_toy().map_err(io::Error::other)?;
-    let report = check_trace_invariants(&trace);
-    let history_verdict = check(&history_for_seed(seed), CheckerConfig::default());
-    println!(
-        "seed={} profile={} events={} trace_verdict={} history_verdict={}",
-        seed,
-        profile.as_str(),
-        trace.events.len(),
-        if report.is_ok() { "ok" } else { "failed" },
-        verdict_name(&history_verdict)
-    );
+    let spec = fixture_spec(seed, profile, false);
+    let run = run_spec(spec, RecorderLevel::Theater).map_err(io::Error::other)?;
+    print_run_summary(seed, profile, &run, "one");
     if has_flag(args, "--export-json") {
         fs::create_dir_all("artifacts")?;
-        fs::write(format!("artifacts/{seed}.json"), trace.to_json())?;
+        fs::write(format!("artifacts/{seed}.json"), run.artifact_json(profile))?;
     }
-    Ok(())
+    if let Some(path) = parse_string_flag(args, "--export-history") {
+        let written = write_history_tsv(&path, &run.history)?;
+        println!("history export file={path} operations={written}");
+    }
+    if run.healthy() {
+        Ok(())
+    } else {
+        Err(io::Error::other("cluster fixture found a failure"))
+    }
 }
 
 fn run_campaign(args: &[String]) -> io::Result<()> {
     let seeds = parse_u64_flag(args, "--seeds").unwrap_or(1);
     let profile = parse_profile(args, FaultProfile::Rough);
-    let jobs = parse_u64_flag(args, "--jobs").unwrap_or(1);
+    let jobs = parse_u64_flag(args, "--jobs").unwrap_or(1).max(1);
+    let worker_count = jobs.min(seeds.max(1)) as usize;
+    let next_seed = Arc::new(AtomicU64::new(0));
+    let export_json = has_flag(args, "--export-json");
+    fs::create_dir_all("artifacts")?;
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let next_seed = Arc::clone(&next_seed);
+        workers.push(thread::spawn(move || -> io::Result<(u64, u64, u64)> {
+            let mut failures = 0_u64;
+            let mut history_failures = 0_u64;
+            let mut events = 0_u64;
+            loop {
+                let seed = next_seed.fetch_add(1, Ordering::Relaxed);
+                if seed >= seeds {
+                    break;
+                }
+                let result = run_spec(
+                    fixture_spec(Seed::new(seed), profile, true),
+                    RecorderLevel::Campaign,
+                )
+                .map_err(|error| error.to_string());
+                match result {
+                    Ok(run) => {
+                        events = events.saturating_add(run.event_count);
+                        let failed = !run.healthy();
+                        let history_failed = !matches!(run.verdict, Verdict::Linearizable { .. });
+                        if failed {
+                            failures = failures.saturating_add(1);
+                        }
+                        if history_failed {
+                            history_failures = history_failures.saturating_add(1);
+                        }
+                        if failed || history_failed || export_json {
+                            fs::write(format!("artifacts/{seed}.json"), run.artifact_json(profile))?;
+                        }
+                    }
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        fs::write(
+                            format!("artifacts/{seed}.json"),
+                            format!(
+                                "{{\"fixture_version\":1,\"seed\":\"{seed}\",\"profile\":\"{}\",\"error\":\"{}\"}}",
+                                profile.as_str(),
+                                json_escape(&error)
+                            ),
+                        )?;
+                    }
+                }
+            }
+            Ok((failures, history_failures, events))
+        }));
+    }
     let mut failures = 0_u64;
     let mut history_failures = 0_u64;
-    for seed in 0..seeds {
-        let spec = RunSpec::standard(Seed::new(seed), profile);
-        let mut sim = Sim::new(spec.seed, spec.config, RecorderLevel::Campaign);
-        sim.seed_toy_ticks();
-        let trace = sim.run_toy().map_err(io::Error::other)?;
-        if !check_trace_invariants(&trace).is_ok() {
-            failures += 1;
-        }
-        if !matches!(
-            check(&history_for_seed(Seed::new(seed)), CheckerConfig::default()),
-            Verdict::Linearizable { .. }
-        ) {
-            history_failures += 1;
-        }
+    let mut events = 0_u64;
+    for worker in workers {
+        let (worker_failures, worker_history_failures, worker_events) = worker
+            .join()
+            .map_err(|_| io::Error::other("campaign worker panicked"))??;
+        failures = failures.saturating_add(worker_failures);
+        history_failures = history_failures.saturating_add(worker_history_failures);
+        events = events.saturating_add(worker_events);
     }
+    let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
     println!(
-        "campaign profile={} seeds={} jobs={} failures={failures} history_failures={history_failures}",
+        "campaign profile={} seeds={} jobs={} failures={} history_failures={} events={} runs_per_sec={:.2}",
         profile.as_str(),
         seeds,
-        jobs
+        jobs,
+        failures,
+        history_failures,
+        events,
+        f64::from(seeds as u32) / elapsed
     );
     if failures == 0 && history_failures == 0 {
         Ok(())
@@ -112,31 +188,89 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
 
 fn run_regressions() -> io::Result<()> {
     let path = Path::new("exhibits/regressions.toml");
-    if path.exists() {
-        let content = fs::read_to_string(path)?;
-        let entries = content
-            .lines()
-            .filter(|line| line.starts_with("[["))
-            .count();
-        println!("regressions: PASS entries={entries}");
-    } else {
+    if !path.exists() {
         println!("regressions: PASS entries=0");
+        return Ok(());
     }
+    let content = fs::read_to_string(path)?;
+    let mut entries = Vec::new();
+    let mut seed = None;
+    let mut profile = FaultProfile::Rough;
+    for line in content.lines().map(str::trim) {
+        if line == "[[regression]]" {
+            if let Some(seed) = seed.take() {
+                entries.push((seed, profile));
+            }
+        } else if let Some(value) = line.strip_prefix("seed =") {
+            seed = parse_seed_text(value.trim().trim_matches('"'));
+        } else if let Some(value) = line.strip_prefix("profile =") {
+            profile = FaultProfile::parse(value.trim().trim_matches('"')).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid regression profile")
+            })?;
+        }
+    }
+    if let Some(seed) = seed {
+        entries.push((seed, profile));
+    }
+    // A corpus entry records a seed that once failed and has since been fixed,
+    // so the assertion is that it stays clean. Requiring it to keep failing
+    // would make the corpus impossible to populate after a fix.
+    for (seed, profile) in &entries {
+        let run = run_spec(fixture_spec(*seed, *profile, true), RecorderLevel::Campaign)
+            .map_err(io::Error::other)?;
+        if !run.healthy() {
+            return Err(io::Error::other(format!(
+                "regression {seed} ({}) reopened: invariants or liveness failed",
+                profile.as_str()
+            )));
+        }
+        if !matches!(run.verdict, Verdict::Linearizable { .. }) {
+            return Err(io::Error::other(format!(
+                "regression {seed} ({}) reopened: history is no longer linearizable",
+                profile.as_str()
+            )));
+        }
+    }
+    println!("regressions: PASS entries={}", entries.len());
     Ok(())
 }
 
 fn run_shrink(args: &[String]) -> io::Result<()> {
-    let failure = parse_string_flag(args, "--failure").unwrap_or_else(|| String::from("(none)"));
-    let spec = RunSpec::standard(Seed::new(0x2a), FaultProfile::Rough);
-    let canonical = canonicalize_fault_plan(&spec.plan);
-    let shrunk = shrink_fault_plan(&canonical, |_| true);
+    let failure = parse_string_flag(args, "--failure");
+    let failure_text = failure.as_deref().map(fs::read_to_string).transpose()?;
+    let seed = failure_text
+        .as_deref()
+        .and_then(extract_seed)
+        .unwrap_or(Seed::new(0x2a));
+    let profile = failure_text
+        .as_deref()
+        .and_then(extract_profile)
+        .unwrap_or(FaultProfile::Rough);
+    let spec = failure_text
+        .as_deref()
+        .map(|text| extract_run_spec(text, seed, profile))
+        .unwrap_or_else(|| fixture_spec(seed, profile, true));
+    let canonical = cc_sim::canonicalize_fault_plan(&spec.plan);
+    let shrunk = shrink_cluster_plan(&RunSpec {
+        plan: canonical.clone(),
+        ..spec.clone()
+    });
+    let reproduces = reproduces_failure(&RunSpec {
+        plan: shrunk.clone(),
+        ..spec
+    });
     println!(
-        "shrinker: input={} canonical_actions={} shrunk_actions={}",
-        failure,
+        "shrinker: input={} canonical_actions={} shrunk_actions={} reproduces={}",
+        failure.as_deref().unwrap_or("(standard fixture)"),
         canonical.actions.len(),
-        shrunk.actions.len()
+        shrunk.actions.len(),
+        reproduces
     );
-    Ok(())
+    if reproduces {
+        Ok(())
+    } else {
+        Err(io::Error::other("shrinker lost the reproduce oracle"))
+    }
 }
 
 fn check_history(args: &[String]) -> io::Result<()> {
@@ -146,7 +280,91 @@ fn check_history(args: &[String]) -> io::Result<()> {
             "check-history requires --file PATH",
         )
     })?;
-    let text = fs::read_to_string(&path)?;
+    let history = read_history(&path)?;
+    let verdict = check(&history, CheckerConfig::default());
+    println!("history file={path} verdict={}", verdict_name(&verdict));
+    if matches!(verdict, Verdict::Linearizable { .. }) {
+        Ok(())
+    } else {
+        Err(io::Error::other("real history is not linearizable"))
+    }
+}
+
+fn export_porcupine(args: &[String]) -> io::Result<()> {
+    let path = parse_string_flag(args, "--file").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export-porcupine requires --file PATH",
+        )
+    })?;
+    let history = read_history(&path)?;
+    let json = export_porcupine_json(&history);
+    if let Some(output) = parse_string_flag(args, "--output") {
+        fs::write(&output, json)?;
+        println!(
+            "porcupine export file={output} operations={}",
+            history.operations.len()
+        );
+    } else {
+        println!("{json}");
+    }
+    Ok(())
+}
+
+/// Render a produced history in the same TSV shape `read_history` parses, so a
+/// real campaign history can feed `check-history` and the Porcupine export
+/// instead of a hand-written toy.
+fn write_history_tsv(path: &str, history: &History) -> io::Result<usize> {
+    let mut out = String::from("# CC-HISTORY v1: KIND KEY OBSERVED_VALUE INVOKE_NS COMPLETE_NS\n");
+    let mut written = 0_usize;
+    for operation in &history.operations {
+        // Only completed operations have an observed value; an ambiguous
+        // timeout is not representable in this shape and is skipped.
+        let Some(complete) = operation.complete else {
+            continue;
+        };
+        let (kind, key) = match &operation.kind {
+            OperationKind::Set { key, .. } => ("SET", key.clone()),
+            OperationKind::Get { key } => ("GET", key.clone()),
+            OperationKind::Del { key } => ("DEL", key.clone()),
+            OperationKind::Incr { key } => ("INCR", key.clone()),
+            OperationKind::Cas { key, .. } => ("CAS", key.clone()),
+            OperationKind::Scan { .. } => continue,
+        };
+        let value = match (&operation.outcome, kind) {
+            (Outcome::Value(Some(value)), _) => hex_value(value),
+            (Outcome::Value(None), _) => String::from("-"),
+            (Outcome::Integer(value), _) => value.to_string(),
+            (Outcome::Ok, "SET") => match &operation.kind {
+                OperationKind::Set { value, .. } => hex_value(value),
+                _ => String::from("-"),
+            },
+            (Outcome::Ok, _) => String::from("-"),
+            _ => continue,
+        };
+        out.push_str(&format!(
+            "{kind}\t{}\t{value}\t{}\t{}\n",
+            hex_value(&key),
+            operation.invoke.as_nanos(),
+            complete.as_nanos()
+        ));
+        written += 1;
+    }
+    fs::write(path, out)?;
+    Ok(written)
+}
+
+/// Keys and values are arbitrary bytes; the TSV shape is tab-delimited text, so
+/// render them as hex to keep the format unambiguous.
+fn hex_value(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::from("-");
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn read_history(path: &str) -> io::Result<History> {
+    let text = fs::read_to_string(path)?;
     let mut history = History::default();
     for (line_number, line) in text.lines().enumerate() {
         if line.is_empty() || line.starts_with('#') {
@@ -161,13 +379,41 @@ fn check_history(args: &[String]) -> io::Result<()> {
         })?;
         history.push(operation);
     }
-    let verdict = check(&history, CheckerConfig::default());
-    println!("history file={path} verdict={}", verdict_name(&verdict));
-    if matches!(verdict, Verdict::Linearizable { .. }) {
-        Ok(())
+    Ok(history)
+}
+
+fn fixture_spec(seed: Seed, profile: FaultProfile, campaign: bool) -> RunSpec {
+    let end_time = if campaign {
+        Time::from_nanos(3_000_000_000)
     } else {
-        Err(io::Error::other("real history is not linearizable"))
-    }
+        Time::from_nanos(6_000_000_000)
+    };
+    let node_count = 5;
+    let nodes: Vec<NodeId> = (1..=node_count).map(NodeId::new).collect();
+    let mut spec = RunSpec::standard(seed, profile);
+    spec.config.end_time = end_time;
+    spec.end_time = end_time;
+    spec.plan = materialize_fault_plan(seed, profile, &nodes, end_time);
+    spec.workload = WorkloadSpec {
+        clients: 2,
+        ops_per_second: 10,
+        keyspace: 16,
+    };
+    spec
+}
+
+fn print_run_summary(seed: Seed, profile: FaultProfile, run: &ClusterRun, command: &str) {
+    println!(
+        "{} seed={} profile={} events={} history={} completed={} healthy={} verdict={}",
+        command,
+        seed,
+        profile.as_str(),
+        run.event_count,
+        run.history.operations.len(),
+        run.completed_operations,
+        run.healthy(),
+        verdict_name(&run.verdict)
+    );
 }
 
 fn parse_history_operation(fields: &[&str]) -> Result<Operation, &'static str> {
@@ -219,30 +465,128 @@ fn parse_history_operation(fields: &[&str]) -> Result<Operation, &'static str> {
     ))
 }
 
-fn history_for_seed(seed: Seed) -> History {
-    let key = format!("k{}", seed.0).into_bytes();
-    let value = seed.0.to_string().into_bytes();
-    History {
-        operations: vec![
-            Operation::completed(
-                1,
-                OperationKind::Set {
-                    key: key.clone(),
-                    value: value.clone(),
-                },
-                Time::from_nanos(1),
-                Time::from_nanos(2),
-                Outcome::Ok,
-            ),
-            Operation::completed(
-                2,
-                OperationKind::Get { key },
-                Time::from_nanos(3),
-                Time::from_nanos(4),
-                Outcome::Value(Some(value)),
-            ),
-        ],
+fn extract_seed(text: &str) -> Option<Seed> {
+    text.split("\"seed\":\"")
+        .nth(1)
+        .and_then(|value| value.split('"').next())
+        .and_then(parse_seed_text)
+}
+
+fn extract_profile(text: &str) -> Option<FaultProfile> {
+    text.split("\"profile\":\"")
+        .nth(1)
+        .and_then(|value| value.split('"').next())
+        .and_then(FaultProfile::parse)
+}
+
+fn parse_seed_text(value: &str) -> Option<Seed> {
+    let value = value.trim_start_matches("0x");
+    u64::from_str_radix(value, 16).ok().map(Seed::new)
+}
+
+fn extract_run_spec(text: &str, seed: Seed, profile: FaultProfile) -> RunSpec {
+    let mut spec = fixture_spec(seed, profile, true);
+    if let Some(node_count) = extract_number(text, "\"node_count\":") {
+        spec.config.node_count = node_count;
     }
+    if let Some(end_time) = extract_number(text, "\"end_time_ns\":") {
+        spec.config.end_time = Time::from_nanos(end_time);
+        spec.end_time = spec.config.end_time;
+    }
+    if let Some(clients) = extract_number(text, "\"clients\":") {
+        spec.workload.clients = clients;
+    }
+    if let Some(ops_per_second) = extract_number(text, "\"ops_per_second\":") {
+        spec.workload.ops_per_second = ops_per_second;
+    }
+    if let Some(keyspace) = extract_number(text, "\"keyspace\":") {
+        spec.workload.keyspace = keyspace;
+    }
+    if let Some(faults) = extract_faults(text) {
+        spec.plan = faults;
+    }
+    spec
+}
+
+fn extract_faults(text: &str) -> Option<FaultPlan> {
+    let mut plan = FaultPlan::default();
+    let faults = text.split("\"faults\":[").nth(1)?;
+    for fragment in faults.split("\"at_ns\":").skip(1) {
+        let at = extract_number(fragment, "").unwrap_or(0);
+        let action_text = fragment.split("\"action\":{").nth(1)?;
+        let kind = extract_string(action_text, "\"kind\":\"")?;
+        let action = match kind.as_str() {
+            "partition" => FaultAction::Partition {
+                left: extract_node_array(action_text, "\"left\":[")?,
+                right: extract_node_array(action_text, "\"right\":[")?,
+            },
+            "heal" => FaultAction::Heal,
+            "crash" => FaultAction::Crash {
+                node: NodeId::new(extract_number(action_text, "\"node\":")?),
+            },
+            "restart" => FaultAction::Restart {
+                node: NodeId::new(extract_number(action_text, "\"node\":")?),
+            },
+            "wipe" => FaultAction::Wipe {
+                node: NodeId::new(extract_number(action_text, "\"node\":")?),
+            },
+            "clock-skew" => FaultAction::ClockSkew {
+                node: NodeId::new(extract_number(action_text, "\"node\":")?),
+                offset: Duration::from_nanos(extract_number(action_text, "\"offset_ns\":")?),
+            },
+            "disk-degrade" => FaultAction::DiskDegrade {
+                node: NodeId::new(extract_number(action_text, "\"node\":")?),
+                write_latency: Duration::from_nanos(extract_number(
+                    action_text,
+                    "\"write_latency_ns\":",
+                )?),
+            },
+            "link-degrade" => FaultAction::LinkDegrade {
+                from: NodeId::new(extract_number(action_text, "\"from\":")?),
+                to: NodeId::new(extract_number(action_text, "\"to\":")?),
+                config: LinkConfig::default(),
+            },
+            "reconfigure" => FaultAction::Reconfigure {
+                voters: extract_node_array(action_text, "\"voters\":[")?,
+            },
+            _ => continue,
+        };
+        plan.push(FaultAt {
+            at: Time::from_nanos(at),
+            action,
+        });
+    }
+    Some(plan)
+}
+
+fn extract_node_array(text: &str, marker: &str) -> Option<Vec<NodeId>> {
+    let body = text.split(marker).nth(1)?.split(']').next()?;
+    Some(
+        body.split(',')
+            .filter(|value| !value.is_empty())
+            .map(|value| value.parse().ok().map(NodeId::new))
+            .collect::<Option<Vec<_>>>()?,
+    )
+}
+
+fn extract_number(text: &str, marker: &str) -> Option<u64> {
+    let value = if marker.is_empty() {
+        text
+    } else {
+        text.split(marker).nth(1)?
+    };
+    value
+        .trim_start_matches(|character: char| !character.is_ascii_digit())
+        .split(|character: char| !character.is_ascii_digit())
+        .next()
+        .and_then(|number| number.parse().ok())
+}
+
+fn extract_string(text: &str, marker: &str) -> Option<String> {
+    text.split(marker)
+        .nth(1)
+        .and_then(|value| value.split('"').next())
+        .map(str::to_owned)
 }
 
 fn verdict_name(verdict: &Verdict) -> &'static str {
@@ -262,8 +606,7 @@ fn parse_profile(args: &[String], default: FaultProfile) -> FaultProfile {
 
 fn parse_seed(args: &[String], default: u64) -> Seed {
     parse_string_flag(args, "--seed")
-        .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-        .map(Seed::new)
+        .and_then(|value| parse_seed_text(&value))
         .unwrap_or_else(|| Seed::new(default))
 }
 
@@ -287,10 +630,24 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|value| value == flag)
 }
 
+fn json_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '"' => ['\\', '"'].into_iter().collect::<Vec<_>>(),
+            '\\' => ['\\', '\\'].into_iter().collect::<Vec<_>>(),
+            '\n' => ['\\', 'n'].into_iter().collect::<Vec<_>>(),
+            '\r' => ['\\', 'r'].into_iter().collect::<Vec<_>>(),
+            '\t' => ['\\', 't'].into_iter().collect::<Vec<_>>(),
+            other => [other].into_iter().collect::<Vec<_>>(),
+        })
+        .collect()
+}
+
 fn print_help() {
     println!(concat!(
         "cc-swarm ",
         env!("CARGO_PKG_VERSION"),
-        "\n\nCommands:\n  run --profile rough --seeds N --jobs N\n  one --seed 0x... --profile rough [--export-json]\n  regress\n  shrink --failure PATH\n  check-history --file PATH\n  --selfcheck\n  --determinism\n  --determinism-seeds N"
+        "\n\nCommands:\n  run --profile rough --seeds N --jobs N\n  one --seed 0x... --profile rough [--export-json] [--export-history PATH]\n  regress\n  shrink --failure PATH\n  check-history --file PATH\n  export-porcupine --file PATH [--output PATH]\n  --selfcheck\n  --determinism\n  --determinism-seeds N"
     ));
 }

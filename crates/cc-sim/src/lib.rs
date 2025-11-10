@@ -636,6 +636,12 @@ pub enum FaultAction {
         to: NodeId,
         config: LinkConfig,
     },
+    /// Move the voting set to `voters` via one joint-consensus transition. The
+    /// simulator only carries the node ids; what a joint config means is the
+    /// host's business, so `cc-sim` stays generic per the crate DAG rule.
+    Reconfigure {
+        voters: Vec<NodeId>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -655,6 +661,8 @@ impl FaultPlan {
         self.actions.sort_by(|left, right| left.at.cmp(&right.at));
     }
 
+    /// Liveness is only required of plans that leave a quorum standing, and a
+    /// reconfigure changes which set that quorum is counted over.
     #[must_use]
     pub fn is_survivable(&self, nodes: &[NodeId]) -> bool {
         let wiped: BTreeSet<NodeId> = self
@@ -665,7 +673,16 @@ impl FaultPlan {
                 _ => None,
             })
             .collect();
-        nodes.iter().filter(|node| !wiped.contains(node)).count() * 2 > nodes.len()
+        let voters: Vec<NodeId> = self
+            .actions
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.action {
+                FaultAction::Reconfigure { voters } if !voters.is_empty() => Some(voters.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| nodes.to_vec());
+        voters.iter().filter(|node| !wiped.contains(node)).count() * 2 > voters.len()
     }
 }
 
@@ -767,54 +784,123 @@ pub fn materialize_fault_plan(
     end_time: Time,
 ) -> FaultPlan {
     let mut plan = FaultPlan::default();
-    if matches!(profile, FaultProfile::Calm) || nodes.len() < 3 {
-        return plan;
-    }
-    let mut rng = Xoshiro256pp::stream(seed, "fault-plan", 0);
-    let first = nodes[0];
-    let second = nodes[1];
-    plan.push(FaultAt {
-        at: Time::from_nanos(1_000_000_000 + rng.range_u64(0, 1_000_000_001)),
-        action: FaultAction::Partition {
-            left: vec![first],
-            right: nodes[1..].to_vec(),
-        },
-    });
-    if matches!(
-        profile,
-        FaultProfile::Rough | FaultProfile::Brutal | FaultProfile::Membership | FaultProfile::Wipe
-    ) {
+    let span = end_time.as_nanos();
+    if !matches!(profile, FaultProfile::Calm) && nodes.len() >= 3 && span > 0 {
+        let mut rng = Xoshiro256pp::stream(seed, "fault-plan", 0);
+        let first = nodes[0];
+        let second = nodes[1];
+        // Vary the cut so the campaign is not forever testing "node 1 alone
+        // versus the rest": some seeds isolate one node, some split two off.
+        let minority: Vec<NodeId> = if rng.range_u64(0, 2) == 0 {
+            vec![first]
+        } else {
+            nodes.iter().copied().take(2).collect()
+        };
+        let directional = rng.range_u64(0, 2) == 0;
         plan.push(FaultAt {
-            at: Time::from_nanos(3_000_000_000 + rng.range_u64(0, 1_000_000_001)),
-            action: FaultAction::Crash { node: second },
-        });
-        plan.push(FaultAt {
-            at: Time::from_nanos(5_000_000_000 + rng.range_u64(0, 1_000_000_001)),
-            action: FaultAction::Restart { node: second },
-        });
-    }
-    if matches!(profile, FaultProfile::Wipe) {
-        plan.push(FaultAt {
-            at: Time::from_nanos(2_000_000_000),
-            action: FaultAction::Wipe { node: first },
-        });
-    }
-    if matches!(profile, FaultProfile::Brutal) {
-        plan.push(FaultAt {
-            at: Time::from_nanos(2_500_000_000),
-            action: FaultAction::ClockSkew {
-                node: first,
-                offset: Duration::from_millis(25),
+            at: at_percent(span, 20, &mut rng),
+            action: FaultAction::Partition {
+                left: minority.clone(),
+                right: nodes
+                    .iter()
+                    .copied()
+                    .filter(|id| !minority.contains(id))
+                    .collect(),
             },
         });
+        // A one-way link failure is not the same fault as a partition: the
+        // leader still hears acks while its appends vanish. Seeds that pick a
+        // directional cut exercise the asymmetric case §3.4 calls for.
+        if directional {
+            plan.push(FaultAt {
+                at: at_percent(span, 22, &mut rng),
+                action: FaultAction::LinkDegrade {
+                    from: first,
+                    to: second,
+                    config: LinkConfig {
+                        base_delay: Duration::from_millis(40),
+                        drop: P16::new(24_576),
+                        ..LinkConfig::default()
+                    },
+                },
+            });
+        }
+        if matches!(
+            profile,
+            FaultProfile::Rough
+                | FaultProfile::Brutal
+                | FaultProfile::Membership
+                | FaultProfile::Wipe
+        ) {
+            plan.push(FaultAt {
+                at: at_percent(span, 30, &mut rng),
+                action: FaultAction::Crash { node: second },
+            });
+            plan.push(FaultAt {
+                at: at_percent(span, 50, &mut rng),
+                action: FaultAction::Restart { node: second },
+            });
+        }
+        if matches!(profile, FaultProfile::Membership) {
+            // Shrink the voting set while a node is already down, then restore
+            // it. Which node leaves varies by seed, so the leader is sometimes
+            // the one being removed.
+            let removed = nodes[(rng.range_u64(0, nodes.len() as u64)) as usize];
+            let shrunk: Vec<NodeId> = nodes.iter().copied().filter(|id| *id != removed).collect();
+            plan.push(FaultAt {
+                at: at_percent(span, 40, &mut rng),
+                action: FaultAction::Reconfigure { voters: shrunk },
+            });
+            plan.push(FaultAt {
+                at: at_percent(span, 60, &mut rng),
+                action: FaultAction::Reconfigure {
+                    voters: nodes.to_vec(),
+                },
+            });
+        }
+        if matches!(profile, FaultProfile::Wipe) {
+            plan.push(FaultAt {
+                at: at_percent(span, 25, &mut rng),
+                action: FaultAction::Wipe { node: first },
+            });
+        }
+        if matches!(profile, FaultProfile::Brutal) {
+            plan.push(FaultAt {
+                at: at_percent(span, 35, &mut rng),
+                action: FaultAction::ClockSkew {
+                    node: first,
+                    offset: Duration::from_millis(25),
+                },
+            });
+            plan.push(FaultAt {
+                at: at_percent(span, 45, &mut rng),
+                action: FaultAction::DiskDegrade {
+                    node: second,
+                    write_latency: Duration::from_millis(5),
+                },
+            });
+        }
     }
+    // §7.3's rule is `end_time − 30× election timeout`, but a short campaign run
+    // is shorter than that margin. Clamping to a fraction of the run keeps the
+    // heal late and, crucially, still after every fault above.
+    let heal_margin = cc_raft::DEFAULT_ELECTION_MAX
+        .as_nanos()
+        .saturating_mul(30)
+        .min(span.saturating_mul(30) / 100);
     plan.push(FaultAt {
-        at: end_time
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or(Time::from_nanos(0)),
+        at: Time::from_nanos(span.saturating_sub(heal_margin)),
         action: FaultAction::Heal,
     });
     plan
+}
+
+/// Place a fault at a fraction of the run, with jitter of one percent, so a
+/// three-second campaign run and a sixty-second soak exercise the same shape.
+fn at_percent(span: u64, percent: u64, rng: &mut Xoshiro256pp) -> Time {
+    let base = span.saturating_mul(percent) / 100;
+    let jitter = (span / 100).max(1);
+    Time::from_nanos(base.saturating_add(rng.range_u64(0, jitter)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -890,7 +976,8 @@ impl Lifecycle {
             FaultAction::Partition { .. }
             | FaultAction::Heal
             | FaultAction::DiskDegrade { .. }
-            | FaultAction::LinkDegrade { .. } => {}
+            | FaultAction::LinkDegrade { .. }
+            | FaultAction::Reconfigure { .. } => {}
         }
     }
 
@@ -898,6 +985,109 @@ impl Lifecycle {
         if let Some(state) = self.nodes.iter_mut().find(|state| state.node == node) {
             state.status = status;
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_coverage_tests {
+    use super::*;
+
+    fn kind_name(action: &FaultAction) -> &'static str {
+        match action {
+            FaultAction::Partition { .. } => "partition",
+            FaultAction::Heal => "heal",
+            FaultAction::Crash { .. } => "crash",
+            FaultAction::Restart { .. } => "restart",
+            FaultAction::Wipe { .. } => "wipe",
+            FaultAction::ClockSkew { .. } => "clock-skew",
+            FaultAction::DiskDegrade { .. } => "disk-degrade",
+            FaultAction::LinkDegrade { .. } => "link-degrade",
+            FaultAction::Reconfigure { .. } => "reconfigure",
+        }
+    }
+
+    /// Every fault a plan generates must land inside the run and before the
+    /// closing heal. A campaign horizon shorter than the fault schedule used to
+    /// silently drop crash and restart from every profile.
+    #[test]
+    fn every_generated_fault_lands_inside_the_run_and_before_the_heal() {
+        let nodes: Vec<NodeId> = (1..=5).map(NodeId::new).collect();
+        for span_ns in [1_000_000_000_u64, 3_000_000_000, 60_000_000_000] {
+            let end = Time::from_nanos(span_ns);
+            for profile in [
+                FaultProfile::Rough,
+                FaultProfile::Brutal,
+                FaultProfile::Membership,
+                FaultProfile::Wipe,
+            ] {
+                for seed in 0..64_u64 {
+                    let plan = materialize_fault_plan(Seed::new(seed), profile, &nodes, end);
+                    let heal = plan
+                        .actions
+                        .iter()
+                        .find(|fault| matches!(fault.action, FaultAction::Heal))
+                        .expect("every plan closes with a heal");
+                    for fault in &plan.actions {
+                        assert!(
+                            fault.at <= end,
+                            "{} at {} escapes the {span_ns}ns run",
+                            kind_name(&fault.action),
+                            fault.at.as_nanos()
+                        );
+                        if !matches!(fault.action, FaultAction::Heal) {
+                            assert!(
+                                fault.at < heal.at,
+                                "{} must precede the closing heal",
+                                kind_name(&fault.action)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The palette in `docs` has to be the palette the campaigns actually
+    /// generate — including the directional link cut and both partition shapes.
+    #[test]
+    fn generated_plans_cover_the_whole_fault_palette() {
+        let nodes: Vec<NodeId> = (1..=5).map(NodeId::new).collect();
+        let end = Time::from_nanos(3_000_000_000);
+        let mut kinds = BTreeSet::new();
+        let mut minority_sizes = BTreeSet::new();
+        for profile in [
+            FaultProfile::Rough,
+            FaultProfile::Brutal,
+            FaultProfile::Membership,
+            FaultProfile::Wipe,
+        ] {
+            for seed in 0..256_u64 {
+                for fault in materialize_fault_plan(Seed::new(seed), profile, &nodes, end).actions {
+                    kinds.insert(kind_name(&fault.action));
+                    if let FaultAction::Partition { left, .. } = &fault.action {
+                        minority_sizes.insert(left.len());
+                    }
+                }
+            }
+        }
+        for expected in [
+            "partition",
+            "heal",
+            "crash",
+            "restart",
+            "wipe",
+            "clock-skew",
+            "disk-degrade",
+            "link-degrade",
+            "reconfigure",
+        ] {
+            assert!(kinds.contains(expected), "{expected} is never generated");
+        }
+        assert_eq!(
+            minority_sizes,
+            BTreeSet::from([1, 2]),
+            "partitions must vary the cut, not always isolate node 1"
+        );
     }
 }
 
@@ -990,6 +1180,72 @@ mod tests {
     }
 
     #[test]
+    fn network_duplicate_delivery_is_explicit() {
+        let nodes = [NodeId::new(1), NodeId::new(2)];
+        let mut config = LinkConfig::default();
+        config.duplicate = P16::MAX;
+        let mut network = Network::new(&nodes, Seed::new(5), config);
+        let decisions = network
+            .send(Time::from_nanos(0), nodes[0], nodes[1], vec![7])
+            .expect("send");
+        assert!(
+            decisions
+                .iter()
+                .filter(|decision| matches!(decision, NetworkDecision::Delivered(_)))
+                .count()
+                >= 1
+        );
+    }
+
+    #[test]
+    fn network_max_inflight_drops_until_completion() {
+        let nodes = [NodeId::new(1), NodeId::new(2)];
+        let mut config = LinkConfig::default();
+        config.max_inflight = 1;
+        let mut network = Network::new(&nodes, Seed::new(6), config);
+        let first = network
+            .send(Time::from_nanos(0), nodes[0], nodes[1], vec![1])
+            .expect("first send");
+        assert!(matches!(first[0], NetworkDecision::Delivered(_)));
+        let second = network
+            .send(Time::from_nanos(0), nodes[0], nodes[1], vec![2])
+            .expect("second send");
+        assert_eq!(second, vec![NetworkDecision::Dropped]);
+        network.complete(nodes[0], nodes[1]).expect("complete");
+        assert!(matches!(
+            network
+                .send(Time::from_nanos(0), nodes[0], nodes[1], vec![3])
+                .expect("retry")[0],
+            NetworkDecision::Delivered(_)
+        ));
+    }
+
+    #[test]
+    fn disk_cross_file_reordering_is_lost_without_each_fsync() {
+        let mut disk = SimDisk::new();
+        let wal = cc_env::FileId::Wal { segment: 0 };
+        let sst = cc_env::FileId::Sst { file_no: 1 };
+        disk.write(wal, 0, b"wal").expect("wal");
+        disk.fsync(wal).expect("wal fsync");
+        disk.write(sst, 0, b"sst").expect("sst");
+        disk.crash();
+        assert_eq!(disk.durable(wal), Some(b"wal".as_slice()));
+        assert_eq!(disk.durable(sst), Some([].as_slice()));
+    }
+
+    #[test]
+    fn clock_skew_changes_lifecycle_clock_not_node_membership() {
+        let node = NodeId::new(1);
+        let mut lifecycle = Lifecycle::new(&[node]);
+        lifecycle.apply(&FaultAction::ClockSkew {
+            node,
+            offset: Duration::from_millis(25),
+        });
+        assert_eq!(lifecycle.nodes[0].status, NodeStatus::Up);
+        assert_eq!(lifecycle.nodes[0].clock_offset, Duration::from_millis(25));
+    }
+
+    #[test]
     fn fault_plan_is_materialized_and_survivability_is_explicit() {
         let nodes = [NodeId::new(1), NodeId::new(2), NodeId::new(3)];
         let left = materialize_fault_plan(
@@ -1011,6 +1267,22 @@ mod tests {
                 .any(|entry| entry.action == FaultAction::Heal)
         );
         assert!(left.is_survivable(&nodes));
+    }
+
+    #[test]
+    fn generated_plans_heal_thirty_election_timeouts_before_the_end() {
+        let nodes = [NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+        let end = Time::from_nanos(60_000_000_000);
+        let plan = materialize_fault_plan(Seed::new(9), FaultProfile::Rough, &nodes, end);
+        let heal = plan
+            .actions
+            .last()
+            .expect("generated plan has a terminal heal");
+        assert_eq!(heal.action, FaultAction::Heal);
+        assert_eq!(
+            heal.at,
+            Time::from_nanos(end.as_nanos() - cc_raft::DEFAULT_ELECTION_MAX.as_nanos() * 30)
+        );
     }
 
     #[test]

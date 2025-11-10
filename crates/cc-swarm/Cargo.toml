@@ -6,14 +6,21 @@ license.workspace = true
 publish = false
 
 [dependencies]
+cc-cluster = { path = "../cc-cluster" }
 cc-checker = { path = "../cc-checker" }
 cc-core = { path = "../cc-core" }
+cc-env = { path = "../cc-env" }
+cc-kv = { path = "../cc-kv" }
+cc-raft = { path = "../cc-raft" }
 cc-sim = { path = "../cc-sim" }
+cc-store = { path = "../cc-store" }
 
 [[bin]]
 name = "cc-swarm"
 path = "src/main.rs"
 
+[lib]
+path = "src/lib.rs"
+
 [lints]
 workspace = true
-

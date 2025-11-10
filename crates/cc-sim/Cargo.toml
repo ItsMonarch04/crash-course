@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 cc-core = { path = "../cc-core" }
 cc-env = { path = "../cc-env" }
+cc-raft = { path = "../cc-raft" }
 
 [lints]
 workspace = true
-

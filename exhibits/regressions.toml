@@ -1,2 +1,26 @@
 # Append-only regression corpus. Each entry records a real minimized failure.
+#
+# An entry is a (seed, profile) pair that once failed and has since been fixed.
+# `cc-swarm regress` re-runs every entry against HEAD and fails if any of them
+# reopens, so these seeds are the ones a future change is most likely to break.
 
+[[regression]]
+seed = "0x0000000000000005"
+profile = "calm"
+# Found: the checker treated real-time precedence as `complete <= invoke`, so two
+# zero-duration reads sharing an instant each required the other to be
+# linearized first. The cycle is unsatisfiable and a legal history was reported
+# as not-linearizable. Fixed by making precedence strict.
+
+[[regression]]
+seed = "0x000000000000005e"
+profile = "calm"
+# Second witness for the same precedence cycle, on a history where the
+# same-instant pair straddles an Incr rather than a Set.
+
+[[regression]]
+seed = "0x0000000000000071"
+profile = "membership"
+# Exercises a joint-consensus shrink and restore while a voter is down. Before
+# the membership profile generated real reconfigure actions this seed was
+# byte-identical to the rough profile and proved nothing about membership.
