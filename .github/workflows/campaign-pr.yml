@@ -19,4 +19,7 @@ jobs:
       - run: cargo test --workspace --release
       - run: cargo run -p cc-swarm -- --determinism-seeds 100
       - run: cargo run -p cc-swarm -- run --profile calm --seeds 1000 --jobs 2
-      - run: cargo test -p cc-wal --release -- --ignored prefix_durability_campaign_1m
+      - run: cargo run -p cc-swarm -- run --profile rough --seeds 10000 --jobs 4
+      - run: cargo run -p cc-swarm -- run --profile membership --seeds 10000 --jobs 4
+      - run: cargo run -p cc-swarm -- regress
+      - run: ./scripts/ci/porcupine-crosscheck.sh

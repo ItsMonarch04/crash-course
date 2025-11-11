@@ -10,3 +10,13 @@ if (( bundle_bytes > 300000 )); then
   exit 1
 fi
 echo "theater size budget: PASS ${bundle_bytes} bytes <= 300000"
+
+wasm_path="$repo_root/theater/public/wasm/cc_wasm_bg.wasm"
+if [[ -f "$wasm_path" ]]; then
+  wasm_gzip_bytes="$(gzip -c "$wasm_path" | wc -c | tr -d ' ')"
+  if (( wasm_gzip_bytes > 2500000 )); then
+    echo "wasm size budget: FAIL ${wasm_gzip_bytes} gzip bytes > 2500000" >&2
+    exit 1
+  fi
+  echo "wasm size budget: PASS ${wasm_gzip_bytes} gzip bytes <= 2500000"
+fi

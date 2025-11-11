@@ -45,3 +45,16 @@ jobs:
           path: traces
           merge-multiple: true
       - run: cmp traces/trace-ubuntu-latest.cctrace traces/trace-macos-14.cctrace
+  wasm-equivalence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - run: rustup target add wasm32-unknown-unknown
+      - run: CARGO_HTTP_MULTIPLEXING=false cargo install wasm-bindgen-cli --version 0.2.105 --locked
+      - run: ./scripts/ci/wasm-equivalence.sh

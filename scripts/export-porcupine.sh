@@ -5,4 +5,21 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
-echo "Porcupine export is produced by the cc-checker JSON encoder; feed it a history artifact."
+
+if [[ "${1:-}" != "--file" || -z "${2:-}" ]]; then
+  echo "usage: $0 --file HISTORY.tsv [--output PORCUPINE.json]" >&2
+  exit 2
+fi
+
+history_file="$2"
+shift 2
+args=(export-porcupine --file "$history_file")
+if [[ "${1:-}" == "--output" && -n "${2:-}" ]]; then
+  args+=(--output "$2")
+  shift 2
+fi
+if (($#)); then
+  echo "usage: $0 --file HISTORY.tsv [--output PORCUPINE.json]" >&2
+  exit 2
+fi
+cargo run --quiet -p cc-swarm -- "${args[@]}"

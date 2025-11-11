@@ -25,4 +25,20 @@ jobs:
       - run: cargo test -p cc-store --release -- --ignored corruption_campaign_has_no_silent_wrong_answers
       - run: cargo test -p cc-sim --release -- --ignored wipe_profile_campaign_500k
       - run: cargo test -p cc-raft --release -- --ignored message_soup_campaign_100k_schedules
-      - run: cargo run -p cc-swarm -- run --profile rough --seeds 100000 --jobs 16
+      - run: cargo run --release -p cc-swarm -- run --profile rough --seeds 1000000 --jobs 16
+      - run: cargo run --release -p cc-swarm -- run --profile membership --seeds 1000000 --jobs 16
+      - run: cargo run --release -p cc-swarm -- run --profile wipe --seeds 500000 --jobs 16
+      - uses: actions/cache/restore@v4
+        with:
+          path: target/campaign-counter.json
+          key: campaign-counter-${{ github.run_id }}
+          restore-keys: campaign-counter-
+      - run: node scripts/ci/campaign-badge.mjs --input target/campaign-counter.json --output target/campaign-counter.json --seeds 2500000 --profile rough+membership+wipe --run-id "${GITHUB_RUN_ID}"
+      - uses: actions/cache/save@v4
+        with:
+          path: target/campaign-counter.json
+          key: campaign-counter-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: campaign-badge-${{ github.run_id }}
+          path: target/campaign-counter.json
