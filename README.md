@@ -59,4 +59,4 @@ AGPL-3.0-only. See [LICENSE](LICENSE).
 
 ---
 
-**Version:** v0.8.10
+**Version:** v0.8.11
