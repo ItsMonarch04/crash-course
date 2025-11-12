@@ -9,6 +9,12 @@ tool under active construction, not a production database and not a benchmark
 claim. The core is designed as synchronous, host-independent state machines
 that can run in a simulator, a real host, or WebAssembly.
 
+![The browser theater running a five-node cluster, killing the leader, and
+watching the survivors elect a new one without losing an acknowledged write.](theater/public/crash-course.gif)
+
+The animation above is generated, not staged: `./scripts/record-gif.sh` drives
+the real theater with Playwright and encodes the captured frames.
+
 ## Try the current workspace
 
 ```sh
@@ -21,12 +27,18 @@ cargo run --release -p cc-bench -- --workload A --clients 1 --ops 10000
 
 The repository currently contains:
 
-- `ccdb`, a bounded RESP lab host with a CRC-checked restart journal;
-- a deterministic simulator with fault plans, traces, checkers, and a shrinker;
-- a static browser theater with the ABI-1 JSON facade, topology canvas,
-  re-execution timeline, shareable scenarios, and museum loader;
+- `ccdb`, a bounded RESP lab host with a CRC-checked restart journal, three-node
+  TCP replication, leader redirects, snapshot catch-up, and durable fsync
+  failure shims;
+- a deterministic simulator that composes real `cc-cluster::Node` instances,
+  drives workload actors, captures client histories, checks invariants, runs
+  campaigns, and shrinks reproduced failures;
+- a persistent `wasm-bindgen` bridge and browser theater with live topology,
+  inspector, timeline/scrubbing, fault injection, verdict, and share-URL
+  panels;
 - an empty-by-default museum manifest that accepts only pinned real traces; and
-- writeups, limitations, and disclosed local-model benchmark reports.
+- normative format notes, named safety traps, campaign tooling, limitations,
+  and disclosed local-model benchmark reports.
 
 Correctness work comes before performance claims. Supported development targets
 are Linux x86_64, macOS arm64, and WebAssembly; Windows is not a supported CI
@@ -47,4 +59,4 @@ AGPL-3.0-only. See [LICENSE](LICENSE).
 
 ---
 
-**Version:** v0.8.9
+**Version:** v0.8.10
