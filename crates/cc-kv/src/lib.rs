@@ -34,9 +34,27 @@ pub enum KvCommand {
         key: Vec<u8>,
         delta: i64,
     },
+    Append {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    GetSet {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    GetDel {
+        key: Vec<u8>,
+    },
     Expire {
         key: Vec<u8>,
         ttl: Duration,
+    },
+    ExpireAt {
+        key: Vec<u8>,
+        at: Time,
+    },
+    Ttl {
+        key: Vec<u8>,
     },
     Persist {
         key: Vec<u8>,
@@ -61,7 +79,10 @@ pub enum KvCommand {
 impl KvCommand {
     #[must_use]
     pub fn is_write(&self) -> bool {
-        !matches!(self, Self::Get { .. } | Self::Scan { .. } | Self::Ping)
+        !matches!(
+            self,
+            Self::Get { .. } | Self::Ttl { .. } | Self::Scan { .. } | Self::Ping
+        )
     }
 
     #[must_use]
@@ -71,7 +92,12 @@ impl KvCommand {
             | Self::Del { key }
             | Self::Cas { key, .. }
             | Self::Incr { key, .. }
+            | Self::Append { key, .. }
+            | Self::GetSet { key, .. }
+            | Self::GetDel { key }
             | Self::Expire { key, .. }
+            | Self::ExpireAt { key, .. }
+            | Self::Ttl { key }
             | Self::Persist { key }
             | Self::Get { key } => Some(key),
             Self::PurgeExpired { .. }
@@ -215,6 +241,7 @@ impl Kv {
     pub fn read(&self, command: KvCommand, at: Time) -> Result<KvReply, KvError> {
         match command {
             KvCommand::Get { key } => Ok(KvReply::Value(self.visible_get(&key, at))),
+            KvCommand::Ttl { key } => Ok(KvReply::Integer(self.ttl_seconds(&key, at))),
             KvCommand::Scan { start, end, limit } => Ok(KvReply::Scan(self.visible_scan(
                 start.as_deref(),
                 end.as_deref(),
@@ -270,6 +297,28 @@ impl Kv {
                 self.store.put(&key, value.to_string().as_bytes())?;
                 Ok(KvReply::Integer(value))
             }
+            KvCommand::Append { key, value } => {
+                let mut combined = self.visible_get(&key, now).unwrap_or_default();
+                combined.extend_from_slice(&value);
+                self.store.put(&key, &combined)?;
+                Ok(KvReply::Integer(
+                    i64::try_from(combined.len()).unwrap_or(i64::MAX),
+                ))
+            }
+            KvCommand::GetSet { key, value } => {
+                let previous = self.visible_get(&key, now);
+                self.store.put(&key, &value)?;
+                self.ttl.remove(&key);
+                Ok(KvReply::Value(previous))
+            }
+            KvCommand::GetDel { key } => {
+                let previous = self.visible_get(&key, now);
+                if previous.is_some() {
+                    self.store.delete(&key)?;
+                }
+                self.ttl.remove(&key);
+                Ok(KvReply::Value(previous))
+            }
             KvCommand::Expire { key, ttl } => {
                 if self.visible_get(&key, now).is_some() {
                     self.ttl.insert(key, now + ttl);
@@ -278,6 +327,15 @@ impl Kv {
                     Ok(KvReply::Integer(0))
                 }
             }
+            KvCommand::ExpireAt { key, at } => {
+                if self.visible_get(&key, now).is_some() {
+                    self.ttl.insert(key, at);
+                    Ok(KvReply::Integer(1))
+                } else {
+                    Ok(KvReply::Integer(0))
+                }
+            }
+            KvCommand::Ttl { key } => Ok(KvReply::Integer(self.ttl_seconds(&key, now))),
             KvCommand::Persist { key } => {
                 Ok(KvReply::Integer(if self.ttl.remove(&key).is_some() {
                     1
@@ -334,6 +392,19 @@ impl Kv {
             return None;
         }
         self.store.get(key, None)
+    }
+
+    fn ttl_seconds(&self, key: &[u8], now: Time) -> i64 {
+        if self.visible_get(key, now).is_none() {
+            return -2;
+        }
+        self.ttl.get(key).map_or(-1, |deadline| {
+            i64::try_from(
+                deadline.as_nanos().saturating_sub(now.as_nanos())
+                    / Duration::from_secs(1).as_nanos(),
+            )
+            .unwrap_or(i64::MAX)
+        })
     }
 
     fn visible_scan(
@@ -430,10 +501,33 @@ pub fn encode_command(command: &KvCommand) -> Vec<u8> {
             enc.bytes(key);
             enc.u64(*delta as u64);
         }
+        KvCommand::Append { key, value } => {
+            enc.u8(12);
+            enc.bytes(key);
+            enc.bytes(value);
+        }
+        KvCommand::GetSet { key, value } => {
+            enc.u8(13);
+            enc.bytes(key);
+            enc.bytes(value);
+        }
+        KvCommand::GetDel { key } => {
+            enc.u8(14);
+            enc.bytes(key);
+        }
         KvCommand::Expire { key, ttl } => {
             enc.u8(5);
             enc.bytes(key);
             enc.u64(ttl.as_nanos());
+        }
+        KvCommand::ExpireAt { key, at } => {
+            enc.u8(15);
+            enc.bytes(key);
+            enc.u64(at.as_nanos());
+        }
+        KvCommand::Ttl { key } => {
+            enc.u8(16);
+            enc.bytes(key);
         }
         KvCommand::Persist { key } => {
             enc.u8(6);
@@ -499,6 +593,20 @@ pub fn decode_command(bytes: &[u8]) -> Result<KvCommand, KvError> {
             limit: usize::try_from(dec.u32()?).unwrap_or(usize::MAX),
         },
         11 => KvCommand::Ping,
+        12 => KvCommand::Append {
+            key: dec.bytes()?,
+            value: dec.bytes()?,
+        },
+        13 => KvCommand::GetSet {
+            key: dec.bytes()?,
+            value: dec.bytes()?,
+        },
+        14 => KvCommand::GetDel { key: dec.bytes()? },
+        15 => KvCommand::ExpireAt {
+            key: dec.bytes()?,
+            at: Time::from_nanos(dec.u64()?),
+        },
+        16 => KvCommand::Ttl { key: dec.bytes()? },
         tag => {
             return Err(KvError::Decode(DecodeError::InvalidTag {
                 offset: dec.position(),
@@ -562,6 +670,100 @@ mod tests {
             ..StoreConfig::default()
         })
         .expect("kv")
+    }
+
+    #[test]
+    fn rmw_family_is_atomic_and_preserves_documented_ttl_rules() {
+        let mut kv = kv();
+        let client = ClientId::new(4);
+        let now = Time::from_nanos(100_000_000_000);
+        kv.apply(
+            LogIndex::new(1),
+            Term::new(1),
+            client,
+            1,
+            KvCommand::Set {
+                key: b"k".to_vec(),
+                value: b"a".to_vec(),
+                ttl: Some(Duration::from_secs(20)),
+            },
+            now,
+        )
+        .expect("set");
+        assert_eq!(
+            kv.apply(
+                LogIndex::new(2),
+                Term::new(1),
+                client,
+                2,
+                KvCommand::Append {
+                    key: b"k".to_vec(),
+                    value: b"bc".to_vec()
+                },
+                now,
+            ),
+            Ok(KvReply::Integer(3))
+        );
+        assert_eq!(
+            kv.read(KvCommand::Ttl { key: b"k".to_vec() }, now),
+            Ok(KvReply::Integer(20))
+        );
+        assert_eq!(
+            kv.apply(
+                LogIndex::new(3),
+                Term::new(1),
+                client,
+                3,
+                KvCommand::GetSet {
+                    key: b"k".to_vec(),
+                    value: b"new".to_vec()
+                },
+                now,
+            ),
+            Ok(KvReply::Value(Some(b"abc".to_vec())))
+        );
+        assert_eq!(
+            kv.read(KvCommand::Ttl { key: b"k".to_vec() }, now),
+            Ok(KvReply::Integer(-1))
+        );
+        assert_eq!(
+            kv.apply(
+                LogIndex::new(4),
+                Term::new(1),
+                client,
+                4,
+                KvCommand::GetDel { key: b"k".to_vec() },
+                now,
+            ),
+            Ok(KvReply::Value(Some(b"new".to_vec())))
+        );
+        assert_eq!(
+            kv.read(KvCommand::Ttl { key: b"k".to_vec() }, now),
+            Ok(KvReply::Integer(-2))
+        );
+    }
+
+    #[test]
+    fn extended_command_codec_round_trips() {
+        let commands = [
+            KvCommand::Append {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+            KvCommand::GetSet {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+            KvCommand::GetDel { key: b"k".to_vec() },
+            KvCommand::ExpireAt {
+                key: b"k".to_vec(),
+                at: Time::from_nanos(7),
+            },
+            KvCommand::Ttl { key: b"k".to_vec() },
+        ];
+        for command in commands {
+            assert_eq!(decode_command(&encode_command(&command)), Ok(command));
+        }
     }
 
     #[test]

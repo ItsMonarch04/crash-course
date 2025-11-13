@@ -12,10 +12,19 @@ are:
 | Peer stream frame | `CCPF` | 1 | `cc-env` |
 | Real-host command journal payload | `CCKV` | 1 | `cc-node` |
 | KV snapshot | `CCKV` | 1 | `cc-kv` |
+| Offline backup archive | `CCBK` | 1 | `cc-node` |
 
 The byte layouts are intentionally implemented by hand. A layout change needs
 a new decision record, a version bump, a compatibility note, and round-trip,
 malformed-input, and corruption tests.
+
+`CCKV` command tags 1–11 are the original command family. ADR-0006 adds the
+backward-compatible tags `12=Append`, `13=GetSet`, `14=GetDel`,
+`15=ExpireAt`, and `16=Ttl`; existing tag bytes and fields are unchanged.
+
+`CCBK` is `magic:u32`, `version:u16`, `file_count:u32`, then sorted entries of
+`path_len:u16`, UTF-8 path bytes, `data_len:u64`, `crc32c:u32`, and file bytes.
+Version 1 permits exactly `node.json`, `ccdb.toml`, and `commands.log`.
 
 Raft messages are deliberately absent from that table. `cc-raft` is sans-IO:
 its `Message` values never become bytes. Inside the simulator they are moved

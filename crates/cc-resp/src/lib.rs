@@ -210,6 +210,15 @@ pub enum ClientCommand {
         key: Vec<u8>,
         delta: i64,
     },
+    Append {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    GetSet {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    GetDel(Vec<u8>),
     SetNx {
         key: Vec<u8>,
         value: Vec<u8>,
@@ -218,6 +227,11 @@ pub enum ClientCommand {
         key: Vec<u8>,
         ttl: Duration,
     },
+    ExpireAt {
+        key: Vec<u8>,
+        at_seconds: u64,
+    },
+    Ttl(Vec<u8>),
     Persist(Vec<u8>),
     Scan {
         cursor: u64,
@@ -266,6 +280,15 @@ pub fn parse_command(value: RespValue) -> Result<ClientCommand, RespError> {
             key: args[1].clone(),
             delta: parse_i64(&args[2])?,
         }),
+        b"APPEND" if args.len() == 3 => Ok(ClientCommand::Append {
+            key: args[1].clone(),
+            value: args[2].clone(),
+        }),
+        b"GETSET" if args.len() == 3 => Ok(ClientCommand::GetSet {
+            key: args[1].clone(),
+            value: args[2].clone(),
+        }),
+        b"GETDEL" if args.len() == 2 => Ok(ClientCommand::GetDel(args[1].clone())),
         b"SETNX" if args.len() == 3 => Ok(ClientCommand::SetNx {
             key: args[1].clone(),
             value: args[2].clone(),
@@ -274,6 +297,11 @@ pub fn parse_command(value: RespValue) -> Result<ClientCommand, RespError> {
             key: args[1].clone(),
             ttl: Duration::from_secs(parse_u64(&args[2])?),
         }),
+        b"EXPIREAT" if args.len() == 3 => Ok(ClientCommand::ExpireAt {
+            key: args[1].clone(),
+            at_seconds: parse_u64(&args[2])?,
+        }),
+        b"TTL" if args.len() == 2 => Ok(ClientCommand::Ttl(args[1].clone())),
         b"PERSIST" if args.len() == 2 => Ok(ClientCommand::Persist(args[1].clone())),
         b"SCAN" if args.len() >= 2 => parse_scan(args),
         b"INFO" if args.len() == 1 => Ok(ClientCommand::Info),
@@ -405,6 +433,40 @@ mod tests {
                 nx: true,
                 xx: false,
             }
+        );
+    }
+
+    #[test]
+    fn command_table_maps_rmw_and_ttl_family() {
+        let command = |parts: &[&[u8]]| {
+            RespValue::Array(
+                parts
+                    .iter()
+                    .map(|part| RespValue::Bulk(Some(part.to_vec())))
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            parse_command(command(&[b"APPEND", b"k", b"v"])).expect("append"),
+            ClientCommand::Append {
+                key: b"k".to_vec(),
+                value: b"v".to_vec()
+            }
+        );
+        assert_eq!(
+            parse_command(command(&[b"GETDEL", b"k"])).expect("getdel"),
+            ClientCommand::GetDel(b"k".to_vec())
+        );
+        assert_eq!(
+            parse_command(command(&[b"EXPIREAT", b"k", b"42"])).expect("expireat"),
+            ClientCommand::ExpireAt {
+                key: b"k".to_vec(),
+                at_seconds: 42
+            }
+        );
+        assert_eq!(
+            parse_command(command(&[b"TTL", b"k"])).expect("ttl"),
+            ClientCommand::Ttl(b"k".to_vec())
         );
     }
 

@@ -345,12 +345,50 @@ fn execute(state: &Arc<HostState>, command: ClientCommand) -> io::Result<RespVal
                 Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
             }
         }
+        ClientCommand::Append { key, value } => {
+            match apply_durable(state, client, KvCommand::Append { key, value }, now) {
+                Ok(reply) => reply,
+                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
+            }
+        }
+        ClientCommand::GetSet { key, value } => {
+            match apply_durable(state, client, KvCommand::GetSet { key, value }, now) {
+                Ok(reply) => reply,
+                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
+            }
+        }
+        ClientCommand::GetDel(key) => {
+            match apply_durable(state, client, KvCommand::GetDel { key }, now) {
+                Ok(reply) => reply,
+                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
+            }
+        }
         ClientCommand::Expire { key, ttl } => {
             match apply_durable(state, client, KvCommand::Expire { key, ttl }, now) {
                 Ok(reply) => reply,
                 Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
             }
         }
+        ClientCommand::ExpireAt { key, at_seconds } => {
+            match apply_durable(
+                state,
+                client,
+                KvCommand::ExpireAt {
+                    key,
+                    at: Time::from_nanos(at_seconds.saturating_mul(1_000_000_000)),
+                },
+                now,
+            ) {
+                Ok(reply) => reply,
+                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
+            }
+        }
+        ClientCommand::Ttl(key) => state
+            .kv
+            .lock()
+            .map_err(|_| io::Error::other("KV mutex poisoned"))?
+            .read(KvCommand::Ttl { key }, now)
+            .map_err(io::Error::other)?,
         ClientCommand::Persist(key) => {
             match apply_durable(state, client, KvCommand::Persist { key }, now) {
                 Ok(reply) => reply,
@@ -426,7 +464,11 @@ fn is_write_command(command: &ClientCommand) -> bool {
             | ClientCommand::SetNx { .. }
             | ClientCommand::Del(_)
             | ClientCommand::IncrBy { .. }
+            | ClientCommand::Append { .. }
+            | ClientCommand::GetSet { .. }
+            | ClientCommand::GetDel(_)
             | ClientCommand::Expire { .. }
+            | ClientCommand::ExpireAt { .. }
             | ClientCommand::Persist(_)
     )
 }
