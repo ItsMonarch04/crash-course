@@ -21,4 +21,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: ./scripts/ci/forbidden-grep.sh
       - run: cargo test --workspace --all-targets
+      # Exhaustive, not sampled: this asserts the log<=4 / term<=3 / messages<=8
+      # envelope closes without hitting the state cap. It fails loudly if a
+      # change to `cc-raft` makes the reachable state space grow.
+      - run: cargo run --release -p cc-swarm -- model-check
       - run: cargo doc --workspace --no-deps

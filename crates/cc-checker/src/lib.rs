@@ -115,14 +115,6 @@ impl History {
     pub fn push(&mut self, operation: Operation) {
         self.operations.push(operation);
     }
-
-    #[must_use]
-    pub fn by_key(&self, key: &[u8]) -> Vec<&Operation> {
-        self.operations
-            .iter()
-            .filter(|operation| operation.kind.key() == key)
-            .collect()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -476,13 +468,14 @@ pub fn check_no_resurrection(history: &History) -> InvariantReport {
             OperationKind::Set { key, .. } if operation.outcome == Outcome::Ok => {
                 deleted.remove(key);
             }
-            OperationKind::Get { key } => {
-                if deleted.contains(key) && operation.outcome == Outcome::Value(Some(Vec::new())) {
-                    report.violations.push(InvariantViolation {
-                        name: "no_resurrection",
-                        detail: format!("key {:?} returned after acknowledged delete", key),
-                    });
-                }
+            OperationKind::Get { key }
+                if deleted.contains(key)
+                    && operation.outcome == Outcome::Value(Some(Vec::new())) =>
+            {
+                report.violations.push(InvariantViolation {
+                    name: "no_resurrection",
+                    detail: format!("key {key:?} returned after acknowledged delete"),
+                });
             }
             _ => {}
         }

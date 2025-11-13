@@ -1057,7 +1057,7 @@ impl RaftNode {
                 })
                 .count()
         };
-        count(old) >= old.len() / 2 + 1 && count(new) >= new.len() / 2 + 1
+        count(old) > old.len() / 2 && count(new) > new.len() / 2
     }
 
     fn has_majority(&self, votes: &BTreeSet<NodeId>) -> bool {

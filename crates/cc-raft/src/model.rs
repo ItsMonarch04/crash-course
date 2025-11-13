@@ -25,7 +25,10 @@ impl Default for ModelConfig {
             max_log: 4,
             max_term: 3,
             max_messages: 8,
-            max_depth: 16,
+            // Depth 8 exhausts the log<=4 / term<=3 / messages<=8 envelope in
+            // ~1.43M states. Depth 16 does not terminate under any practical
+            // cap, so it is not a defensible default.
+            max_depth: 8,
             max_states: 2_000_000,
         }
     }
@@ -42,18 +45,34 @@ pub struct ModelReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelError {
     InvalidConfig,
-    StateLimit { explored: usize, limit: usize },
-    Invariant { state: usize, reason: String },
+    /// `discovered` counts distinct states the search has *seen*; `explored`
+    /// counts the ones it has fully expanded. The cap is on the former, so
+    /// reporting only the latter compares two different quantities.
+    StateLimit {
+        discovered: usize,
+        explored: usize,
+        limit: usize,
+    },
+    Invariant {
+        state: usize,
+        reason: String,
+    },
 }
 
 impl fmt::Display for ModelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig => write!(formatter, "invalid model-check bounds"),
-            Self::StateLimit { explored, limit } => {
+            Self::StateLimit {
+                discovered,
+                explored,
+                limit,
+            } => {
                 write!(
                     formatter,
-                    "model state limit {limit} reached after {explored} states"
+                    "model state limit reached: {discovered} states discovered \
+                     (cap {limit}) with {explored} fully explored — raise \
+                     --max-states or lower --max-depth"
                 )
             }
             Self::Invariant { state, reason } => {
@@ -131,6 +150,7 @@ pub fn check(config: ModelConfig) -> Result<ModelReport, ModelError> {
             if seen.insert(fingerprint(&next)) {
                 if seen.len() > config.max_states {
                     return Err(ModelError::StateLimit {
+                        discovered: seen.len(),
                         explored,
                         limit: config.max_states,
                     });
@@ -151,12 +171,12 @@ pub fn check(config: ModelConfig) -> Result<ModelReport, ModelError> {
 fn successors(state: &ModelState, config: ModelConfig) -> Vec<ModelState> {
     let mut output = Vec::new();
     let now = Time::from_nanos(1_000_000);
-    for id in state.nodes.keys().copied() {
-        if state.nodes[&id].hard_state.term.get() <= config.max_term {
+    for id in state.nodes.keys() {
+        if state.nodes[id].hard_state.term.get() <= config.max_term {
             let mut next = state.clone();
             let effects = next
                 .nodes
-                .get_mut(&id)
+                .get_mut(id)
                 .expect("model node")
                 .on_timer(now, TimerKind::Election);
             route(&mut next, effects, config.max_messages);
@@ -164,20 +184,20 @@ fn successors(state: &ModelState, config: ModelConfig) -> Vec<ModelState> {
                 output.push(next);
             }
         }
-        if state.nodes[&id].role == Role::Leader {
+        if state.nodes[id].role == Role::Leader {
             let mut heartbeat = state.clone();
             let effects = heartbeat
                 .nodes
-                .get_mut(&id)
+                .get_mut(id)
                 .expect("model node")
                 .on_timer(now, TimerKind::Heartbeat);
             route(&mut heartbeat, effects, config.max_messages);
             if in_bounds(&heartbeat, config) {
                 output.push(heartbeat);
             }
-            if state.nodes[&id].log.len() < config.max_log {
+            if state.nodes[id].log.len() < config.max_log {
                 let mut proposed = state.clone();
-                let payload = state.nodes[&id]
+                let payload = state.nodes[id]
                     .last_index()
                     .get()
                     .saturating_add(1)
@@ -185,7 +205,7 @@ fn successors(state: &ModelState, config: ModelConfig) -> Vec<ModelState> {
                     .to_vec();
                 if let Ok(effects) = proposed
                     .nodes
-                    .get_mut(&id)
+                    .get_mut(id)
                     .expect("model node")
                     .propose(payload)
                 {
