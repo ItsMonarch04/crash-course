@@ -1,0 +1,6 @@
+.git
+target
+artifacts
+theater/node_modules
+theater/dist
+test-results

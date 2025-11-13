@@ -103,7 +103,7 @@ for name in sys.argv[1:]:
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
 PY
 
-python3 scripts/resp-proxy.py \
+cargo run --quiet -p cc-swarm -- proxy \
   --listen 127.0.0.1:7379 \
   --upstream 127.0.0.1:7201 \
   --drop-every "$drop_every" \

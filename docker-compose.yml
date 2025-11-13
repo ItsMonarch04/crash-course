@@ -1,0 +1,42 @@
+x-cluster-environment: &cluster
+  CCDB_PEERS: n1:7201,n2:7202,n3:7203
+
+services:
+  n1:
+    build: .
+    command: ["run", "--config", "/var/lib/ccdb/ccdb.toml"]
+    volumes: ["n1:/var/lib/ccdb"]
+    ports: ["7101:7101", "7301:7301"]
+    environment:
+      <<: *cluster
+      CCDB_NODE_ID: "1"
+      CCDB_CLIENT_PORT: "7101"
+      CCDB_PEER_PORT: "7201"
+      CCDB_METRICS_PORT: "7301"
+  n2:
+    build: .
+    command: ["run", "--config", "/var/lib/ccdb/ccdb.toml"]
+    volumes: ["n2:/var/lib/ccdb"]
+    ports: ["7102:7102", "7302:7302"]
+    environment:
+      <<: *cluster
+      CCDB_NODE_ID: "2"
+      CCDB_CLIENT_PORT: "7102"
+      CCDB_PEER_PORT: "7202"
+      CCDB_METRICS_PORT: "7302"
+  n3:
+    build: .
+    command: ["run", "--config", "/var/lib/ccdb/ccdb.toml"]
+    volumes: ["n3:/var/lib/ccdb"]
+    ports: ["7103:7103", "7303:7303"]
+    environment:
+      <<: *cluster
+      CCDB_NODE_ID: "3"
+      CCDB_CLIENT_PORT: "7103"
+      CCDB_PEER_PORT: "7203"
+      CCDB_METRICS_PORT: "7303"
+
+volumes:
+  n1:
+  n2:
+  n3:
