@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -28,6 +29,9 @@ const REPLICATION_ACK: u8 = b'A';
 const REPLICATION_SNAPSHOT: u8 = b'R';
 const PEER_CONNECT_TIMEOUT: StdDuration = StdDuration::from_millis(250);
 const PEER_IO_TIMEOUT: StdDuration = StdDuration::from_millis(500);
+const BACKUP_MAGIC: &[u8; 4] = b"CCBK";
+const BACKUP_VERSION: u16 = 1;
+const BACKUP_MAX_FILE: usize = 1024 * 1024 * 1024;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -36,6 +40,7 @@ fn main() -> io::Result<()> {
         Some("run") => run_node(&args[1..]),
         Some("peer") => peer_probe(&args[1..]),
         Some("selfcheck") => selfcheck(&args[1..]),
+        Some("doctor") => doctor(&args[1..]),
         Some("admin") => admin(&args[1..]),
         _ => {
             print_help();
@@ -81,8 +86,9 @@ fn init_cluster(args: &[String]) -> io::Result<()> {
         fs::write(
             data_dir.join("ccdb.toml"),
             format!(
-                "[node]\nid = {node}\ndata_dir = \"{}\"\nlisten_client = \"127.0.0.1:{port}\"\nlisten_peer = \"127.0.0.1:{peer_port}\"\npeer_nodes = \"{peer_nodes}\"\n\n[storage]\nfsync = \"always\"\n",
-                data_dir.display()
+                "[node]\nid = {node}\ndata_dir = \"{}\"\nlisten_client = \"127.0.0.1:{port}\"\nlisten_peer = \"127.0.0.1:{peer_port}\"\nlisten_metrics = \"127.0.0.1:{}\"\npeer_nodes = \"{peer_nodes}\"\n\n[storage]\nfsync = \"always\"\n",
+                data_dir.display(),
+                7300 + node
             ),
         )?;
         sync_directory(&data_dir)?;
@@ -131,12 +137,14 @@ fn run_node(args: &[String]) -> io::Result<()> {
 
     let client_listener = TcpListener::bind(&config.listen_client)?;
     let peer_listener = TcpListener::bind(&config.listen_peer)?;
+    let metrics_listener = TcpListener::bind(&config.listen_metrics)?;
     println!(
-        "ccdb node={} recovered_seq={} client={} peer={}",
+        "ccdb node={} recovered_seq={} client={} peer={} metrics={}",
         config.id,
         next_sequence.saturating_sub(1),
         config.listen_client,
-        config.listen_peer
+        config.listen_peer,
+        config.listen_metrics,
     );
 
     let metrics_path = config.data_dir.join("metrics.prom");
@@ -145,6 +153,23 @@ fn run_node(args: &[String]) -> io::Result<()> {
         loop {
             thread::sleep(StdDuration::from_secs(1));
             let _ = fs::write(&metrics_path, metrics_for_task.render());
+        }
+    });
+
+    let metrics_state = Arc::clone(&state);
+    thread::spawn(move || {
+        for result in metrics_listener.incoming() {
+            match result {
+                Ok(stream) => {
+                    let state = Arc::clone(&metrics_state);
+                    thread::spawn(move || {
+                        if let Err(error) = serve_metrics(stream, &state) {
+                            eprintln!("metrics connection closed with error: {error}");
+                        }
+                    });
+                }
+                Err(error) => eprintln!("metrics accept error: {error}"),
+            }
         }
     });
 
@@ -178,6 +203,39 @@ fn run_node(args: &[String]) -> io::Result<()> {
         });
     }
     Ok(())
+}
+
+fn serve_metrics(mut stream: TcpStream, state: &HostState) -> io::Result<()> {
+    stream.set_read_timeout(Some(StdDuration::from_secs(2)))?;
+    let mut request = [0_u8; 4 * 1024];
+    let read = stream.read(&mut request)?;
+    let first_line = std::str::from_utf8(&request[..read])
+        .ok()
+        .and_then(|text| text.lines().next())
+        .unwrap_or_default();
+    let (content_type, body) = if first_line.starts_with("GET /metrics ") {
+        ("text/plain; version=0.0.4", state.metrics.render())
+    } else if first_line.starts_with("GET / ") {
+        ("text/html; charset=utf-8", metrics_dashboard())
+    } else {
+        ("text/plain; charset=utf-8", String::from("not found\n"))
+    };
+    let status = if first_line.starts_with("GET /metrics ") || first_line.starts_with("GET / ") {
+        "200 OK"
+    } else {
+        "404 Not Found"
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    )
+}
+
+fn metrics_dashboard() -> String {
+    String::from(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>ccdb metrics</title><style>:root{--bg:#080b10;--panel:#0d131c;--line:#243343;--text:#e6edf5;--teal:#58d6b2}body{font:14px ui-monospace,monospace;background:var(--bg);color:var(--text);max-width:900px;margin:3rem auto;padding:0 1rem}h1{color:var(--teal)}pre{border:1px solid var(--line);padding:1rem;background:var(--panel)}</style><h1>ccdb / metrics</h1><p>Dependency-free operator view. Refreshes every second.</p><pre id=m>loading…</pre><script>setInterval(async()=>m.textContent=await(await fetch('/metrics')).text(),1000)</script>",
+    )
 }
 
 fn serve_connection(mut stream: TcpStream, state: Arc<HostState>) -> io::Result<()> {
@@ -244,6 +302,10 @@ fn serve_peer(mut stream: TcpStream, state: Arc<HostState>) -> io::Result<()> {
 fn execute(state: &Arc<HostState>, command: ClientCommand) -> io::Result<RespValue> {
     let now = process_time();
     let client = ClientId::new(1);
+    state.metrics.commands.fetch_add(1, Ordering::Relaxed);
+    if !is_write_command(&command) {
+        state.metrics.reads.fetch_add(1, Ordering::Relaxed);
+    }
     if is_write_command(&command) {
         let (leader, peer_address) = leader_info(&state.config);
         if leader != state.config.id {
@@ -500,7 +562,6 @@ fn apply_durable(
             now,
         )
         .map_err(io::Error::other)?;
-    state.metrics.commands.fetch_add(1, Ordering::Relaxed);
     state.metrics.writes.fetch_add(1, Ordering::Relaxed);
     state.metrics.fsyncs.fetch_add(1, Ordering::Relaxed);
     Ok(reply)
@@ -912,19 +973,214 @@ fn selfcheck(args: &[String]) -> io::Result<()> {
         ));
     }
     let journal_path = path.join("commands.log");
-    let records = if journal_path.exists() {
+    let journal_records = if journal_path.exists() {
         let mut journal = DurableJournal::open(&journal_path)?;
-        journal.replay()?.len()
+        journal.replay()?
     } else {
-        0
+        Vec::new()
     };
+    if has_flag(args, "--deep") {
+        deep_selfcheck(path, &journal_records)?;
+    }
     println!(
-        "selfcheck data_dir={} journal_records={} metrics={}",
+        "selfcheck{} data_dir={} journal_records={} metrics={}",
+        if has_flag(args, "--deep") {
+            " --deep"
+        } else {
+            ""
+        },
         path.display(),
-        records,
+        journal_records.len(),
         path.join("metrics.prom").exists()
     );
     Ok(())
+}
+
+fn deep_selfcheck(path: &Path, records: &[JournalRecord]) -> io::Result<()> {
+    let config_path = path.join("ccdb.toml");
+    if config_path.exists() {
+        let config = read_config(&config_path)?;
+        if fs::canonicalize(&config.data_dir)? != fs::canonicalize(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "config data_dir {} does not match checked directory {}",
+                    config.data_dir.display(),
+                    path.display()
+                ),
+            ));
+        }
+        validate_identity(&config)?;
+    } else if !path.join("node.json").exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing both ccdb.toml and node.json identity marker",
+        ));
+    }
+    let mut previous = 0_u64;
+    for record in records {
+        if record.sequence <= previous {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("journal sequence {} follows {previous}", record.sequence),
+            ));
+        }
+        previous = record.sequence;
+    }
+    let next = if path.join("commands.log").exists() {
+        load_state(&path.join("commands.log"))?.1
+    } else {
+        1
+    };
+    if next != previous.saturating_add(1).max(1) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal watermark does not match replayed applied index",
+        ));
+    }
+    let staging = path.join("snapshots/staging");
+    if staging.exists() && fs::read_dir(&staging)?.next().transpose()?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot staging contains an incomplete restore; advisor: inspect and remove only after verifying the source archive",
+        ));
+    }
+    let metrics = path.join("metrics.prom");
+    if metrics.exists() {
+        for line in fs::read_to_string(&metrics)?.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((name, value)) = line.split_once(' ') else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed metrics line",
+                ));
+            };
+            if !name.starts_with("ccdb_") || value.parse::<u64>().is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid metrics sample",
+                ));
+            }
+        }
+    }
+    println!(
+        "deep-check identity=ok journal_crc=ok journal_watermark={} snapshot_staging=clean metrics={}",
+        previous,
+        if metrics.exists() { "ok" } else { "absent" },
+    );
+    Ok(())
+}
+
+fn doctor(args: &[String]) -> io::Result<()> {
+    let data_dir = flag(args, "--data-dir").unwrap_or_else(|| String::from("."));
+    let path = Path::new(&data_dir);
+    fs::create_dir_all(path)?;
+    fsync_probe(path)?;
+    let clock_started = std::time::Instant::now();
+    let first = process_time();
+    let second = process_time();
+    let clock = if second >= first && clock_started.elapsed() >= StdDuration::ZERO {
+        "pass"
+    } else {
+        "fail"
+    };
+    let client = flag(args, "--client-addr").unwrap_or_else(|| String::from("127.0.0.1:7101"));
+    let peer = flag(args, "--peer-addr").unwrap_or_else(|| String::from("127.0.0.1:7201"));
+    let client_status = port_probe(&client);
+    let peer_status = port_probe(&peer);
+    println!(
+        "doctor data_dir={} filesystem={} fsync=pass clock={} open_files={} client_port={} peer_port={}",
+        path.display(),
+        filesystem_kind(path),
+        clock,
+        open_file_limit(),
+        client_status,
+        peer_status,
+    );
+    if clock == "fail" {
+        Err(io::Error::other("clock moved backwards"))
+    } else {
+        Ok(())
+    }
+}
+
+fn fsync_probe(path: &Path) -> io::Result<()> {
+    let nonce = process_time().as_nanos();
+    let source = path.join(format!(".ccdb-doctor-{}-{nonce}.tmp", std::process::id()));
+    let renamed = path.join(format!(".ccdb-doctor-{}-{nonce}.ok", std::process::id()));
+    if source.exists() || renamed.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "doctor probe path collision",
+        ));
+    }
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&source)?;
+        file.write_all(b"ccdb-fsync-probe-v1")?;
+        file.sync_all()?;
+        fs::rename(&source, &renamed)?;
+        sync_directory(path)?;
+        if fs::read(&renamed)? != b"ccdb-fsync-probe-v1" {
+            return Err(io::Error::other("fsync probe readback mismatch"));
+        }
+        fs::remove_file(&renamed)?;
+        sync_directory(path)
+    })();
+    if source.exists() {
+        let _ = fs::remove_file(&source);
+    }
+    if renamed.exists() {
+        let _ = fs::remove_file(&renamed);
+    }
+    result
+}
+
+fn port_probe(address: &str) -> &'static str {
+    match TcpListener::bind(address) {
+        Ok(_) => "available",
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => "in-use",
+        Err(_) => "invalid-or-unavailable",
+    }
+}
+
+fn filesystem_kind(path: &Path) -> String {
+    #[cfg(target_os = "linux")]
+    let output = std::process::Command::new("df")
+        .args(["-T", path.to_str().unwrap_or(".")])
+        .output();
+    #[cfg(not(target_os = "linux"))]
+    let output = std::process::Command::new("stat")
+        .args(["-f", "%T", path.to_str().unwrap_or(".")])
+        .output();
+    output
+        .ok()
+        .filter(|value| value.status.success())
+        .and_then(|value| String::from_utf8(value.stdout).ok())
+        .and_then(|text| text.lines().last().map(str::to_owned))
+        .map(|line| {
+            line.split_whitespace()
+                .last()
+                .unwrap_or("unknown")
+                .to_owned()
+        })
+        .unwrap_or_else(|| String::from("unknown"))
+}
+
+fn open_file_limit() -> String {
+    fs::read_to_string("/proc/self/limits")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| line.starts_with("Max open files"))
+                .and_then(|line| line.split_whitespace().nth(3))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| String::from("unknown"))
 }
 
 fn peer_probe(args: &[String]) -> io::Result<()> {
@@ -962,6 +1218,28 @@ fn peer_probe(args: &[String]) -> io::Result<()> {
 }
 
 fn admin(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|arg| arg == "backup") {
+        let data_dir = flag(args, "--data-dir").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "backup requires --data-dir")
+        })?;
+        let output = flag(args, "--output").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "backup requires --output")
+        })?;
+        let count = backup_data_dir(Path::new(&data_dir), Path::new(&output))?;
+        println!("backup: PASS files={count} output={output}");
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "restore") {
+        let input = flag(args, "--input").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "restore requires --input")
+        })?;
+        let data_dir = flag(args, "--data-dir").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "restore requires --data-dir")
+        })?;
+        let count = restore_backup(Path::new(&input), Path::new(&data_dir))?;
+        println!("restore: PASS files={count} data_dir={data_dir}");
+        return Ok(());
+    }
     let address = flag(args, "--addr").unwrap_or_else(|| String::from("127.0.0.1:7101"));
     let config = flag(args, "--config")
         .map(|path| read_config(Path::new(&path)))
@@ -995,12 +1273,218 @@ fn admin(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+fn backup_data_dir(data_dir: &Path, output: &Path) -> io::Result<usize> {
+    if !data_dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "backup data directory is absent",
+        ));
+    }
+    if output.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "backup output already exists",
+        ));
+    }
+    let files = ["node.json", "ccdb.toml", "commands.log"];
+    let mut entries = Vec::new();
+    for name in files {
+        let path = data_dir.join(name);
+        let data = if path.exists() {
+            fs::read(&path)?
+        } else if name == "commands.log" {
+            Vec::new()
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("backup requires {}", path.display()),
+            ));
+        };
+        if data.len() > BACKUP_MAX_FILE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "backup file exceeds limit",
+            ));
+        }
+        if name == "commands.log" {
+            let mut journal = DurableJournal::open(&path)?;
+            let _ = journal.replay()?;
+            if fs::metadata(&path)?.len() != data.len() as u64 {
+                return Err(io::Error::other(
+                    "journal changed during backup; stop writes and retry",
+                ));
+            }
+        }
+        entries.push((name.as_bytes().to_vec(), data));
+    }
+    let mut archive = Vec::new();
+    archive.extend_from_slice(BACKUP_MAGIC);
+    archive.extend_from_slice(&BACKUP_VERSION.to_le_bytes());
+    archive.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (name, data) in &entries {
+        archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        archive.extend_from_slice(name);
+        archive.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        archive.extend_from_slice(&crc32c(data).to_le_bytes());
+        archive.extend_from_slice(data);
+    }
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temporary = output.with_extension(format!("tmp-{}", std::process::id()));
+    if temporary.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "backup staging path exists",
+        ));
+    }
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&archive)?;
+        file.sync_all()?;
+        fs::rename(&temporary, output)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|()| entries.len())
+}
+
+fn restore_backup(input: &Path, data_dir: &Path) -> io::Result<usize> {
+    if data_dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "restore target must not exist",
+        ));
+    }
+    let archive = fs::read(input)?;
+    let mut cursor = 0_usize;
+    if take_bytes(&archive, &mut cursor, 4)? != BACKUP_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid backup magic",
+        ));
+    }
+    let version = take_u16(&archive, &mut cursor)?;
+    if version != BACKUP_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported backup version",
+        ));
+    }
+    let count = usize::try_from(take_u32(&archive, &mut cursor)?).unwrap_or(usize::MAX);
+    if count != 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid backup file count",
+        ));
+    }
+    let allowed = ["node.json", "ccdb.toml", "commands.log"];
+    let mut entries = BTreeMap::new();
+    for _ in 0..count {
+        let name_len = usize::from(take_u16(&archive, &mut cursor)?);
+        let name = std::str::from_utf8(take_bytes(&archive, &mut cursor, name_len)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "backup path is not UTF-8"))?;
+        if !allowed.contains(&name) || entries.contains_key(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid backup path",
+            ));
+        }
+        let length = usize::try_from(take_u64(&archive, &mut cursor)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "backup length overflow"))?;
+        if length > BACKUP_MAX_FILE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "backup file exceeds limit",
+            ));
+        }
+        let expected = take_u32(&archive, &mut cursor)?;
+        let data = take_bytes(&archive, &mut cursor, length)?.to_vec();
+        if crc32c(&data) != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "backup checksum mismatch",
+            ));
+        }
+        entries.insert(name.to_owned(), data);
+    }
+    if cursor != archive.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing backup bytes",
+        ));
+    }
+    let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = data_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("ccdb");
+    let staging = parent.join(format!(".{file_name}.restore-{}", std::process::id()));
+    if staging.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "restore staging path exists",
+        ));
+    }
+    let result = (|| {
+        fs::create_dir(&staging)?;
+        fs::create_dir_all(staging.join("raft"))?;
+        fs::create_dir_all(staging.join("store/sst"))?;
+        fs::create_dir_all(staging.join("snapshots/staging"))?;
+        for (name, mut data) in entries {
+            if name == "ccdb.toml" {
+                let text = String::from_utf8(data).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "backup config is not UTF-8")
+                })?;
+                data = text
+                    .lines()
+                    .map(|line| {
+                        if line.trim_start().starts_with("data_dir =") {
+                            format!("data_dir = \"{}\"", data_dir.display())
+                        } else {
+                            line.to_owned()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into_bytes();
+                data.push(b'\n');
+            }
+            let path = staging.join(name);
+            let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+        }
+        sync_directory(&staging)?;
+        fs::rename(&staging, data_dir)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() && staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result.map(|()| count)
+}
+
+fn take_u16(input: &[u8], cursor: &mut usize) -> io::Result<u16> {
+    Ok(u16::from_le_bytes(
+        take_bytes(input, cursor, 2)?
+            .try_into()
+            .expect("two-byte backup field"),
+    ))
+}
+
 #[derive(Clone, Debug)]
 struct Config {
     id: u64,
     data_dir: PathBuf,
     listen_client: String,
     listen_peer: String,
+    listen_metrics: String,
     peers: Vec<Peer>,
 }
 
@@ -1046,6 +1530,8 @@ fn read_config(path: &Path) -> io::Result<Config> {
         value_after(&text, "listen_client").unwrap_or_else(|| String::from("127.0.0.1:7101"));
     let listen_peer =
         value_after(&text, "listen_peer").unwrap_or_else(|| String::from("127.0.0.1:7201"));
+    let listen_metrics = value_after(&text, "listen_metrics")
+        .unwrap_or_else(|| format!("127.0.0.1:{}", 7300_u64.saturating_add(id)));
     let peer_addresses = value_after(&text, "peer_nodes")
         .unwrap_or_else(|| listen_peer.clone())
         .split(',')
@@ -1066,6 +1552,7 @@ fn read_config(path: &Path) -> io::Result<Config> {
         data_dir,
         listen_client,
         listen_peer,
+        listen_metrics,
         peers,
     })
 }
@@ -1180,7 +1667,7 @@ fn print_help() {
     println!(concat!(
         "ccdb ",
         env!("CARGO_PKG_VERSION"),
-        "\n\nCommands:\n  init --cluster NAME --nodes N [--base-dir DIR] [--force]\n  run --config PATH\n  peer --addr ADDR [--retries N] [--payload TEXT]\n  admin --addr ADDR status|members|snapshot\n  selfcheck --data-dir DIR"
+        "\n\nCommands:\n  init --cluster NAME --nodes N [--base-dir DIR] [--force]\n  run --config PATH\n  peer --addr ADDR [--retries N] [--payload TEXT]\n  admin --addr ADDR status|members|snapshot\n  admin backup --data-dir DIR --output FILE\n  admin restore --input FILE --data-dir DIR\n  selfcheck --data-dir DIR [--deep]\n  doctor [--data-dir DIR] [--client-addr ADDR] [--peer-addr ADDR]"
     ));
 }
 
@@ -1303,6 +1790,7 @@ fn load_state(path: &Path) -> io::Result<(Kv, u64)> {
 
 struct Metrics {
     commands: AtomicU64,
+    reads: AtomicU64,
     writes: AtomicU64,
     fsyncs: AtomicU64,
     peer_frames: AtomicU64,
@@ -1317,6 +1805,7 @@ impl Metrics {
             .open(trace_path)?;
         Ok(Self {
             commands: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
             writes: AtomicU64::new(0),
             fsyncs: AtomicU64::new(0),
             peer_frames: AtomicU64::new(0),
@@ -1339,8 +1828,9 @@ impl Metrics {
 
     fn render(&self) -> String {
         format!(
-            "# TYPE ccdb_commands_total counter\nccdb_commands_total {}\n# TYPE ccdb_writes_total counter\nccdb_writes_total {}\n# TYPE ccdb_fsyncs_total counter\nccdb_fsyncs_total {}\n# TYPE ccdb_peer_frames_total counter\nccdb_peer_frames_total {}\n",
+            "# TYPE ccdb_commands_total counter\nccdb_commands_total {}\n# TYPE ccdb_reads_total counter\nccdb_reads_total {}\n# TYPE ccdb_writes_total counter\nccdb_writes_total {}\n# TYPE ccdb_fsyncs_total counter\nccdb_fsyncs_total {}\n# TYPE ccdb_peer_frames_total counter\nccdb_peer_frames_total {}\n",
             self.commands.load(Ordering::Relaxed),
+            self.reads.load(Ordering::Relaxed),
             self.writes.load(Ordering::Relaxed),
             self.fsyncs.load(Ordering::Relaxed),
             self.peer_frames.load(Ordering::Relaxed),
@@ -1371,6 +1861,7 @@ mod tests {
             data_dir: directory.clone(),
             listen_client: String::from("127.0.0.1:7101"),
             listen_peer: String::from("127.0.0.1:7201"),
+            listen_metrics: String::from("127.0.0.1:7301"),
             peers: vec![Peer {
                 id: 1,
                 address: String::from("127.0.0.1:7201"),
@@ -1464,5 +1955,88 @@ mod tests {
                 assert!(used <= resp.len(), "RESP parser overread at round {round}");
             }
         }
+    }
+
+    #[test]
+    fn doctor_fsync_probe_cleans_up_after_itself() {
+        let directory = env::temp_dir().join(format!(
+            "cc-node-doctor-{}-{}",
+            std::process::id(),
+            process_time().as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("doctor test directory");
+        fsync_probe(&directory).expect("fsync probe");
+        assert_eq!(fs::read_dir(&directory).expect("read directory").count(), 0);
+        fs::remove_dir_all(directory).expect("remove doctor test directory");
+    }
+
+    #[test]
+    fn deep_selfcheck_cross_validates_identity_watermark_and_metrics() {
+        let directory = env::temp_dir().join(format!(
+            "cc-node-deep-check-{}-{}",
+            std::process::id(),
+            process_time().as_nanos()
+        ));
+        fs::create_dir_all(directory.join("snapshots/staging")).expect("deep-check directory");
+        fs::write(
+            directory.join("node.json"),
+            b"{\"cluster\":\"test\",\"id\":1}\n",
+        )
+        .expect("identity marker");
+        fs::write(
+            directory.join("ccdb.toml"),
+            format!(
+                "[node]\nid = 1\ndata_dir = \"{}\"\nlisten_client = \"127.0.0.1:7101\"\nlisten_peer = \"127.0.0.1:7201\"\nlisten_metrics = \"127.0.0.1:7301\"\npeer_nodes = \"127.0.0.1:7201\"\n",
+                directory.display()
+            ),
+        )
+        .expect("config");
+        fs::write(
+            directory.join("metrics.prom"),
+            "# TYPE ccdb_commands_total counter\nccdb_commands_total 0\n",
+        )
+        .expect("metrics");
+        deep_selfcheck(&directory, &[]).expect("deep check");
+        fs::remove_dir_all(directory).expect("remove deep-check directory");
+    }
+
+    #[test]
+    fn metrics_dashboard_is_dependency_free_and_links_metrics() {
+        let dashboard = metrics_dashboard();
+        assert!(dashboard.contains("fetch('/metrics')"));
+        assert!(dashboard.contains("ccdb / metrics"));
+        assert!(!dashboard.contains("https://"));
+    }
+
+    #[test]
+    fn backup_restore_round_trip_passes_deep_selfcheck() {
+        let root = env::temp_dir().join(format!(
+            "cc-node-backup-{}-{}",
+            std::process::id(),
+            process_time().as_nanos()
+        ));
+        let source = root.join("source");
+        let restored = root.join("restored");
+        fs::create_dir_all(source.join("snapshots/staging")).expect("source directory");
+        fs::write(
+            source.join("node.json"),
+            b"{\"cluster\":\"test\",\"id\":1}\n",
+        )
+        .expect("marker");
+        fs::write(
+            source.join("ccdb.toml"),
+            format!(
+                "[node]\nid = 1\ndata_dir = \"{}\"\nlisten_client = \"127.0.0.1:7101\"\nlisten_peer = \"127.0.0.1:7201\"\nlisten_metrics = \"127.0.0.1:7301\"\npeer_nodes = \"127.0.0.1:7201\"\n",
+                source.display()
+            ),
+        )
+        .expect("config");
+        let archive = root.join("backup.ccbk");
+        assert_eq!(backup_data_dir(&source, &archive).expect("backup"), 3);
+        assert_eq!(restore_backup(&archive, &restored).expect("restore"), 3);
+        let mut journal = DurableJournal::open(&restored.join("commands.log")).expect("journal");
+        let records = journal.replay().expect("replay");
+        deep_selfcheck(&restored, &records).expect("deep selfcheck");
+        fs::remove_dir_all(root).expect("remove backup test directory");
     }
 }

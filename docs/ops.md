@@ -17,6 +17,10 @@ cargo run -p cc-node --bin ccdb -- run --config /tmp/ccdb-demo/n2/ccdb.toml
 cargo run -p cc-node --bin ccdb -- run --config /tmp/ccdb-demo/n3/ccdb.toml
 cargo run -p cc-node --bin ccdb -- admin --addr 127.0.0.1:7102 status
 cargo run -p cc-node --bin ccdb -- selfcheck --data-dir /tmp/ccdb-demo/n1
+cargo run -p cc-node --bin ccdb -- selfcheck --deep --data-dir /tmp/ccdb-demo/n1
+cargo run -p cc-node --bin ccdb -- doctor --data-dir /tmp/ccdb-demo/n1
+cargo run -p cc-node --bin ccdb -- admin backup --data-dir /tmp/ccdb-demo/n1 --output /tmp/n1.ccbk
+cargo run -p cc-node --bin ccdb -- admin restore --input /tmp/n1.ccbk --data-dir /tmp/ccdb-restored/n1
 ```
 
 The client listener accepts bounded RESP2 frames. The peer listener accepts
@@ -25,8 +29,12 @@ versioned `CCREPL1` write, acknowledgement, and snapshot messages. Admin
 status follows a follower's leader address to the current leader; the bench
 driver does the same for real-host workloads. `metrics.prom` is refreshed by
 the host heartbeat and includes command, write, fsync, and peer-frame
-counters. A data-directory identity marker prevents starting a configuration
-against another node's files.
+counters. `listen_metrics` serves the Prometheus text at `/metrics` and a
+dependency-free live dashboard at `/`. A data-directory identity marker
+prevents starting a configuration against another node's files. Deep
+self-check replays and CRC-checks the journal, verifies its sequence watermark,
+checks identity/config agreement, rejects incomplete snapshot staging, and
+validates emitted metrics; it advises but never repairs.
 
 ## Fault work
 
@@ -34,7 +42,11 @@ against another node's files.
 kills the leader, measures sub-two-second failover, wipes and restarts a node,
 and verifies TCP snapshot catch-up. `scripts/real-faults.sh` adds a sustained
 SET workload, chunked history checking, SIGSTOP/SIGCONT pauses, and a
-byte-level userspace proxy on one peer path. `--soak-hours 1` performs the
+byte-level `cc-swarm proxy` on one peer path. `--soak-hours 1` performs the
 local one-hour fixture soak; the 24-hour owner/nightly soak remains a separate
 gate. Page-cache loss, torn writes, partitions, and large simulator campaigns
 must use the deterministic models and their recorded commands.
+
+For a packaged local lab, see [`deploy/README.md`](../deploy/README.md). It
+contains a three-node Compose topology and a hardened-by-default systemd unit
+template; neither changes the project’s local-lab security boundary.

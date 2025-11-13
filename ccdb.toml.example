@@ -3,6 +3,7 @@ id = 1
 data_dir = "./ccdb-data/n1"
 listen_client = "127.0.0.1:7101"
 listen_peer = "127.0.0.1:7201"
+listen_metrics = "127.0.0.1:7301"
 
 [storage]
 fsync = "always"
