@@ -11,14 +11,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
 use cc_core::{ClientId, LogIndex, Term, Time, crc32c};
 use cc_env::{WireMsg, decode_peer_frame, encode_peer_frame};
 use cc_kv::{Kv, KvCommand, KvReply, decode_command, encode_command};
 use cc_resp::{ClientCommand, MAX_FRAME, RespValue, encode, parse, parse_command};
 use cc_store::StoreConfig;
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 
 const JOURNAL_MAX_RECORD: usize = 4 * 1024 * 1024;
 const JOURNAL_HEADER: usize = 8;
@@ -148,11 +148,11 @@ fn run_node(args: &[String]) -> io::Result<()> {
     );
 
     let metrics_path = config.data_dir.join("metrics.prom");
-    let metrics_for_task = Arc::clone(&state.metrics);
+    let metrics_for_task = Arc::clone(&state);
     thread::spawn(move || {
         loop {
             thread::sleep(StdDuration::from_secs(1));
-            let _ = fs::write(&metrics_path, metrics_for_task.render());
+            let _ = fs::write(&metrics_path, render_metrics(&metrics_for_task));
         }
     });
 
@@ -214,7 +214,7 @@ fn serve_metrics(mut stream: TcpStream, state: &HostState) -> io::Result<()> {
         .and_then(|text| text.lines().next())
         .unwrap_or_default();
     let (content_type, body) = if first_line.starts_with("GET /metrics ") {
-        ("text/plain; version=0.0.4", state.metrics.render())
+        ("text/plain; version=0.0.4", render_metrics(state))
     } else if first_line.starts_with("GET / ") {
         ("text/html; charset=utf-8", metrics_dashboard())
     } else {
@@ -567,21 +567,34 @@ fn apply_durable(
     Ok(reply)
 }
 
+/// Resolve a `host:port` peer address at connect time.
+///
+/// Config files carry text, not IP literals: a Compose or systemd topology
+/// names its peers (`n2:7202`) and the address behind that name can change
+/// across restarts. Parsing straight to `SocketAddr` accepted only numeric
+/// hosts, so every container deployment failed with "invalid peer address"
+/// before a single frame was sent. Resolution stays here, at the point of use,
+/// rather than being frozen into `Config` at startup.
+fn resolve_peer_addr(address: &str) -> io::Result<SocketAddr> {
+    if let Ok(parsed) = address.parse::<SocketAddr>() {
+        return Ok(parsed);
+    }
+    address
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid peer address"))
+}
+
 fn leader_info(config: &Config) -> (u64, String) {
     let mut candidates = vec![(config.id, config.listen_peer.clone())];
     for peer in &config.peers {
         if peer.id == config.id {
             continue;
         }
-        if TcpStream::connect_timeout(
-            &peer
-                .address
-                .parse()
-                .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
-            PEER_CONNECT_TIMEOUT,
-        )
-        .is_ok()
-        {
+        let Ok(resolved) = resolve_peer_addr(&peer.address) else {
+            continue;
+        };
+        if TcpStream::connect_timeout(&resolved, PEER_CONNECT_TIMEOUT).is_ok() {
             candidates.push((peer.id, peer.address.clone()));
         }
     }
@@ -639,13 +652,7 @@ fn send_replication(peer: &Peer, sequence: u64, time: Time, command: &KvCommand)
     let mut delay = StdDuration::from_millis(10);
     let mut last_error = None;
     for attempt in 0..3 {
-        match TcpStream::connect_timeout(
-            &peer
-                .address
-                .parse()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid peer address"))?,
-            PEER_CONNECT_TIMEOUT,
-        ) {
+        match TcpStream::connect_timeout(&resolve_peer_addr(&peer.address)?, PEER_CONNECT_TIMEOUT) {
             Ok(mut stream) => {
                 stream.set_read_timeout(Some(PEER_IO_TIMEOUT))?;
                 stream.set_write_timeout(Some(PEER_IO_TIMEOUT))?;
@@ -818,13 +825,10 @@ fn sync_from_peers(state: &HostState) -> io::Result<()> {
         if peer.id == state.config.id {
             continue;
         }
-        let mut stream = match TcpStream::connect_timeout(
-            &peer
-                .address
-                .parse()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid peer address"))?,
-            PEER_CONNECT_TIMEOUT,
-        ) {
+        let Ok(resolved) = resolve_peer_addr(&peer.address) else {
+            continue;
+        };
+        let mut stream = match TcpStream::connect_timeout(&resolved, PEER_CONNECT_TIMEOUT) {
             Ok(stream) => stream,
             Err(_) => continue,
         };
@@ -1045,9 +1049,40 @@ fn deep_selfcheck(path: &Path, records: &[JournalRecord]) -> io::Result<()> {
             "snapshot staging contains an incomplete restore; advisor: inspect and remove only after verifying the source archive",
         ));
     }
+    // The names the operator surface promises. A metrics file that parses but
+    // has quietly stopped emitting half the inventory is exactly the kind of
+    // silent gap deep-check exists to catch.
+    const REQUIRED_METRICS: [&str; 12] = [
+        "ccdb_commands_total",
+        "ccdb_reads_total",
+        "ccdb_writes_total",
+        "ccdb_fsyncs_total",
+        "ccdb_peer_frames_total",
+        "ccdb_uptime_seconds",
+        "ccdb_up",
+        "ccdb_node_id",
+        "ccdb_is_leader",
+        "ccdb_leader_node_id",
+        "ccdb_commit_index",
+        "ccdb_applied_index",
+    ];
     let metrics = path.join("metrics.prom");
     if metrics.exists() {
-        for line in fs::read_to_string(&metrics)?.lines() {
+        let text = fs::read_to_string(&metrics)?;
+        for required in REQUIRED_METRICS {
+            if !text.lines().any(|line| {
+                line.split_once(' ')
+                    .is_some_and(|(name, _)| name == required)
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "metrics file is missing {required}; advisor: the node may be writing an older inventory"
+                    ),
+                ));
+            }
+        }
+        for line in text.lines() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -1509,7 +1544,7 @@ fn validate_identity(config: &Config) -> io::Result<()> {
             ),
         ));
     }
-    if !text.contains(&format!("\"cluster\":\"")) {
+    if !text.contains("\"cluster\":\"") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "data-dir identity marker has no cluster",
@@ -1789,6 +1824,7 @@ fn load_state(path: &Path) -> io::Result<(Kv, u64)> {
 }
 
 struct Metrics {
+    started: Instant,
     commands: AtomicU64,
     reads: AtomicU64,
     writes: AtomicU64,
@@ -1804,6 +1840,7 @@ impl Metrics {
             .append(true)
             .open(trace_path)?;
         Ok(Self {
+            started: Instant::now(),
             commands: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             writes: AtomicU64::new(0),
@@ -1826,16 +1863,63 @@ impl Metrics {
         trace.flush()
     }
 
-    fn render(&self) -> String {
+    /// Counters only. Everything here is owned by `Metrics` itself, so it can
+    /// be rendered without touching the journal or the KV lock.
+    fn render_counters(&self) -> String {
         format!(
-            "# TYPE ccdb_commands_total counter\nccdb_commands_total {}\n# TYPE ccdb_reads_total counter\nccdb_reads_total {}\n# TYPE ccdb_writes_total counter\nccdb_writes_total {}\n# TYPE ccdb_fsyncs_total counter\nccdb_fsyncs_total {}\n# TYPE ccdb_peer_frames_total counter\nccdb_peer_frames_total {}\n",
+            "# TYPE ccdb_commands_total counter\nccdb_commands_total {}\n\
+             # TYPE ccdb_reads_total counter\nccdb_reads_total {}\n\
+             # TYPE ccdb_writes_total counter\nccdb_writes_total {}\n\
+             # TYPE ccdb_fsyncs_total counter\nccdb_fsyncs_total {}\n\
+             # TYPE ccdb_peer_frames_total counter\nccdb_peer_frames_total {}\n\
+             # TYPE ccdb_uptime_seconds gauge\nccdb_uptime_seconds {}\n",
             self.commands.load(Ordering::Relaxed),
             self.reads.load(Ordering::Relaxed),
             self.writes.load(Ordering::Relaxed),
             self.fsyncs.load(Ordering::Relaxed),
             self.peer_frames.load(Ordering::Relaxed),
+            self.started.elapsed().as_secs(),
         )
     }
+}
+
+/// The full operator inventory: the counters plus the gauges that need node
+/// state to compute.
+///
+/// Every value here is read from something the host already maintains. Nothing
+/// probes a peer or measures a latency — a scrape must not be able to perturb
+/// the thing it is measuring, and a metric the host cannot actually observe
+/// would be a number with no meaning behind it.
+fn render_metrics(state: &HostState) -> String {
+    let applied = state
+        .kv
+        .lock()
+        .map(|kv| kv.applied_index.get())
+        .unwrap_or_default();
+    let commit = state.sequence.load(Ordering::Acquire).saturating_sub(1);
+    // `leader_info` resolves the lowest reachable node id, which is this
+    // host's whole notion of leadership. See docs/LIMITATIONS.md.
+    let (leader, _) = leader_info(&state.config);
+    let is_leader = u8::from(leader == state.config.id);
+    format!(
+        "{}\
+         # TYPE ccdb_up gauge\nccdb_up 1\n\
+         # TYPE ccdb_node_id gauge\nccdb_node_id {}\n\
+         # TYPE ccdb_is_leader gauge\nccdb_is_leader {}\n\
+         # TYPE ccdb_leader_node_id gauge\nccdb_leader_node_id {}\n\
+         # TYPE ccdb_commit_index gauge\nccdb_commit_index {}\n\
+         # TYPE ccdb_applied_index gauge\nccdb_applied_index {}\n\
+         # TYPE ccdb_journal_records gauge\nccdb_journal_records {}\n\
+         # TYPE ccdb_peers_configured gauge\nccdb_peers_configured {}\n",
+        state.metrics.render_counters(),
+        state.config.id,
+        is_leader,
+        leader,
+        commit,
+        applied,
+        commit,
+        state.config.peers.len(),
+    )
 }
 
 #[cfg(test)]
@@ -1991,12 +2075,38 @@ mod tests {
             ),
         )
         .expect("config");
+        // The fixture is a real host's inventory, not a token line: deep-check
+        // now requires the whole documented metric set, so a node that quietly
+        // stopped emitting half of it fails instead of passing.
+        let full_inventory = concat!(
+            "ccdb_commands_total 0\n",
+            "ccdb_reads_total 0\n",
+            "ccdb_writes_total 0\n",
+            "ccdb_fsyncs_total 0\n",
+            "ccdb_peer_frames_total 0\n",
+            "ccdb_uptime_seconds 0\n",
+            "ccdb_up 1\n",
+            "ccdb_node_id 1\n",
+            "ccdb_is_leader 1\n",
+            "ccdb_leader_node_id 1\n",
+            "ccdb_commit_index 0\n",
+            "ccdb_applied_index 0\n",
+            "ccdb_journal_records 0\n",
+            "ccdb_peers_configured 1\n",
+        );
+        fs::write(directory.join("metrics.prom"), full_inventory).expect("metrics");
+        deep_selfcheck(&directory, &[]).expect("deep check");
+
+        // Dropping one name from the inventory must be caught.
         fs::write(
             directory.join("metrics.prom"),
-            "# TYPE ccdb_commands_total counter\nccdb_commands_total 0\n",
+            full_inventory.replace("ccdb_applied_index 0\n", ""),
         )
         .expect("metrics");
-        deep_selfcheck(&directory, &[]).expect("deep check");
+        assert!(
+            deep_selfcheck(&directory, &[]).is_err(),
+            "a missing metric is a deep-check failure"
+        );
         fs::remove_dir_all(directory).expect("remove deep-check directory");
     }
 

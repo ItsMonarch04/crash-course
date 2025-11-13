@@ -37,6 +37,22 @@ echo "The harness does not claim kernel-truth: disk/page-cache campaigns remain 
 "$repo_root/scripts/demo.sh"
 
 fault_dir="$(mktemp -d "${TMPDIR:-/tmp}/ccdb-faults.XXXXXX")"
+
+wait_for_port() {
+  local port="$1"
+  local attempts="${2:-80}"
+  # bash's /dev/tcp needs no external binary and no Python: the point of this
+  # harness is the database, not its scaffolding.
+  for _ in $(seq 1 "$attempts"); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      exec 3>&- 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.05
+  done
+  echo "port $port did not become ready" >&2
+  return 1
+}
 declare -a node_pids=()
 proxy_pid=""
 workload_pid=""
@@ -73,21 +89,8 @@ ccdb_bin="$repo_root/target/debug/ccdb"
 # byte proxy.  This exercises CCREPL1 frames, not only client RESP traffic.
 "$ccdb_bin" run --config "$fault_dir/n1/ccdb.toml" >"$fault_dir/n1.log" 2>&1 &
 node_pids[1]="$!"
-python3 <<'PY'
-import socket
-import time
-
-for port in (7101, 7201):
-    deadline = time.monotonic() + 4
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                break
-        except OSError:
-            time.sleep(0.05)
-    else:
-        raise SystemExit(f"node 1 port {port} did not become ready")
-PY
+wait_for_port 7101
+wait_for_port 7201
 
 python3 - "$fault_dir/n2/ccdb.toml" "$fault_dir/n3/ccdb.toml" <<'PY'
 from pathlib import Path
@@ -111,41 +114,16 @@ cargo run --quiet -p cc-swarm -- proxy \
   >"$fault_dir/proxy.log" 2>&1 &
 proxy_pid="$!"
 
-python3 <<'PY'
-import socket
-import time
-
-deadline = time.monotonic() + 2
-while time.monotonic() < deadline:
-    try:
-        with socket.create_connection(("127.0.0.1", 7379), timeout=0.1):
-            break
-    except OSError:
-        time.sleep(0.05)
-else:
-    raise SystemExit("peer proxy did not become ready")
-PY
+wait_for_port 7379 40
 
 for node in 2 3; do
   "$ccdb_bin" run --config "$fault_dir/n${node}/ccdb.toml" >"$fault_dir/n${node}.log" 2>&1 &
   node_pids[node]="$!"
 done
 
-python3 <<'PY'
-import socket
-import time
-
-for port in (7101, 7102, 7103, 7201, 7202, 7203):
-    deadline = time.monotonic() + 4
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                break
-        except OSError:
-            time.sleep(0.05)
-    else:
-        raise SystemExit(f"port {port} did not become ready")
-PY
+for port in 7101 7102 7103 7201 7202 7203; do
+  wait_for_port "$port"
+done
 
 if (( drop_every == 0 )); then
   "$ccdb_bin" peer --addr 127.0.0.1:7379 --retries 5

@@ -8,6 +8,13 @@ writes in `commands.log`, a length-delimited journal with CRC-32C and
 leader's journal snapshot into a wiped data directory. This journal is not a
 replacement for the segmented WAL in the simulator crates.
 
+`ccdb` does not run the consensus core. Leadership here is static: the lowest
+configured node id that answers a TCP probe is the leader, records are written
+at term 1, and no election takes place. Raft itself lives in `cc-cluster` and
+`cc-raft`, exercised by the deterministic simulator and the WebAssembly
+theater. Read [limitations](LIMITATIONS.md) before reading a `role:leader`
+line as a consensus outcome.
+
 ## Start and inspect
 
 ```sh
@@ -42,10 +49,14 @@ validates emitted metrics; it advises but never repairs.
 kills the leader, measures sub-two-second failover, wipes and restarts a node,
 and verifies TCP snapshot catch-up. `scripts/real-faults.sh` adds a sustained
 SET workload, chunked history checking, SIGSTOP/SIGCONT pauses, and a
-byte-level `cc-swarm proxy` on one peer path. `--soak-hours 1` performs the
-local one-hour fixture soak; the 24-hour owner/nightly soak remains a separate
-gate. Page-cache loss, torn writes, partitions, and large simulator campaigns
-must use the deterministic models and their recorded commands.
+byte-level `cc-swarm proxy` on one peer path. `--duration-seconds N` and
+`--soak-hours N` both set the run length; the routine local check is five
+minutes and the longest soak actually performed is one hour. There is no
+multi-day soak gate — running one has never been part of this project's
+evidence, and the page does not imply otherwise. Page-cache loss, torn writes,
+partitions, and large simulator campaigns must use the deterministic models and
+their recorded commands, which reach far more states per second than wall-clock
+soaking does.
 
 For a packaged local lab, see [`deploy/README.md`](../deploy/README.md). It
 contains a three-node Compose topology and a hardened-by-default systemd unit

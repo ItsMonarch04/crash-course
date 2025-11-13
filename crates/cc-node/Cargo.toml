@@ -6,7 +6,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
-cc-cluster = { path = "../cc-cluster" }
 cc-core = { path = "../cc-core" }
 cc-env = { path = "../cc-env" }
 cc-kv = { path = "../cc-kv" }
@@ -17,5 +16,10 @@ cc-store = { path = "../cc-store" }
 name = "ccdb"
 path = "src/main.rs"
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# Host crate: reads real clocks and spawns real threads by design.
+disallowed_types = "allow"

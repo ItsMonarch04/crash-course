@@ -1,4 +1,7 @@
-FROM rust:1.88-bookworm AS build
+# `rust-toolchain.toml` pins the channel to stable, so rustup governs which
+# compiler actually runs. A specific version in this tag would be decoration:
+# it would be overridden on the first cargo invocation.
+FROM rust:bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --locked --release -p cc-node
@@ -7,6 +10,10 @@ FROM debian:bookworm-slim
 RUN useradd --create-home --uid 10001 ccdb
 COPY --from=build /src/target/release/ccdb /usr/local/bin/ccdb
 COPY deploy/container-entrypoint.sh /usr/local/bin/ccdb-entrypoint
+# Create and own the data directory *before* dropping privileges. Docker
+# creates a missing volume mount point as root, so without this the entrypoint's
+# first `mkdir` fails with EACCES as uid 10001 and every node dies on start.
+RUN mkdir -p /var/lib/ccdb && chown ccdb:ccdb /var/lib/ccdb
 USER ccdb
 VOLUME ["/var/lib/ccdb"]
 EXPOSE 7101 7201 7301

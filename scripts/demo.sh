@@ -30,19 +30,12 @@ ccdb init --cluster demo --nodes 3 --base-dir "$demo_dir"
 
 wait_for_port() {
   local port="$1"
-  for _ in {1..80}; do
-    if python3 - "$port" <<'PY'
-import socket
-import sys
-
-with socket.socket() as sock:
-    sock.settimeout(0.1)
-    try:
-        sock.connect(("127.0.0.1", int(sys.argv[1])))
-    except OSError:
-        raise SystemExit(1)
-PY
-    then
+  local attempts="${2:-80}"
+  # bash's /dev/tcp needs no external binary and no Python: the point of this
+  # harness is the database, not its scaffolding.
+  for _ in $(seq 1 "$attempts"); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      exec 3>&- 2>/dev/null || true
       return 0
     fi
     sleep 0.05
@@ -112,7 +105,7 @@ if b"20" not in reply:
 print("acknowledged=20 counter=20")
 PY
 
-echo "[4/7] kill the elected leader and verify sub-two-second failover"
+echo "[4/7] kill the current leader and verify sub-two-second failover"
 kill -9 "${node_pids[1]}"
 node_pids[1]=""
 python3 <<'PY'
