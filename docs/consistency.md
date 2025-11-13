@@ -29,3 +29,19 @@ The linearizability checker in `cc-checker` tests completed operations and
 branches open timeouts as either taking effect or not taking effect. The
 simulator's invariant checker separately enforces trace order and bounded
 liveness, so a checker `undecided` result is never silently reported as safe.
+
+## Claim receipts
+
+| Claim | Enforcing receipt |
+|---|---|
+| One leader per term and committed-prefix safety | [`cc-raft` invariant evaluators and `message_soup_campaign_100k_schedules`](../crates/cc-raft/src/lib.rs) |
+| ReadIndex requires a fresh quorum round and current-term no-op | [`trap_readindex_noop` and stale-round tests](../crates/cc-raft/src/lib.rs) |
+| Followers reject writes instead of serving them locally | [`node_starts_as_follower_and_rejects_writes_until_leader`](../crates/cc-cluster/src/lib.rs) |
+| Duplicate requests return the cached result | [`trap_sessions_in_snapshot` and session tests](../crates/cc-kv/src/lib.rs) |
+| Applied index changes atomically with state | [`trap_applied_index_atomicity`](../crates/cc-kv/src/lib.rs) |
+| Replica clocks do not change TTL visibility | [`trap_ttl_replica_clock_uses_leader_time_only`](../crates/cc-kv/src/lib.rs) |
+| Scans are checked as snapshot-legal within the call window | [`scan_is_checked_as_a_snapshot_legal_operation`](../crates/cc-checker/src/lib.rs) |
+| Open timeouts branch both ways | [`trap_open_op_semantics_allows_timeout_to_take_effect` and `trap_open_op_can_be_dropped_in_the_other_direction`](../crates/cc-checker/src/lib.rs) |
+| Checker budget exhaustion is reported as undecided | [`budget_exhaustion_is_explicitly_undecided`](../crates/cc-checker/src/lib.rs) |
+| Client histories are checked, not synthesized | [`calm_five_node_cluster_elects_and_captures_real_history`](../crates/cc-swarm/src/lib.rs) |
+| Crash/restart rebuilds from durable simulated bytes | [`scripted_leader_crash_restart_catches_up_from_surviving_cluster`](../crates/cc-swarm/src/lib.rs) |
