@@ -42,3 +42,11 @@ jobs:
         with:
           name: campaign-badge-${{ github.run_id }}
           path: target/campaign-counter.json
+      - name: Find of the night
+        if: always()
+        run: node scripts/ci/find-of-night.mjs --base-url "https://${GITHUB_REPOSITORY_OWNER}.github.io/crash-course/" --output target/find-of-night.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: find-of-night-${{ github.run_id }}
+          path: target/find-of-night.md

@@ -17,6 +17,9 @@ test("hero scenario elects, survives a leader kill, and shares its run", async (
   const firstLeader = await page.getByTestId("leader-id").textContent();
   await expect(page.getByTestId("virtual-time")).not.toHaveText("0s / 60s");
 
+  await page.getByTestId("determinism-proof").click();
+  await expect(page.getByTestId("determinism-proof")).toContainText("MATCH", { timeout: 30_000 });
+
   // Killing the leader must produce a *different* leader within bounded
   // virtual time — the §1.5 hero claim, actually asserted.
   await page.getByRole("button", { name: /KILL LEADER/ }).click();
@@ -36,4 +39,17 @@ test("hero scenario elects, survives a leader kill, and shares its run", async (
   await page.goto(sharedUrl);
   await expect(page.getByLabel("Seed")).toHaveValue(/0x/);
   await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM", { timeout: 15_000 });
+});
+
+test("guided lesson hands control back and embed mode is chromeless", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM", { timeout: 15_000 });
+  await page.getByLabel("Lesson").selectOption("asymmetric");
+  await expect(page.getByText("Asymmetric election")).toBeVisible();
+  await page.getByRole("button", { name: "TAKE THE CONTROLS" }).click();
+  await expect(page.getByText("Asymmetric election")).not.toBeVisible();
+
+  await page.goto("/#embed=1");
+  await expect(page.getByLabel("Cluster topology")).toBeVisible();
+  await expect(page.getByText("CRASH COURSE")).not.toBeVisible();
 });

@@ -15,6 +15,7 @@ type TraceFixture = { trace_version: number; seed: string; events: TraceEvent[] 
 type WasmNode = { id: number; status: string; role: Role; term: number; commit: number; applied: number; durable_bytes: number; log_tail: number[] };
 type WasmState = { virtual_time_ns: number; history_len: number; completed_operations: number; had_leader: boolean; nodes: WasmNode[]; trace: TraceFixture };
 type FaultSpec = { action: string; node?: number; offset_ms?: number; latency_ms?: number };
+type LessonName = "free" | "figure8" | "asymmetric" | "herd" | "snapshot";
 type WasmModule = {
   default: (moduleOrPath?: string) => Promise<unknown>;
   init: (spec: string) => SimHandle;
@@ -101,6 +102,17 @@ function faultsFromUrl(): FaultSpec[] {
   return scenarioFromUrl().faults;
 }
 
+function embeddedFromUrl(): boolean {
+  return new URLSearchParams(window.location.hash.replace(/^#/, "")).get("embed") === "1";
+}
+
+const LESSONS: Record<Exclude<LessonName, "free">, { title: string; chapter: string; action: FaultSpec }> = {
+  figure8: { title: "Figure-8 reconstruction", chapter: "Isolate one voter, let the majority advance, then heal. Watch the old prefix yield to the committed one.", action: { action: "partition", node: 1 } },
+  asymmetric: { title: "Asymmetric election", chapter: "Cut one voter from the majority. Terms can advance on the minority while commits remain quorum-bound.", action: { action: "partition", node: 2 } },
+  herd: { title: "Thundering herd", chapter: "Crash the current leader. Randomized deterministic timers prevent every survivor from winning at once.", action: { action: "crash", node: 1 } },
+  snapshot: { title: "Snapshot catch-up", chapter: "Degrade a follower disk while the log advances, then restore it and observe state transfer.", action: { action: "disk-degrade", node: 3, latency_ms: 80 } },
+};
+
 function drawTopology(canvas: HTMLCanvasElement, nodes: NodeState[], selected: number | null, partitioned: boolean) {
   const context = canvas.getContext("2d");
   if (!context) return;
@@ -173,6 +185,10 @@ function App() {
   const [faults, setFaults] = useState<FaultSpec[]>(faultsFromUrl);
   const [checkpoint, setCheckpoint] = useState(0.42);
   const [shared, setShared] = useState(false);
+  const [determinism, setDeterminism] = useState<"idle" | "running" | "match" | "diverged">("idle");
+  const [traceHash, setTraceHash] = useState("");
+  const [lesson, setLesson] = useState<LessonName>("free");
+  const [embedded, setEmbedded] = useState(embeddedFromUrl);
   const [museumFilter, setMuseumFilter] = useState("all");
   const [museum, setMuseum] = useState<MuseumManifest>({ schema_version: 1, build: "loading", exhibits: [] });
   const markers = useMemo(() => deriveMarkers(trace), [trace]);
@@ -182,6 +198,12 @@ function App() {
   const lostWrites = trace?.events.filter((event) => event.kind === "ClientTimeout").length ?? 0;
   const selectedNode = nodes.find((node) => node.id === selected) ?? nodes[0] ?? EMPTY_NODES[0];
   const visibleExhibits = museum.exhibits.filter((exhibit) => museumFilter === "all" || exhibit.kind === museumFilter);
+
+  useEffect(() => {
+    const update = () => setEmbedded(embeddedFromUrl());
+    window.addEventListener("hashchange", update);
+    return () => window.removeEventListener("hashchange", update);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -329,8 +351,41 @@ function App() {
     setShared(true);
   }
 
+  function chooseLesson(value: LessonName) {
+    setLesson(value);
+    if (value === "free") return;
+    const preset = LESSONS[value];
+    if (value === "herd") {
+      killLeader();
+    } else {
+      inject(preset.action);
+      if (value === "figure8" || value === "asymmetric") setPartitioned(true);
+    }
+  }
+
+  async function proveDeterminism() {
+    const runtime = wasmRuntime.current;
+    if (!runtime) return;
+    setDeterminism("running");
+    const targetNs = wasmState?.virtual_time_ns ?? 0;
+    const traces: string[] = [];
+    for (let pass = 0; pass < 2; pass += 1) {
+      const handle = runtime.module.init(JSON.stringify({ seed, profile }));
+      faults.forEach((action) => runtime.module.inject(handle, JSON.stringify(action)));
+      let state = JSON.parse(runtime.module.state(handle)) as WasmState;
+      for (let elapsed = 0; elapsed < targetNs; elapsed += 500_000_000) {
+        state = JSON.parse(runtime.module.step(handle, 500_000_000n)) as WasmState;
+      }
+      traces.push(JSON.stringify(state.trace));
+      handle.free();
+    }
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(traces[0]));
+    setTraceHash([...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 12));
+    setDeterminism(traces[0] === traces[1] ? "match" : "diverged");
+  }
+
   return (
-    <main className="shell">
+    <main className={`shell${embedded ? " embed" : ""}`}>
       <header className="topbar">
         <div className="brand"><span className="brand-mark">CC</span><div><strong>CRASH COURSE</strong><small>DETERMINISTIC FLIGHT RECORDER</small></div></div>
         <div className="verdict"><span className={`led ${partitioned || lostWrites > 0 ? "danger-led" : ""}`} /> {partitioned ? "OPEN" : "SAFE"} <b>{ackedWrites} acked · {lostWrites} lost</b></div>
@@ -341,10 +396,14 @@ function App() {
       <section className="control-strip">
         <label>SEED<input value={seed} onChange={(event) => setSeed(event.target.value)} aria-label="Seed" /></label>
         <label>PROFILE<select value={profile} onChange={(event) => setProfile(event.target.value)}><option>calm</option><option>gentle</option><option>rough</option><option>brutal</option><option>membership</option></select></label>
+        <label>LESSON<select aria-label="Lesson" value={lesson} onChange={(event) => chooseLesson(event.target.value as LessonName)}><option value="free">free explore</option><option value="figure8">figure-8</option><option value="asymmetric">asymmetric</option><option value="herd">thundering herd</option><option value="snapshot">snapshot catch-up</option></select></label>
         <label>CLUSTER<select defaultValue="5"><option>3 nodes</option><option>5 nodes</option><option>7 nodes</option></select></label>
         <label>SPEED<select value={speed} onChange={(event) => setSpeed(event.target.value)}><option>¼×</option><option>1×</option><option>4×</option><option>16×</option><option>64×</option></select></label>
         <span className="spacer" />
         <button className="outline-button" onClick={() => { setPartitioned(false); inject({ action: "heal" }); }}>HEAL ALL</button>
+        <button className="outline-button" onClick={() => void proveDeterminism()} data-testid="determinism-proof">
+          {determinism === "idle" ? "RUN TWICE" : determinism === "running" ? "CHECKING…" : determinism === "match" ? `MATCH ${traceHash}` : "DIVERGED"}
+        </button>
         <button className="accent-button" onClick={killLeader}>KILL LEADER <span>k</span></button>
       </section>
       <section className="workspace">
@@ -359,7 +418,7 @@ function App() {
           <div className="slider-label"><span>DISK LATENCY · n{selectedNode.id}</span><b>1 ms</b></div><input type="range" min="0" max="100" defaultValue="1" onChange={(event) => inject({ action: "disk-degrade", node: selectedNode.id, latency_ms: Number(event.target.value) })} />
           <div className="panel-footnote">Every control appends data to the run spec. Share it, replay it, shrink it.</div>
         </aside>
-        <section className="topology-panel panel"><div className="panel-heading"><span><span className="panel-kicker">TOPOLOGY / LIVE</span><small>virtual {Math.round(virtualTime * 60).toString().padStart(2, "0")}s · {speed}</small></span><span className="status-chip">{partitioned ? "PARTITIONED" : "HEALTHY"}</span></div><canvas ref={canvas} onClick={() => setSelected(selected === 1 ? 2 : 1)} aria-label="Cluster topology" /></section>
+        <section className="topology-panel panel"><div className="panel-heading"><span><span className="panel-kicker">TOPOLOGY / LIVE</span><small>virtual {Math.round(virtualTime * 60).toString().padStart(2, "0")}s · {speed}</small></span><span className="status-chip">{partitioned ? "PARTITIONED" : "HEALTHY"}</span></div>{lesson !== "free" && <div className="lesson-overlay"><b>{LESSONS[lesson].title}</b><span>{LESSONS[lesson].chapter}</span><button onClick={() => setLesson("free")}>TAKE THE CONTROLS</button></div>}<canvas ref={canvas} onClick={() => setSelected(selected === 1 ? 2 : 1)} aria-label="Cluster topology" /></section>
         <aside className="inspector panel"><div className="panel-kicker">NODE INSPECTOR</div><div className="node-title"><span className={`role-dot ${selectedNode.role}`} /> n{selectedNode.id}<span className="subtle" data-testid="selected-role">{selectedNode.role}</span></div><div className="metric-grid"><Metric label="TERM" value={`t${selectedNode.term}`} /><Metric label="COMMIT" value={`i${selectedNode.commit}`} /><Metric label="APPLIED" value={`i${selectedNode.applied}`} /><Metric label="DURABLE" value={`${selectedNode.durable} rec`} /></div><div className="inspector-section"><div className="section-title">LOG TAIL <span>captured</span></div><div className="log-tail">{Array.from({ length: Math.max(8, selectedNode.durable) }, (_, index) => <i key={index} className={index < selectedNode.applied ? "committed" : "pending"} style={{ opacity: 0.35 + (index % 5) / 8 }} />)}</div></div><div className="inspector-section"><div className="section-title">EVENT STREAM <span>n{selectedNode.id}</span></div>{recentEvents.length === 0 ? <p className="event-line"><b>—</b> no events captured</p> : recentEvents.map((event) => <p className="event-line" key={event.seq}><b>{(event.time_ns / 1e9).toFixed(3)}</b> {event.kind} <em>seq={event.seq}</em></p>)}</div></aside>
       </section>
       <section className="timeline panel"><div className="timeline-head"><span className="panel-kicker">TIMELINE / RE-EXECUTION</span><span className="timeline-actions"><button onClick={() => setPlaying(false)}>◀</button><button onClick={() => setPlaying((value) => !value)}>{playing ? "Ⅱ" : "▶"}</button><button onClick={() => setPlaying(false)}>▶</button><span data-testid="virtual-time">{Math.round(virtualTime * 60)}s / 60s</span></span></div><div className="timeline-track">{markers.map((marker) => <button key={`${marker.t}-${marker.kind}`} className={`marker ${marker.kind}`} style={{ left: `${marker.t * 100}%` }} title={marker.note} onClick={() => scrubTo(marker.t)} />)}<div className="playhead" style={{ left: `${(playing ? virtualTime : checkpoint) * 100}%` }} /></div><div className="timeline-labels"><span>00:00</span><span>captured events</span><span>60:00</span></div><div className="checkpoint-row">MEMORY CHECKPOINTS {memoryCheckpoints.length === 0 ? <span className="subtle">none captured</span> : memoryCheckpoints.map((value) => <button key={value} onClick={() => scrubTo(value)} className={checkpoint === value ? "selected-checkpoint" : ""}>{Math.round(value * 60)}s</button>)}</div></section>
