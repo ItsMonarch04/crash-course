@@ -35,6 +35,10 @@ pub const REACHABILITY_BEACONS: [&str; 6] = [
     "membership-change",
     "disk-loss",
 ];
+/// The same list, pre-joined for `--help`. Kept next to the array so the two
+/// cannot drift.
+pub const REACHABILITY_BEACONS_HELP: &str =
+    "leader-elected, network-drop, client-timeout, snapshot-install, membership-change, disk-loss";
 const TICK_INTERVAL: Duration = Duration::from_millis(25);
 const CLIENT_RETRY: Duration = Duration::from_millis(25);
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -800,7 +804,7 @@ impl SimCluster {
                 WorkloadActor::new(client, self.spec.seed, self.spec.workload.clone()),
             );
             if let Some(actor) = self.actors.get_mut(&client) {
-                let (sequence, operation) = actor.next();
+                let (sequence, operation) = actor.next_operation();
                 let at = Time::from_nanos(
                     FIRST_CLIENT_TIME
                         .as_nanos()
@@ -1095,9 +1099,21 @@ impl SimCluster {
                 {
                     return Ok(());
                 }
+                // A wiped node has no durable bytes to recover from, so
+                // `recover_node` rebuilds it empty. Catching it up is the
+                // leader's job, and it needs state transfer rather than log
+                // replay — the same path the real host uses when it installs a
+                // journal snapshot into a cleared data directory.
+                let was_wiped = self
+                    .nodes
+                    .get(&node)
+                    .is_some_and(|slot| slot.status == cc_sim::NodeStatus::Wiped);
                 self.recover_node(node)?;
                 if let Some(slot) = self.nodes.get_mut(&node) {
                     slot.status = cc_sim::NodeStatus::Up;
+                }
+                if was_wiped {
+                    self.install_leader_snapshot(node)?;
                 }
                 self.schedule(self.now, ClusterEventKind::Tick(node));
             }
@@ -1109,6 +1125,11 @@ impl SimCluster {
                     slot.disk = SimDisk::new();
                     slot.reset_wal();
                 }
+                // A wipe destroys durable state. That is disk loss, and the
+                // trace has to say so or the `disk-loss` beacon reports a
+                // profile whose entire purpose is losing a disk as never having
+                // lost one.
+                self.record(self.now, Some(node), EventKind::IoLost, Vec::new());
             }
             FaultAction::ClockSkew { node, offset } => {
                 if let Some(slot) = self.nodes.get_mut(&node) {
@@ -1407,6 +1428,57 @@ impl SimCluster {
 
     /// Rebuild a node from whatever survived on its disk. Everything volatile
     /// is gone; the log is replayed by Raft once a leader re-establishes commit.
+    /// Transfer the leader's applied state to a node that came back with an
+    /// empty disk.
+    ///
+    /// This is a real state transfer: the leader's own `create_snapshot` output
+    /// is installed into the target's `Node`, carrying the KV image and the
+    /// `last_included` index/term that `install_snapshot_state` uses to retire
+    /// the log prefix. It is *modelled* rather than chunked over the network —
+    /// `cc-raft` can frame `SnapshotChunk` messages, but `cc-cluster::Node`
+    /// does not intercept them, so routing chunks would move raft's indices
+    /// without the state machine bytes and leave the follower confidently
+    /// wrong. `docs/LIMITATIONS.md` records that boundary.
+    fn install_leader_snapshot(&mut self, target: NodeId) -> Result<(), ClusterError> {
+        let Some(leader) = self.leader() else {
+            return Ok(());
+        };
+        if leader == target {
+            return Ok(());
+        }
+        let snapshot = {
+            let Some(slot) = self.nodes.get_mut(&leader) else {
+                return Ok(());
+            };
+            let Some(node) = slot.node.as_mut() else {
+                return Ok(());
+            };
+            node.create_snapshot().map_err(|error| ClusterError::Node {
+                node: leader,
+                error,
+            })?
+        };
+        let last_included = snapshot.last_included_index;
+        let Some(slot) = self.nodes.get_mut(&target) else {
+            return Ok(());
+        };
+        let Some(node) = slot.node.as_mut() else {
+            return Ok(());
+        };
+        node.install_snapshot(snapshot)
+            .map_err(|error| ClusterError::Node {
+                node: target,
+                error,
+            })?;
+        self.record(
+            self.now,
+            Some(target),
+            EventKind::SnapshotInstall,
+            last_included.get().to_le_bytes().to_vec(),
+        );
+        Ok(())
+    }
+
     fn recover_node(&mut self, id: NodeId) -> Result<(), ClusterError> {
         let voters = self.voters.clone();
         let now = self.host_time(id);
@@ -1461,7 +1533,7 @@ impl SimCluster {
         let Some(actor) = self.actors.get_mut(&client) else {
             return;
         };
-        let (sequence, operation) = actor.next();
+        let (sequence, operation) = actor.next_operation();
         self.schedule(
             self.now + CLIENT_RETRY,
             ClusterEventKind::ClientIssue {
@@ -1901,6 +1973,71 @@ mod tests {
             .expect("restarted node remains in cluster");
         assert_eq!(restarted.1, max_last);
         assert_eq!(restarted.2, restarted.1);
+    }
+
+    /// The wipe wing's actual claim. A wiped node loses every durable byte, so
+    /// there is no log to replay and no prefix for the leader to append onto:
+    /// the only way back is state transfer. Before this was wired the `wipe`
+    /// profile wiped node 1 and never restarted it, so the profile proved the
+    /// cluster survived losing a disk and nothing about the node rejoining —
+    /// and `EventKind::SnapshotInstall` was emitted nowhere in the workspace.
+    #[test]
+    fn wiped_node_rejoins_by_installing_the_leader_snapshot() {
+        let mut spec = RunSpec::standard(Seed::new(0x9c), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(10_000_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.plan = FaultPlan {
+            actions: vec![
+                cc_sim::FaultAt {
+                    at: Time::from_nanos(3_000_000_000),
+                    action: FaultAction::Wipe {
+                        node: NodeId::new(2),
+                    },
+                },
+                cc_sim::FaultAt {
+                    at: Time::from_nanos(6_000_000_000),
+                    action: FaultAction::Restart {
+                        node: NodeId::new(2),
+                    },
+                },
+            ],
+        };
+        let run = run_spec(spec, RecorderLevel::Theater).expect("cluster");
+
+        assert!(run.had_leader);
+        assert!(run.trace_invariants_ok);
+        assert!(matches!(run.verdict, Verdict::Linearizable { .. }));
+
+        let wiped_disk = run
+            .trace
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::IoLost && event.node == Some(NodeId::new(2)));
+        assert!(wiped_disk, "a wipe is durable-state loss and must say so");
+
+        let installed = run.trace.events.iter().any(|event| {
+            event.kind == EventKind::SnapshotInstall && event.node == Some(NodeId::new(2))
+        });
+        assert!(
+            installed,
+            "the rejoining node was caught up by state transfer"
+        );
+
+        // Catching up means catching up: the rejoined node ends at the same
+        // last index as the rest of the cluster, with everything applied.
+        let max_last = run
+            .final_log_indices
+            .iter()
+            .map(|(_, last, _)| *last)
+            .max()
+            .unwrap_or(0);
+        let rejoined = run
+            .final_log_indices
+            .iter()
+            .find(|(id, _, _)| *id == 2)
+            .expect("wiped node remains in cluster");
+        assert_eq!(rejoined.1, max_last);
+        assert_eq!(rejoined.2, rejoined.1);
     }
 
     /// Reads run through the ReadIndex quorum round. Before this was wired the

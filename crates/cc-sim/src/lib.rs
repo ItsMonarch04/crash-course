@@ -658,7 +658,7 @@ pub struct FaultPlan {
 impl FaultPlan {
     pub fn push(&mut self, action: FaultAt) {
         self.actions.push(action);
-        self.actions.sort_by(|left, right| left.at.cmp(&right.at));
+        self.actions.sort_by_key(|action| action.at);
     }
 
     /// Liveness is only required of plans that leave a quorum standing, and a
@@ -720,7 +720,7 @@ impl WorkloadActor {
     }
 
     #[must_use]
-    pub fn next(&mut self) -> (u64, WorkloadOperation) {
+    pub fn next_operation(&mut self) -> (u64, WorkloadOperation) {
         let key_number = self.rng.range_u64(0, self.spec.keyspace.max(1));
         let key = format!("key-{key_number}").into_bytes();
         let operation = match self.rng.range_u64(0, 100) {
@@ -863,6 +863,15 @@ pub fn materialize_fault_plan(
                 at: at_percent(span, 25, &mut rng),
                 action: FaultAction::Wipe { node: first },
             });
+            // The wiped node has to come back, or the profile only proves the
+            // cluster survives losing a disk — never that the owner of that
+            // disk rejoins. Recovery from nothing is the whole point of the
+            // wipe wing, and it is what forces state transfer rather than log
+            // replay.
+            plan.push(FaultAt {
+                at: at_percent(span, 45, &mut rng),
+                action: FaultAction::Restart { node: first },
+            });
         }
         if matches!(profile, FaultProfile::Brutal) {
             plan.push(FaultAt {
@@ -944,7 +953,7 @@ where
 #[must_use]
 pub fn canonicalize_fault_plan(plan: &FaultPlan) -> FaultPlan {
     let mut result = plan.clone();
-    result.actions.sort_by(|left, right| left.at.cmp(&right.at));
+    result.actions.sort_by_key(|action| action.at);
     result
 }
 
@@ -1182,8 +1191,10 @@ mod tests {
     #[test]
     fn network_duplicate_delivery_is_explicit() {
         let nodes = [NodeId::new(1), NodeId::new(2)];
-        let mut config = LinkConfig::default();
-        config.duplicate = P16::MAX;
+        let config = LinkConfig {
+            duplicate: P16::MAX,
+            ..LinkConfig::default()
+        };
         let mut network = Network::new(&nodes, Seed::new(5), config);
         let decisions = network
             .send(Time::from_nanos(0), nodes[0], nodes[1], vec![7])
@@ -1200,8 +1211,10 @@ mod tests {
     #[test]
     fn network_max_inflight_drops_until_completion() {
         let nodes = [NodeId::new(1), NodeId::new(2)];
-        let mut config = LinkConfig::default();
-        config.max_inflight = 1;
+        let config = LinkConfig {
+            max_inflight: 1,
+            ..LinkConfig::default()
+        };
         let mut network = Network::new(&nodes, Seed::new(6), config);
         let first = network
             .send(Time::from_nanos(0), nodes[0], nodes[1], vec![1])
@@ -1302,17 +1315,23 @@ mod tests {
         let mut first = WorkloadActor::new(7, Seed::new(12), spec.clone());
         let mut second = WorkloadActor::new(7, Seed::new(12), spec);
         for expected_sequence in 1..=32 {
-            let left = first.next();
-            let right = second.next();
+            let left = first.next_operation();
+            let right = second.next_operation();
             assert_eq!(left, right);
             assert_eq!(left.0, expected_sequence);
             assert_eq!(first.next_sequence, expected_sequence + 1);
         }
     }
 
+    /// Plan-shape coverage only: this asserts that every generated wipe plan
+    /// leaves a quorum standing. It builds no cluster and applies no wipe. The
+    /// behavioural gate is
+    /// `cc_swarm::tests::wiped_node_rejoins_by_installing_the_leader_snapshot`
+    /// plus the `wipe` campaign profile, which requires the `snapshot-install`
+    /// beacon.
     #[test]
-    #[ignore = "G6 wipe campaign; run explicitly in release mode"]
-    fn wipe_profile_campaign_500k() {
+    #[ignore = "G6 wipe plan-survivability sweep; run explicitly in release mode"]
+    fn wipe_profile_plans_are_survivable_500k() {
         let nodes = [
             NodeId::new(1),
             NodeId::new(2),

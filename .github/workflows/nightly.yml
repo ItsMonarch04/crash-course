@@ -23,7 +23,7 @@ jobs:
       - run: cargo test -p cc-wal --release -- --ignored prefix_durability_campaign_1m
       - run: cargo test -p cc-store --release -- --ignored oracle_differential_campaign_1k_x_200k
       - run: cargo test -p cc-store --release -- --ignored corruption_campaign_has_no_silent_wrong_answers
-      - run: cargo test -p cc-sim --release -- --ignored wipe_profile_campaign_500k
+      - run: cargo test -p cc-sim --release -- --ignored wipe_profile_plans_are_survivable_500k
       - run: cargo test -p cc-raft --release -- --ignored message_soup_campaign_100k_schedules
       - run: cargo run --release -p cc-swarm -- run --profile rough --seeds 1000000 --jobs 16
       - run: cargo run --release -p cc-swarm -- run --profile membership --seeds 1000000 --jobs 16

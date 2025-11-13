@@ -20,7 +20,12 @@ jobs:
       - run: cargo run -p cc-swarm -- --determinism-seeds 100
       - run: cargo run -p cc-swarm -- run --profile calm --seeds 1000 --jobs 2
       - run: cargo run -p cc-swarm -- run --profile rough --seeds 10000 --jobs 4
-      - run: cargo run -p cc-swarm -- run --profile membership --seeds 10000 --jobs 4
+      # Each profile asserts the state it exists to reach. Without these a
+      # profile can stop exercising its own headline behaviour and still report
+      # a clean campaign — which is exactly how `snapshot-install` stayed dark.
+      - run: cargo run -p cc-swarm -- run --profile membership --seeds 10000 --jobs 4 --require-beacon membership-change
+      - run: cargo run -p cc-swarm -- run --profile wipe --seeds 2000 --jobs 4 --require-beacon snapshot-install
+      - run: cargo run -p cc-swarm -- run --profile brutal --seeds 2000 --jobs 4 --require-beacon disk-loss
       - run: cargo run -p cc-swarm -- regress
       - run: ./scripts/ci/sim-throughput.sh
       - run: ./scripts/ci/porcupine-crosscheck.sh

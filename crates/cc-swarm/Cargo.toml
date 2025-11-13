@@ -22,5 +22,10 @@ path = "src/main.rs"
 [lib]
 path = "src/lib.rs"
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# Host crate: reads real clocks and spawns real threads by design.
+disallowed_types = "allow"

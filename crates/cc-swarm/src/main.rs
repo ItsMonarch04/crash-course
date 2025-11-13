@@ -25,9 +25,10 @@ use cc_sim::{
 };
 
 use cc_swarm::{
-    ClusterRun, DETERMINISM_PROFILES, REACHABILITY_BEACONS, deterministic_cluster_trace,
-    deterministic_cluster_trace_for, mutate_fault_plan, reachability_beacons, reproduces_failure,
-    run_spec, semantic_trace_diff, sequence_diagram_svg, shrink_cluster_plan, trace_coverage,
+    ClusterRun, DETERMINISM_PROFILES, REACHABILITY_BEACONS, REACHABILITY_BEACONS_HELP,
+    deterministic_cluster_trace, deterministic_cluster_trace_for, mutate_fault_plan,
+    reachability_beacons, reproduces_failure, run_spec, semantic_trace_diff, sequence_diagram_svg,
+    shrink_cluster_plan, trace_coverage,
 };
 
 fn main() -> io::Result<()> {
@@ -65,7 +66,7 @@ fn run_model_check(args: &[String]) -> io::Result<()> {
         max_term: parse_u64_flag(args, "--max-term").unwrap_or(3),
         max_messages: usize::try_from(parse_u64_flag(args, "--max-messages").unwrap_or(8))
             .unwrap_or(usize::MAX),
-        max_depth: usize::try_from(parse_u64_flag(args, "--max-depth").unwrap_or(16))
+        max_depth: usize::try_from(parse_u64_flag(args, "--max-depth").unwrap_or(8))
             .unwrap_or(usize::MAX),
         max_states: usize::try_from(parse_u64_flag(args, "--max-states").unwrap_or(2_000_000))
             .unwrap_or(usize::MAX),
@@ -536,11 +537,31 @@ fn run_shrink(args: &[String]) -> io::Result<()> {
         shrunk.actions.len(),
         reproduces
     );
-    if reproduces {
-        Ok(())
-    } else {
-        Err(io::Error::other("shrinker lost the reproduce oracle"))
+    if !reproduces {
+        return Err(io::Error::other("shrinker lost the reproduce oracle"));
     }
+    // Leave a receipt beside the artifact. Nightly's "find of the night" only
+    // publishes a failure that carries one, so a raw thousand-action trace can
+    // never be presented as a finding.
+    if let Some(input) = failure.as_deref() {
+        let receipt_path = parse_string_flag(args, "--receipt")
+            .unwrap_or_else(|| format!("{}.shrunk.json", input.trim_end_matches(".json")));
+        let receipt = format!(
+            "{{\"schema_version\":1,\"artifact\":\"{}\",\"seed\":\"{}\",\"profile\":\"{}\",\
+             \"canonical_actions\":{},\"shrunk_actions\":{},\"reproduces\":true}}\n",
+            input.replace('"', "'"),
+            seed,
+            profile.as_str(),
+            canonical.actions.len(),
+            shrunk.actions.len(),
+        );
+        if let Some(parent) = Path::new(&receipt_path).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&receipt_path, receipt)?;
+        println!("shrinker: receipt={receipt_path}");
+    }
+    Ok(())
 }
 
 fn check_history(args: &[String]) -> io::Result<()> {
@@ -831,12 +852,10 @@ fn extract_faults(text: &str) -> Option<FaultPlan> {
 
 fn extract_node_array(text: &str, marker: &str) -> Option<Vec<NodeId>> {
     let body = text.split(marker).nth(1)?.split(']').next()?;
-    Some(
-        body.split(',')
-            .filter(|value| !value.is_empty())
-            .map(|value| value.parse().ok().map(NodeId::new))
-            .collect::<Option<Vec<_>>>()?,
-    )
+    body.split(',')
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse().ok().map(NodeId::new))
+        .collect::<Option<Vec<_>>>()
 }
 
 fn extract_number(text: &str, marker: &str) -> Option<u64> {
@@ -918,6 +937,12 @@ fn print_help() {
     println!(concat!(
         "cc-swarm ",
         env!("CARGO_PKG_VERSION"),
-        "\n\nCommands:\n  run --profile rough --seeds N --jobs N\n  one --seed 0x... --profile rough [--export-json] [--export-history PATH]\n  model-check [--max-log N] [--max-term N] [--max-messages N] [--max-depth N] [--max-states N]\n  search --profile rough --iterations N\n  regress\n  shrink --failure PATH\n  diff <artifact-a.json> <artifact-b.json>\n  sequence <artifact.json> [--output diagram.svg]\n  proxy [--listen ADDR] [--upstream ADDR] [--drop-every N] [--delay-ms N]\n  check-history --file PATH\n  export-porcupine --file PATH [--output PATH]\n  --selfcheck\n  --determinism\n  --determinism-seeds N"
+        "\n\nCommands:\n  run --profile rough --seeds N --jobs N [--require-beacon NAME]\n  one --seed 0x... --profile rough [--export-json] [--export-history PATH]\n  model-check [--max-log N] [--max-term N] [--max-messages N] [--max-depth N] [--max-states N]\n  search --profile rough --iterations N\n  regress\n  shrink --failure PATH\n  diff <artifact-a.json> <artifact-b.json>\n  sequence <artifact.json> [--output diagram.svg]\n  proxy [--listen ADDR] [--upstream ADDR] [--drop-every N] [--delay-ms N]\n  check-history --file PATH\n  export-porcupine --file PATH [--output PATH]\n  --selfcheck\n  --determinism\n  --determinism-seeds N"
     ));
+    println!("\nReachability beacons (for --require-beacon):\n  {REACHABILITY_BEACONS_HELP}");
+    println!(
+        "A beacon names a state the campaign is expected to reach. --require-beacon\n\
+         exits non-zero if it never fired, so a code path that goes dark fails the\n\
+         gate instead of passing quietly."
+    );
 }
