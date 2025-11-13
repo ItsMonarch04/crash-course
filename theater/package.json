@@ -1,7 +1,7 @@
 {
   "name": "crash-course-theater",
   "private": true,
-  "version": "0.10.2",
+  "version": "0.10.3",
   "type": "module",
   "engines": {
     "node": ">=20 <23",

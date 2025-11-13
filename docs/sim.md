@@ -15,7 +15,9 @@ cargo run -p cc-swarm -- search --profile brutal --iterations 1000
 ```
 
 The theater includes guided figure-8, asymmetric-election, thundering-herd,
-and snapshot-catch-up lessons. An embeddable view uses the same live engine:
+and snapshot-catch-up lessons. Cluster size is part of the scenario: the
+control offers 3, 5, and 7 voters and rebuilds the engine at the chosen size,
+which `#nodes=7` also selects. An embeddable view uses the same live engine:
 append `#embed=1&seed=0x...&profile=rough` to the theater URL. It removes the
 chrome, not the simulator.
 

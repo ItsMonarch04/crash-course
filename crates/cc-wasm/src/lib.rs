@@ -34,7 +34,8 @@ pub fn init(spec_json: &str) -> SimHandle {
     let profile = json_string_value(spec_json, "profile")
         .and_then(|value| FaultProfile::parse(&value))
         .unwrap_or(FaultProfile::Calm);
-    let spec = theater_spec(Seed::new(seed), profile);
+    let nodes = json_number_value(spec_json, "nodes");
+    let spec = theater_spec(Seed::new(seed), profile, nodes);
     let cluster = SimCluster::new(spec.clone(), RecorderLevel::Theater)
         .expect("invariant: theater cluster fixture initializes");
     let last_snapshot = cluster.snapshot();
@@ -46,9 +47,17 @@ pub fn init(spec_json: &str) -> SimHandle {
     }
 }
 
-fn theater_spec(seed: Seed, profile: FaultProfile) -> RunSpec {
+/// Cluster sizes the theater offers. Odd sizes only — an even voter count buys
+/// no extra failure tolerance and makes the quorum arithmetic on screen read
+/// like a mistake.
+const THEATER_NODE_COUNTS: [u64; 3] = [3, 5, 7];
+
+fn theater_spec(seed: Seed, profile: FaultProfile, node_count: Option<u64>) -> RunSpec {
     let end_time = Time::from_nanos(60_000_000_000);
     let mut spec = RunSpec::standard(seed, profile);
+    if let Some(count) = node_count.filter(|count| THEATER_NODE_COUNTS.contains(count)) {
+        spec.config.node_count = count;
+    }
     let nodes: Vec<NodeId> = (1..=spec.config.node_count).map(NodeId::new).collect();
     spec.config.end_time = end_time;
     spec.end_time = end_time;
@@ -59,6 +68,14 @@ fn theater_spec(seed: Seed, profile: FaultProfile) -> RunSpec {
         keyspace: 16,
     };
     spec
+}
+
+fn json_number_value(spec_json: &str, key: &str) -> Option<u64> {
+    let marker = format!("\"{key}\"");
+    let tail = spec_json.split_once(&marker)?.1;
+    let value = tail.split_once(':')?.1.trim_start();
+    let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 fn json_string_value(spec_json: &str, key: &str) -> Option<String> {
@@ -220,6 +237,33 @@ mod tests {
         assert_ne!(first, second);
         assert!(second.contains("\"nodes\":["));
         assert!(history_verdict(&handle).contains("verdict"));
+    }
+
+    /// The theater's cluster-size control has to reach the engine. It used to
+    /// be a `<select>` with no handler and a `defaultValue` matching none of
+    /// its options, so it displayed "3 nodes" over a five-node cluster.
+    #[test]
+    fn init_honours_the_requested_cluster_size() {
+        for count in THEATER_NODE_COUNTS {
+            let handle = init(&format!(
+                "{{\"seed\":\"0x2a\",\"profile\":\"calm\",\"nodes\":{count}}}"
+            ));
+            assert_eq!(handle.spec.config.node_count, count);
+            let reported = state(&handle).matches("\"id\":").count();
+            assert_eq!(reported as u64, count, "state reports every node");
+        }
+    }
+
+    /// An unsupported size falls back to the standard cluster rather than
+    /// building something the quorum arithmetic was never checked against.
+    #[test]
+    fn init_ignores_a_cluster_size_outside_the_offered_set() {
+        let standard = init("{\"seed\":\"0x2a\",\"profile\":\"calm\"}")
+            .spec
+            .config
+            .node_count;
+        let handle = init("{\"seed\":\"0x2a\",\"profile\":\"calm\",\"nodes\":4}");
+        assert_eq!(handle.spec.config.node_count, standard);
     }
 
     #[test]
