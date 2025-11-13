@@ -9,6 +9,8 @@ use std::fmt;
 
 use cc_core::{Duration, LogIndex, NodeId, Seed, Term, Time, TimerId, Xoshiro256pp};
 
+pub mod model;
+
 /// Bumped to 2 when append requests and responses gained `read_round`, which
 /// scopes a ReadIndex confirmation to the round that raised it.
 pub const PROTOCOL_VERSION: u16 = 2;
@@ -203,6 +205,7 @@ impl RaftInvariantReport {
 }
 
 /// A pure state machine. Hosts persist effects and deliver message/timer inputs.
+#[derive(Clone)]
 pub struct RaftNode {
     pub id: NodeId,
     pub role: Role,

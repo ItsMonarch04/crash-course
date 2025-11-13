@@ -1,0 +1,13 @@
+[package]
+name = "cc-detlint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "cc-detlint"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -13,7 +13,9 @@ use cc_checker::{
     check_liveness,
 };
 use cc_cluster::{Node, NodeConfig, NodeEffect, NodeError, NodeInput};
-use cc_core::{ClientId, Duration, EventKind, NodeId, Seed, Time, TimerId, Trace};
+use cc_core::{
+    ClientId, Duration, EventKind, NodeId, Seed, Time, TimerId, Trace, Xoshiro256pp, fnv1a,
+};
 use cc_env::FileId;
 use cc_kv::{KvCommand, KvReply};
 use cc_raft::{Entry, RaftConfig, Role, TimerKind};
@@ -25,6 +27,14 @@ use cc_sim::{
 use cc_store::StoreConfig;
 
 pub const MAX_OPERATIONS_PER_RUN: u64 = 32;
+pub const REACHABILITY_BEACONS: [&str; 6] = [
+    "leader-elected",
+    "network-drop",
+    "client-timeout",
+    "snapshot-install",
+    "membership-change",
+    "disk-loss",
+];
 const TICK_INTERVAL: Duration = Duration::from_millis(25);
 const CLIENT_RETRY: Duration = Duration::from_millis(25);
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -148,6 +158,210 @@ pub struct ClusterSnapshot {
     pub had_leader: bool,
     pub verdict: Verdict,
     pub liveness_ok: bool,
+}
+
+/// The first semantic difference between two traces. Sequence numbers are
+/// deliberately omitted from the comparison: position is the sequence, while
+/// the fields below explain the state-machine-visible divergence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceDifference {
+    pub event_index: usize,
+    pub left_len: usize,
+    pub right_len: usize,
+    pub field: &'static str,
+    pub left: String,
+    pub right: String,
+}
+
+/// Find the first meaningful difference between two traces.
+#[must_use]
+pub fn semantic_trace_diff(left: &Trace, right: &Trace) -> Option<TraceDifference> {
+    for (index, (left_event, right_event)) in left.events.iter().zip(&right.events).enumerate() {
+        let difference = if left_event.time != right_event.time {
+            Some((
+                "time_ns",
+                left_event.time.as_nanos().to_string(),
+                right_event.time.as_nanos().to_string(),
+            ))
+        } else if left_event.node != right_event.node {
+            Some((
+                "node",
+                left_event
+                    .node
+                    .map_or_else(|| String::from("none"), |node| node.get().to_string()),
+                right_event
+                    .node
+                    .map_or_else(|| String::from("none"), |node| node.get().to_string()),
+            ))
+        } else if left_event.kind != right_event.kind {
+            Some((
+                "kind",
+                left_event.kind.as_str().to_owned(),
+                right_event.kind.as_str().to_owned(),
+            ))
+        } else if left_event.payload != right_event.payload {
+            Some((
+                "payload_hex",
+                hex(&left_event.payload),
+                hex(&right_event.payload),
+            ))
+        } else {
+            None
+        };
+        if let Some((field, left_value, right_value)) = difference {
+            return Some(TraceDifference {
+                event_index: index,
+                left_len: left.events.len(),
+                right_len: right.events.len(),
+                field,
+                left: left_value,
+                right: right_value,
+            });
+        }
+    }
+    (left.events.len() != right.events.len()).then(|| TraceDifference {
+        event_index: left.events.len().min(right.events.len()),
+        left_len: left.events.len(),
+        right_len: right.events.len(),
+        field: "length",
+        left: left.events.len().to_string(),
+        right: right.events.len().to_string(),
+    })
+}
+
+/// Render a trace as a dependency-free SVG sequence diagram suitable for
+/// issue reports, writeups, and museum exhibits.
+#[must_use]
+pub fn sequence_diagram_svg(trace: &Trace) -> String {
+    let node_count = trace
+        .events
+        .iter()
+        .filter_map(|event| event.node)
+        .map(NodeId::get)
+        .max()
+        .unwrap_or(1);
+    let visible: Vec<_> = trace
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::NetSend
+                    | EventKind::RoleChange
+                    | EventKind::Commit
+                    | EventKind::Fault
+                    | EventKind::ClientOk
+                    | EventKind::ClientTimeout
+            )
+        })
+        .take(500)
+        .collect();
+    let width = 120_u64.saturating_add(node_count.saturating_mul(140));
+    let height = 100_usize.saturating_add(visible.len().saturating_mul(24));
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\"><style>text{{font:11px ui-monospace,monospace;fill:#dce7f2}}.lane{{stroke:#334354}}.msg{{stroke:#58d6b2;marker-end:url(#a)}}.event{{fill:#f2b84b}}</style><rect width=\"100%\" height=\"100%\" fill=\"#0d131c\"/><defs><marker id=\"a\" markerWidth=\"7\" markerHeight=\"7\" refX=\"6\" refY=\"3.5\" orient=\"auto\"><path d=\"M0,0 L7,3.5 L0,7z\" fill=\"#58d6b2\"/></marker></defs>"
+    );
+    for node in 1..=node_count {
+        let x = 80_u64.saturating_add(node.saturating_sub(1).saturating_mul(140));
+        svg.push_str(&format!("<text x=\"{x}\" y=\"28\" text-anchor=\"middle\">n{node}</text><line class=\"lane\" x1=\"{x}\" y1=\"40\" x2=\"{x}\" y2=\"{}\"/>", height.saturating_sub(20)));
+    }
+    for (row, event) in visible.iter().enumerate() {
+        let y = 58_usize.saturating_add(row.saturating_mul(24));
+        let from = event.node.map_or(1, NodeId::get);
+        let from_x = 80_u64.saturating_add(from.saturating_sub(1).saturating_mul(140));
+        if event.kind == EventKind::NetSend {
+            let payload = String::from_utf8_lossy(&event.payload);
+            let to = payload
+                .split_once('>')
+                .and_then(|(_, tail)| tail.split(':').next())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(from);
+            let to_x = 80_u64.saturating_add(to.saturating_sub(1).saturating_mul(140));
+            svg.push_str(&format!("<line class=\"msg\" x1=\"{from_x}\" y1=\"{y}\" x2=\"{to_x}\" y2=\"{y}\"/><text x=\"{}\" y=\"{}\" text-anchor=\"middle\">send #{}</text>", (from_x + to_x) / 2, y.saturating_sub(4), event.seq));
+        } else {
+            svg.push_str(&format!("<circle class=\"event\" cx=\"{from_x}\" cy=\"{y}\" r=\"4\"/><text x=\"{}\" y=\"{}\">{} #{}</text>", from_x.saturating_add(8), y.saturating_add(4), event.kind.as_str(), event.seq));
+        }
+    }
+    svg.push_str("</svg>");
+    svg
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Antithesis-style reachability beacon. A beacon records an expected rare
+/// state without turning its absence in one short run into a safety failure.
+#[macro_export]
+macro_rules! sometimes {
+    ($hits:expr, $index:expr, $condition:expr) => {
+        if $condition {
+            $hits[$index] = $hits[$index].saturating_add(1);
+        }
+    };
+}
+
+#[must_use]
+pub fn reachability_beacons(trace: &Trace, had_leader: bool) -> [u64; REACHABILITY_BEACONS.len()] {
+    let mut hits = [0_u64; REACHABILITY_BEACONS.len()];
+    sometimes!(hits, 0, had_leader);
+    for event in &trace.events {
+        sometimes!(hits, 1, event.kind == EventKind::NetDrop);
+        sometimes!(hits, 2, event.kind == EventKind::ClientTimeout);
+        sometimes!(hits, 3, event.kind == EventKind::SnapshotInstall);
+        sometimes!(hits, 4, event.kind == EventKind::ConfChange);
+        sometimes!(hits, 5, event.kind == EventKind::IoLost);
+    }
+    hits
+}
+
+/// Stable event n-grams used as feedback for coverage-guided fault-plan
+/// search. Payload hashes distinguish messages of the same broad event kind.
+#[must_use]
+pub fn trace_coverage(trace: &Trace) -> BTreeSet<u64> {
+    let atoms: Vec<u64> = trace
+        .events
+        .iter()
+        .map(|event| {
+            let mut bytes = event.kind.as_str().as_bytes().to_vec();
+            bytes.extend_from_slice(&fnv1a(&event.payload).to_le_bytes());
+            fnv1a(&bytes)
+        })
+        .collect();
+    let mut coverage = BTreeSet::new();
+    for width in 1..=3 {
+        for window in atoms.windows(width) {
+            let mut bytes = Vec::with_capacity(window.len() * 8);
+            for atom in window {
+                bytes.extend_from_slice(&atom.to_le_bytes());
+            }
+            coverage.insert(fnv1a(&bytes));
+        }
+    }
+    coverage
+}
+
+/// Deterministically mutate plan timing while retaining typed actions. This is
+/// intentionally small: feedback decides which plans survive, and mutation
+/// never invents an unrepresentable fault.
+#[must_use]
+pub fn mutate_fault_plan(plan: &FaultPlan, seed: Seed, end_time: Time) -> FaultPlan {
+    if plan.actions.is_empty() {
+        return plan.clone();
+    }
+    let mut rng = Xoshiro256pp::stream(seed, "coverage-guided-fault-search", 0);
+    let mut mutated = plan.clone();
+    let index = usize::try_from(rng.range_u64(0, mutated.actions.len() as u64)).unwrap_or(0);
+    let horizon = end_time.as_nanos().max(1);
+    let delta = rng.range_u64(0, (horizon / 8).max(1));
+    let old = mutated.actions[index].at.as_nanos();
+    let moved = if rng.range_u64(0, 2) == 0 {
+        old.saturating_sub(delta)
+    } else {
+        old.saturating_add(delta).min(horizon.saturating_sub(1))
+    };
+    mutated.actions[index].at = Time::from_nanos(moved);
+    canonicalize_fault_plan(&mutated)
 }
 
 impl ClusterRun {
@@ -1568,6 +1782,85 @@ mod tests {
         assert!(run.healthy());
         assert!(!run.history.operations.is_empty());
         assert!(!run.trace.events.is_empty());
+    }
+
+    #[test]
+    fn semantic_diff_reports_the_first_changed_field() {
+        let mut left = Trace::new(Seed::new(1), 0);
+        left.push(
+            Time::from_nanos(7),
+            Some(NodeId::new(1)),
+            EventKind::Commit,
+            vec![1],
+        );
+        let mut right = left.clone();
+        right.events[0].payload = vec![2];
+        let difference = semantic_trace_diff(&left, &right).expect("difference");
+        assert_eq!(difference.event_index, 0);
+        assert_eq!(difference.field, "payload_hex");
+        assert_eq!(difference.left, "01");
+        assert_eq!(difference.right, "02");
+        assert!(semantic_trace_diff(&left, &left).is_none());
+    }
+
+    #[test]
+    fn sequence_diagram_is_a_standalone_svg() {
+        let mut trace = Trace::new(Seed::new(1), 0);
+        trace.push(
+            Time::from_nanos(1),
+            Some(NodeId::new(1)),
+            EventKind::NetSend,
+            b"1>2:1:append".to_vec(),
+        );
+        let svg = sequence_diagram_svg(&trace);
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("n1"));
+        assert!(svg.contains("class=\"msg\""));
+        assert!(svg.ends_with("</svg>"));
+    }
+
+    #[test]
+    fn sometimes_beacons_count_reached_states() {
+        let mut trace = Trace::new(Seed::new(1), 0);
+        trace.push(
+            Time::from_nanos(1),
+            Some(NodeId::new(1)),
+            EventKind::RoleChange,
+            b"candidate>leader".to_vec(),
+        );
+        trace.push(Time::from_nanos(2), None, EventKind::NetDrop, Vec::new());
+        let hits = reachability_beacons(&trace, true);
+        assert_eq!(hits[0], 1);
+        assert_eq!(hits[1], 1);
+        assert_eq!(hits[2], 0);
+    }
+
+    #[test]
+    fn coverage_and_plan_mutation_are_deterministic() {
+        let mut trace = Trace::new(Seed::new(1), 0);
+        trace.push(
+            Time::from_nanos(1),
+            None,
+            EventKind::Fault,
+            b"crash".to_vec(),
+        );
+        trace.push(
+            Time::from_nanos(2),
+            None,
+            EventKind::RoleChange,
+            b"leader".to_vec(),
+        );
+        assert_eq!(trace_coverage(&trace).len(), 3);
+        let plan = FaultPlan {
+            actions: vec![FaultAt {
+                at: Time::from_nanos(50),
+                action: FaultAction::Heal,
+            }],
+        };
+        assert_eq!(
+            mutate_fault_plan(&plan, Seed::new(7), Time::from_nanos(100)),
+            mutate_fault_plan(&plan, Seed::new(7), Time::from_nanos(100))
+        );
     }
 
     #[test]

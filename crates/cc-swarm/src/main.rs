@@ -3,9 +3,11 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,8 +25,9 @@ use cc_sim::{
 };
 
 use cc_swarm::{
-    ClusterRun, DETERMINISM_PROFILES, deterministic_cluster_trace, deterministic_cluster_trace_for,
-    reproduces_failure, run_spec, shrink_cluster_plan,
+    ClusterRun, DETERMINISM_PROFILES, REACHABILITY_BEACONS, deterministic_cluster_trace,
+    deterministic_cluster_trace_for, mutate_fault_plan, reachability_beacons, reproduces_failure,
+    run_spec, semantic_trace_diff, sequence_diagram_svg, shrink_cluster_plan, trace_coverage,
 };
 
 fn main() -> io::Result<()> {
@@ -43,10 +46,231 @@ fn main() -> io::Result<()> {
         Some("shrink") => run_shrink(&args[1..]),
         Some("check-history") => check_history(&args[1..]),
         Some("export-porcupine") => export_porcupine(&args[1..]),
+        Some("diff") => run_diff(&args[1..]),
+        Some("sequence") => run_sequence(&args[1..]),
+        Some("proxy") => run_proxy(&args[1..]),
+        Some("search") => run_coverage_search(&args[1..]),
+        Some("model-check") => run_model_check(&args[1..]),
         _ => {
             print_help();
             Ok(())
         }
+    }
+}
+
+fn run_model_check(args: &[String]) -> io::Result<()> {
+    let config = cc_raft::model::ModelConfig {
+        max_log: usize::try_from(parse_u64_flag(args, "--max-log").unwrap_or(4))
+            .unwrap_or(usize::MAX),
+        max_term: parse_u64_flag(args, "--max-term").unwrap_or(3),
+        max_messages: usize::try_from(parse_u64_flag(args, "--max-messages").unwrap_or(8))
+            .unwrap_or(usize::MAX),
+        max_depth: usize::try_from(parse_u64_flag(args, "--max-depth").unwrap_or(16))
+            .unwrap_or(usize::MAX),
+        max_states: usize::try_from(parse_u64_flag(args, "--max-states").unwrap_or(2_000_000))
+            .unwrap_or(usize::MAX),
+    };
+    let report = cc_raft::model::check(config).map_err(io::Error::other)?;
+    println!(
+        "model-check: PASS nodes=3 max_log={} max_term={} depth={} explored_states={} explored_transitions={} max_frontier={}",
+        config.max_log,
+        config.max_term,
+        report.max_depth,
+        report.explored_states,
+        report.explored_transitions,
+        report.max_frontier,
+    );
+    Ok(())
+}
+
+fn run_coverage_search(args: &[String]) -> io::Result<()> {
+    let iterations = parse_u64_flag(args, "--iterations").unwrap_or(100);
+    let profile = parse_profile(args, FaultProfile::Rough);
+    let mut corpus = Vec::<RunSpec>::new();
+    let mut guided_coverage = BTreeSet::new();
+    let mut uniform_coverage = BTreeSet::new();
+    let mut guided_failures = 0_u64;
+    let mut uniform_failures = 0_u64;
+    let guided_started = Instant::now();
+    for iteration in 0..iterations {
+        let seed = Seed::new(iteration);
+        let mut spec = fixture_spec(seed, profile, true);
+        if !corpus.is_empty() {
+            let parent = &corpus[iteration as usize % corpus.len()];
+            spec.plan = mutate_fault_plan(&parent.plan, seed, spec.end_time);
+        }
+        let run = run_spec(spec.clone(), RecorderLevel::Gate).map_err(io::Error::other)?;
+        let coverage = trace_coverage(&run.trace);
+        let novel = coverage.iter().any(|edge| !guided_coverage.contains(edge));
+        guided_coverage.extend(coverage);
+        if novel {
+            corpus.push(spec);
+        }
+        if !run.healthy() || !matches!(run.verdict, Verdict::Linearizable { .. }) {
+            guided_failures = guided_failures.saturating_add(1);
+        }
+    }
+    let guided_seconds = guided_started.elapsed().as_secs_f64();
+    let uniform_started = Instant::now();
+    for iteration in 0..iterations {
+        let run = run_spec(
+            fixture_spec(Seed::new(iteration), profile, true),
+            RecorderLevel::Gate,
+        )
+        .map_err(io::Error::other)?;
+        uniform_coverage.extend(trace_coverage(&run.trace));
+        if !run.healthy() || !matches!(run.verdict, Verdict::Linearizable { .. }) {
+            uniform_failures = uniform_failures.saturating_add(1);
+        }
+    }
+    let uniform_seconds = uniform_started.elapsed().as_secs_f64();
+    let per_hour = |failures: u64, seconds: f64| {
+        if seconds == 0.0 {
+            0.0
+        } else {
+            failures as f64 * 3_600.0 / seconds
+        }
+    };
+    println!(
+        "coverage-search profile={} iterations={} corpus={} guided_edges={} uniform_edges={} guided_failures={} uniform_failures={} guided_bugs_per_cpu_hour={:.3} uniform_bugs_per_cpu_hour={:.3}",
+        profile.as_str(),
+        iterations,
+        corpus.len(),
+        guided_coverage.len(),
+        uniform_coverage.len(),
+        guided_failures,
+        uniform_failures,
+        per_hour(guided_failures, guided_seconds),
+        per_hour(uniform_failures, uniform_seconds),
+    );
+    Ok(())
+}
+
+fn run_sequence(args: &[String]) -> io::Result<()> {
+    let artifact = args.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: cc-swarm sequence <artifact.json> --output diagram.svg",
+        )
+    })?;
+    let output = parse_string_flag(args, "--output")
+        .unwrap_or_else(|| String::from("artifacts/sequence.svg"));
+    let text = fs::read_to_string(artifact)?;
+    let seed = extract_seed(&text)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "artifact has no seed"))?;
+    let profile = extract_profile(&text).unwrap_or(FaultProfile::Rough);
+    let spec = extract_run_spec(&text, seed, profile);
+    let run = run_spec(spec, RecorderLevel::Theater).map_err(io::Error::other)?;
+    if let Some(parent) = Path::new(&output).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&output, sequence_diagram_svg(&run.trace))?;
+    println!(
+        "sequence diagram: wrote {output} events={}",
+        run.trace.events.len()
+    );
+    Ok(())
+}
+
+fn run_diff(args: &[String]) -> io::Result<()> {
+    if args.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: cc-swarm diff <artifact-a.json> <artifact-b.json>",
+        ));
+    }
+    let mut runs = Vec::with_capacity(2);
+    for path in args {
+        let text = fs::read_to_string(path)?;
+        let seed = extract_seed(&text)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "artifact has no seed"))?;
+        let profile = extract_profile(&text).unwrap_or(FaultProfile::Rough);
+        let spec = extract_run_spec(&text, seed, profile);
+        runs.push(run_spec(spec, RecorderLevel::Theater).map_err(io::Error::other)?);
+    }
+    match semantic_trace_diff(&runs[0].trace, &runs[1].trace) {
+        None => println!(
+            "trace diff: identical events={}",
+            runs[0].trace.events.len()
+        ),
+        Some(difference) => println!(
+            "trace diff: event={} field={} left={} right={} left_events={} right_events={}",
+            difference.event_index,
+            difference.field,
+            difference.left,
+            difference.right,
+            difference.left_len,
+            difference.right_len,
+        ),
+    }
+    Ok(())
+}
+
+fn run_proxy(args: &[String]) -> io::Result<()> {
+    let listen =
+        parse_string_flag(args, "--listen").unwrap_or_else(|| String::from("127.0.0.1:7379"));
+    let upstream =
+        parse_string_flag(args, "--upstream").unwrap_or_else(|| String::from("127.0.0.1:7101"));
+    let drop_every = parse_u64_flag(args, "--drop-every").unwrap_or(0);
+    let delay_ms = parse_u64_flag(args, "--delay-ms").unwrap_or(0);
+    let listener = TcpListener::bind(&listen)?;
+    println!(
+        "cc-swarm proxy listening={listen} upstream={upstream} drop_every={drop_every} delay_ms={delay_ms}"
+    );
+    for client in listener.incoming() {
+        let client = client?;
+        let upstream_address = upstream.clone();
+        thread::spawn(move || {
+            if let Err(error) = proxy_connection(client, &upstream_address, drop_every, delay_ms) {
+                eprintln!("proxy connection: {error}");
+            }
+        });
+    }
+    Ok(())
+}
+
+fn proxy_connection(
+    client: TcpStream,
+    upstream_address: &str,
+    drop_every: u64,
+    delay_ms: u64,
+) -> io::Result<()> {
+    let upstream = TcpStream::connect(upstream_address)?;
+    let client_reply = client.try_clone()?;
+    let upstream_request = upstream.try_clone()?;
+    let first = thread::spawn(move || relay(client, upstream_request, drop_every, delay_ms));
+    let second = thread::spawn(move || relay(upstream, client_reply, drop_every, delay_ms));
+    first
+        .join()
+        .map_err(|_| io::Error::other("proxy request relay panicked"))??;
+    second
+        .join()
+        .map_err(|_| io::Error::other("proxy reply relay panicked"))??;
+    Ok(())
+}
+
+fn relay(
+    mut source: TcpStream,
+    mut target: TcpStream,
+    drop_every: u64,
+    delay_ms: u64,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut chunks = 0_u64;
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            let _ = target.shutdown(Shutdown::Write);
+            return Ok(());
+        }
+        chunks = chunks.saturating_add(1);
+        if drop_every != 0 && chunks.is_multiple_of(drop_every) {
+            continue;
+        }
+        if delay_ms != 0 {
+            thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        target.write_all(&buffer[..read])?;
     }
 }
 
@@ -112,10 +336,16 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
     let mut workers = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let next_seed = Arc::clone(&next_seed);
-        workers.push(thread::spawn(move || -> io::Result<(u64, u64, u64)> {
+        workers.push(thread::spawn(move || -> io::Result<(
+            u64,
+            u64,
+            u64,
+            [u64; REACHABILITY_BEACONS.len()],
+        )> {
             let mut failures = 0_u64;
             let mut history_failures = 0_u64;
             let mut events = 0_u64;
+            let mut beacon_hits = [0_u64; REACHABILITY_BEACONS.len()];
             loop {
                 let seed = next_seed.fetch_add(1, Ordering::Relaxed);
                 if seed >= seeds {
@@ -129,6 +359,13 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
                 match result {
                     Ok(run) => {
                         events = events.saturating_add(run.event_count);
+                        for (total, hits) in
+                            beacon_hits
+                                .iter_mut()
+                                .zip(reachability_beacons(&run.trace, run.had_leader))
+                        {
+                            *total = total.saturating_add(hits);
+                        }
                         let failed = !run.healthy();
                         let history_failed = !matches!(run.verdict, Verdict::Linearizable { .. });
                         if failed {
@@ -154,19 +391,23 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
                     }
                 }
             }
-            Ok((failures, history_failures, events))
+            Ok((failures, history_failures, events, beacon_hits))
         }));
     }
     let mut failures = 0_u64;
     let mut history_failures = 0_u64;
     let mut events = 0_u64;
+    let mut beacon_hits = [0_u64; REACHABILITY_BEACONS.len()];
     for worker in workers {
-        let (worker_failures, worker_history_failures, worker_events) = worker
+        let (worker_failures, worker_history_failures, worker_events, worker_beacons) = worker
             .join()
             .map_err(|_| io::Error::other("campaign worker panicked"))??;
         failures = failures.saturating_add(worker_failures);
         history_failures = history_failures.saturating_add(worker_history_failures);
         events = events.saturating_add(worker_events);
+        for (total, hits) in beacon_hits.iter_mut().zip(worker_beacons) {
+            *total = total.saturating_add(hits);
+        }
     }
     let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
     println!(
@@ -179,6 +420,35 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
         events,
         f64::from(seeds as u32) / elapsed
     );
+    let beacon_report = REACHABILITY_BEACONS
+        .iter()
+        .zip(beacon_hits)
+        .map(|(name, hits)| format!("{name}:{hits}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let missing = REACHABILITY_BEACONS
+        .iter()
+        .zip(beacon_hits)
+        .filter_map(|(name, hits)| (hits == 0).then_some(*name))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("reachability beacons={beacon_report} missing={missing}");
+    if let Some(required) = parse_string_flag(args, "--require-beacon") {
+        let Some(position) = REACHABILITY_BEACONS
+            .iter()
+            .position(|name| *name == required)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown reachability beacon",
+            ));
+        };
+        if beacon_hits[position] == 0 {
+            return Err(io::Error::other(format!(
+                "reachability beacon never fired: {required}"
+            )));
+        }
+    }
     if failures == 0 && history_failures == 0 {
         Ok(())
     } else {
@@ -648,6 +918,6 @@ fn print_help() {
     println!(concat!(
         "cc-swarm ",
         env!("CARGO_PKG_VERSION"),
-        "\n\nCommands:\n  run --profile rough --seeds N --jobs N\n  one --seed 0x... --profile rough [--export-json] [--export-history PATH]\n  regress\n  shrink --failure PATH\n  check-history --file PATH\n  export-porcupine --file PATH [--output PATH]\n  --selfcheck\n  --determinism\n  --determinism-seeds N"
+        "\n\nCommands:\n  run --profile rough --seeds N --jobs N\n  one --seed 0x... --profile rough [--export-json] [--export-history PATH]\n  model-check [--max-log N] [--max-term N] [--max-messages N] [--max-depth N] [--max-states N]\n  search --profile rough --iterations N\n  regress\n  shrink --failure PATH\n  diff <artifact-a.json> <artifact-b.json>\n  sequence <artifact.json> [--output diagram.svg]\n  proxy [--listen ADDR] [--upstream ADDR] [--drop-every N] [--delay-ms N]\n  check-history --file PATH\n  export-porcupine --file PATH [--output PATH]\n  --selfcheck\n  --determinism\n  --determinism-seeds N"
     ));
 }

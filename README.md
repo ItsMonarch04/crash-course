@@ -32,10 +32,16 @@ The repository currently contains:
   failure shims;
 - a deterministic simulator that composes real `cc-cluster::Node` instances,
   drives workload actors, captures client histories, checks invariants, runs
-  campaigns, and shrinks reproduced failures;
+  campaigns, shrinks reproduced failures, searches trace n-gram coverage,
+  reports reachability beacons, and explains first semantic trace divergence;
 - a persistent `wasm-bindgen` bridge and browser theater with live topology,
   inspector, timeline/scrubbing, fault injection, verdict, and share-URL
-  panels;
+  panels, guided lessons, embeddable mode, and a clickable double-run trace
+  proof; traces can also be exported as standalone SVG sequence diagrams;
+- a Redis-shaped single-key RMW family, deep self-check and environment doctor,
+  Prometheus/dashboard endpoint, Rust fault proxy, and three-node Compose lab;
+- `cc-detlint`, the reusable zero-dependency determinism scanner and double-run
+  harness;
 - an empty-by-default museum manifest that accepts only pinned real traces; and
 - normative format notes, named safety traps, campaign tooling, limitations,
   and disclosed local-model benchmark reports.
@@ -59,4 +65,4 @@ AGPL-3.0-only. See [LICENSE](LICENSE).
 
 ---
 
-**Version:** v0.8.11
+**Version:** v0.9.0

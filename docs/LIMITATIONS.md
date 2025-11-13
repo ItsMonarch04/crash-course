@@ -30,10 +30,10 @@ narrow.
   campaigns stay in the hundreds-of-runs-per-second range. Linearizability
   verdicts are therefore statements about short histories under many seeds, not
   about long-running sessions.
-- Generated fault plans have a fixed shape per profile. The seed varies fault
-  timing, the workload, network delays, and which voter a membership change
-  removes, but not the set of faults itself. Broader fault search is an
-  enhancement track, not a property of the current campaigns.
+- Uniform campaign fault plans have a fixed shape per profile. The seed varies
+  timing, workload, network delays, and membership target. The separate
+  coverage-guided search mutates typed plan timing toward novel trace n-grams;
+  it does not turn uniform campaign counts into coverage claims.
 - The current `cc-bench` driver is a reproducible local-state harness. It does
   not publish production performance claims, and all-local loopback replication
   would make network latency unrealistically low.
@@ -41,6 +41,13 @@ narrow.
   JSON-oriented, and the native/WASM equivalence gate compares the exported
   state for the checked fixture inputs; it is not a general browser-hosting
   or performance guarantee.
+- The bounded model checker exhausts only the explicit node/log/term/message,
+  transition-depth, and state-count bounds printed in its report. A completed
+  tiny model is evidence inside that state space, not a proof of unbounded
+  Raft.
+- Real-host backups are offline `CCBK` archives of the identity, config, and
+  durable command journal. They are not yet SSTable checkpoints; the command
+  rejects a journal that changes during capture and restore never merges data.
 
 Performance language is intentionally absent from the claims above. Any future
 comparison must carry its environment, durability mode, topology, config hash,
