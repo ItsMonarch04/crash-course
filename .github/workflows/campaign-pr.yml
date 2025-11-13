@@ -22,4 +22,5 @@ jobs:
       - run: cargo run -p cc-swarm -- run --profile rough --seeds 10000 --jobs 4
       - run: cargo run -p cc-swarm -- run --profile membership --seeds 10000 --jobs 4
       - run: cargo run -p cc-swarm -- regress
+      - run: ./scripts/ci/sim-throughput.sh
       - run: ./scripts/ci/porcupine-crosscheck.sh
