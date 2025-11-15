@@ -590,10 +590,8 @@ impl Store {
         let mut keep = Vec::new();
         let mut seen_keys = BTreeSet::new();
         for (key, value) in all {
-            if !seen_keys.insert(key.user_key.clone()) {
-                if key.sequence < min_snapshot {
-                    continue;
-                }
+            if !seen_keys.insert(key.user_key.clone()) && key.sequence < min_snapshot {
+                continue;
             }
             if key.kind == ValueKind::Delete && key.sequence < min_snapshot {
                 continue;

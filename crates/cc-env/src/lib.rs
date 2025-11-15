@@ -93,7 +93,7 @@ pub fn decode_peer_frame(input: &[u8]) -> Result<(WireMsg, usize), FrameError> {
         return Err(FrameError::InvalidVersion(version));
     }
     let body_len = u32::from_le_bytes(input[6..10].try_into().expect("peer header")) as usize;
-    if body_len < 2 || body_len > MAX_PEER_FRAME + 2 {
+    if !(2..=MAX_PEER_FRAME + 2).contains(&body_len) {
         return Err(FrameError::TooLarge(body_len));
     }
     let total = HEADER

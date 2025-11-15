@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.5"
+version = "0.10.6"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
@@ -27,6 +27,19 @@ publish = false
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+# The deterministic core inherits this table. `disallowed_types` is what makes
+# `clippy.toml`'s ban on HashMap/HashSet/SystemTime/Instant real, so it is
+# denied rather than merely warned: an ambient clock or an unordered map inside
+# a state machine is a determinism bug, not a style opinion.
+#
+# Host crates (cc-node, cc-bench, cc-swarm, cc-wasm, cc-detlint) legitimately
+# read clocks and spawn threads. They declare their own lint table and allow
+# `disallowed_types` explicitly — the same perimeter `cc-detlint` scans. A
+# workspace-wide ban would force exceptions broad enough to hide a core mistake.
+#
+# `priority = -1` on the group is load-bearing: without it Cargo can pass the
+# group flag after the specific one and silently re-enable what a crate meant
+# to allow.
 [workspace.lints.clippy]
-all = "allow"
-pedantic = "allow"
+all = { level = "warn", priority = -1 }
+disallowed_types = "deny"

@@ -417,7 +417,7 @@ impl Kv {
         self.store
             .scan(start, end, None, limit.min(MAX_SCAN))
             .into_iter()
-            .filter(|(key, _)| !self.ttl.get(key).is_some_and(|deadline| *deadline <= now))
+            .filter(|(key, _)| self.ttl.get(key).is_none_or(|deadline| *deadline > now))
             .collect()
     }
 

@@ -700,7 +700,7 @@ mod tests {
             .expect("append");
         let durable = wal.durable_images();
         let recovered = recover(&durable, config()).expect("recovery");
-        assert!(recovered.durable_payloads().len() >= 1);
+        assert!(!recovered.durable_payloads().is_empty());
     }
 
     #[test]
