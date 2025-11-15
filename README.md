@@ -6,8 +6,15 @@ the proof that the failure cases are understood.
 
 The project is deliberately honest about its status: it is an educational lab
 tool under active construction, not a production database and not a benchmark
-claim. The core is designed as synchronous, host-independent state machines
-that can run in a simulator, a real host, or WebAssembly.
+claim.
+
+The consensus core is written as synchronous, host-independent state machines,
+and the same core runs in two places: inside the deterministic simulator and,
+compiled to WebAssembly, inside the browser theater. The `ccdb` lab host is a
+third, deliberately simpler program — it shares the storage and RESP vocabulary
+but replicates over a static primary/backup path with no elections and no
+terms. Which component runs consensus, and which does not, is spelled out in
+[limitations](docs/LIMITATIONS.md).
 
 ![The browser theater running a five-node cluster, killing the leader, and
 watching the survivors elect a new one without losing an acknowledged write.](theater/public/crash-course.gif)
@@ -32,12 +39,16 @@ The repository currently contains:
   failure shims;
 - a deterministic simulator that composes real `cc-cluster::Node` instances,
   drives workload actors, captures client histories, checks invariants, runs
-  campaigns, shrinks reproduced failures, searches trace n-gram coverage,
-  reports reachability beacons, and explains first semantic trace divergence;
-- a persistent `wasm-bindgen` bridge and browser theater with live topology,
-  inspector, timeline/scrubbing, fault injection, verdict, and share-URL
-  panels, guided lessons, embeddable mode, and a clickable double-run trace
-  proof; traces can also be exported as standalone SVG sequence diagrams;
+  campaigns, catches wiped nodes up by snapshot install, shrinks reproduced
+  failures, searches trace n-gram coverage, gates on reachability beacons, and
+  explains first semantic trace divergence;
+- a bounded model checker that exhaustively explores the reachable `cc-raft`
+  state space within printed log, term, message, and depth bounds;
+- a persistent `wasm-bindgen` bridge and browser theater with a resizable
+  cluster, live topology, node inspector, timeline stepping and scrubbing,
+  fault injection, verdict, and share-URL panels, guided lessons, embeddable
+  mode, and a clickable double-run trace proof; traces can also be exported as
+  standalone SVG sequence diagrams;
 - a Redis-shaped single-key RMW family, deep self-check and environment doctor,
   Prometheus/dashboard endpoint, Rust fault proxy, and three-node Compose lab;
 - `cc-detlint`, the reusable zero-dependency determinism scanner and double-run
@@ -65,4 +76,4 @@ AGPL-3.0-only. See [LICENSE](LICENSE).
 
 ---
 
-**Version:** v0.10.4
+**Version:** v0.10.5
