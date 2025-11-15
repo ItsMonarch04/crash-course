@@ -131,7 +131,7 @@ fn parse_options(args: &[String]) -> io::Result<Options> {
         .unwrap_or(Workload::A);
     let clients = number_flag(args, "--clients", 1)?;
     let ops = number_flag(args, "--ops", 10_000)?;
-    let seed = number_flag(args, "--seed", 0x_ccb0_01)?;
+    let seed = number_flag(args, "--seed", 0x00cc_b001)?;
     let value_bytes = usize::try_from(number_flag(
         args,
         "--value-bytes",
@@ -276,11 +276,10 @@ fn run_remote(options: &Options, initial_address: &str) -> io::Result<String> {
     }
     samples.sort_unstable();
     let elapsed_ns = started.elapsed().as_nanos();
-    let throughput = if elapsed_ns == 0 {
-        0
-    } else {
-        u128::from(acknowledged).saturating_mul(1_000_000_000) / elapsed_ns
-    };
+    let throughput = u128::from(acknowledged)
+        .saturating_mul(1_000_000_000)
+        .checked_div(elapsed_ns)
+        .unwrap_or(0);
     Ok(format!(
         "{{\n  \"schema\": 1,\n  \"mode\": \"real-host\",\n  \"address\": \"{}\",\n  \"workload\": \"{}\",\n  \"clients\": {},\n  \"ops\": {},\n  \"repetitions\": {},\n  \"seed\": {},\n  \"acked\": {},\n  \"throughput_ops_per_sec\": {},\n  \"latency_ns\": {{\"p50\": {}, \"p95\": {}, \"p99\": {}, \"max\": {}}}\n}}",
         json_escape(&address),
@@ -355,11 +354,10 @@ fn report_json(report: &Report) -> String {
     let mut samples = report.samples.clone();
     samples.sort_unstable();
     let total_ops = report.ops.saturating_mul(report.repetitions);
-    let throughput = if report.elapsed_ns == 0 {
-        0
-    } else {
-        u128::from(total_ops).saturating_mul(1_000_000_000) / report.elapsed_ns
-    };
+    let throughput = u128::from(total_ops)
+        .saturating_mul(1_000_000_000)
+        .checked_div(report.elapsed_ns)
+        .unwrap_or(0);
     format!(
         "{{\n  \"schema\": 1,\n  \"workload\": \"{}\",\n  \"clients\": {},\n  \"ops\": {},\n  \"repetitions\": {},\n  \"seed\": {},\n  \"value_bytes\": {},\n  \"config_hash\": \"{:016x}\",\n  \"environment\": {{\"os\": \"{}\", \"arch\": \"{}\", \"note\": \"closed-loop deterministic local model; loopback replication latency is not measured\"}},\n  \"throughput_ops_per_sec\": {},\n  \"latency_ns\": {{\"p50\": {}, \"p95\": {}, \"p99\": {}, \"p999\": {}, \"max\": {}}}\n}}",
         report.workload.as_str(),
