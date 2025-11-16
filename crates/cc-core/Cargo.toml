@@ -2,7 +2,9 @@
 name = "cc-core"
 version.workspace = true
 edition.workspace = true
+description = "Deterministic, host-independent vocabulary shared by Crash Course crates."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [lints]

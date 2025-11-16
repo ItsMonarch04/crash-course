@@ -2,7 +2,9 @@
 name = "cc-detlint"
 version.workspace = true
 edition.workspace = true
+description = "Zero-dependency determinism scanner and double-run harness."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [[bin]]

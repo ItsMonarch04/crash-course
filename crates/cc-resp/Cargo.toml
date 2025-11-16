@@ -2,7 +2,9 @@
 name = "cc-resp"
 version.workspace = true
 edition.workspace = true
+description = "Bounded RESP2 parser/encoder and the closed client command table."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

@@ -1,4 +1,4 @@
-# Fsync, torn writes, and the page cache made visible
+# 02 — Fsync, torn writes, and the page cache made visible
 
 The first storage promise in Crash Course is intentionally narrow: an
 acknowledged log record must survive a crash, while an unacknowledged record

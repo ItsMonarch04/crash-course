@@ -13,39 +13,39 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 720
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - run: node scripts/check-version-coherence.mjs
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - run: cargo run -p cc-swarm -- --determinism-seeds 1000
-      - run: cargo test -p cc-wal --release -- --ignored prefix_durability_campaign_1m
-      - run: cargo test -p cc-store --release -- --ignored oracle_differential_campaign_1k_x_200k
-      - run: cargo test -p cc-store --release -- --ignored corruption_campaign_has_no_silent_wrong_answers
-      - run: cargo test -p cc-sim --release -- --ignored wipe_profile_plans_are_survivable_500k
-      - run: cargo test -p cc-raft --release -- --ignored message_soup_campaign_100k_schedules
-      - run: cargo run --release -p cc-swarm -- run --profile rough --seeds 1000000 --jobs 16
-      - run: cargo run --release -p cc-swarm -- run --profile membership --seeds 1000000 --jobs 16
-      - run: cargo run --release -p cc-swarm -- run --profile wipe --seeds 500000 --jobs 16
-      - uses: actions/cache/restore@v4
+      - run: cargo run --locked -p cc-swarm -- --determinism-seeds 1000
+      - run: cargo test --locked -p cc-wal --release -- --ignored prefix_durability_campaign_1m
+      - run: cargo test --locked -p cc-store --release -- --ignored oracle_differential_campaign_1k_x_200k
+      - run: cargo test --locked -p cc-store --release -- --ignored corruption_campaign_has_no_silent_wrong_answers
+      - run: cargo test --locked -p cc-sim --release -- --ignored wipe_profile_plans_are_survivable_500k
+      - run: cargo test --locked -p cc-raft --release -- --ignored message_soup_campaign_100k_schedules
+      - run: cargo run --locked --release -p cc-swarm -- run --profile rough --seeds 1000000 --jobs 16
+      - run: cargo run --locked --release -p cc-swarm -- run --profile membership --seeds 1000000 --jobs 16
+      - run: cargo run --locked --release -p cc-swarm -- run --profile wipe --seeds 500000 --jobs 16
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target/campaign-counter.json
           key: campaign-counter-${{ github.run_id }}
           restore-keys: campaign-counter-
       - run: node scripts/ci/campaign-badge.mjs --input target/campaign-counter.json --output target/campaign-counter.json --seeds 2500000 --profile rough+membership+wipe --run-id "${GITHUB_RUN_ID}"
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target/campaign-counter.json
           key: campaign-counter-${{ github.run_id }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: campaign-badge-${{ github.run_id }}
           path: target/campaign-counter.json
       - name: Find of the night
         if: always()
         run: node scripts/ci/find-of-night.mjs --base-url "https://${GITHUB_REPOSITORY_OWNER}.github.io/crash-course/" --output target/find-of-night.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: find-of-night-${{ github.run_id }}

@@ -9,23 +9,24 @@ permissions:
 jobs:
   bounded-campaigns:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - run: node scripts/check-version-coherence.mjs
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - run: cargo test --workspace --release
-      - run: cargo run -p cc-swarm -- --determinism-seeds 100
-      - run: cargo run -p cc-swarm -- run --profile calm --seeds 1000 --jobs 2
-      - run: cargo run -p cc-swarm -- run --profile rough --seeds 10000 --jobs 4
+      - run: cargo test --locked --workspace --release
+      - run: cargo run --locked -p cc-swarm -- --determinism-seeds 100
+      - run: cargo run --locked -p cc-swarm -- run --profile calm --seeds 1000 --jobs 2
+      - run: cargo run --locked -p cc-swarm -- run --profile rough --seeds 10000 --jobs 4
       # Each profile asserts the state it exists to reach. Without these a
       # profile can stop exercising its own headline behaviour and still report
       # a clean campaign — which is exactly how `snapshot-install` stayed dark.
-      - run: cargo run -p cc-swarm -- run --profile membership --seeds 10000 --jobs 4 --require-beacon membership-change
-      - run: cargo run -p cc-swarm -- run --profile wipe --seeds 2000 --jobs 4 --require-beacon snapshot-install
-      - run: cargo run -p cc-swarm -- run --profile brutal --seeds 2000 --jobs 4 --require-beacon disk-loss
-      - run: cargo run -p cc-swarm -- regress
+      - run: cargo run --locked -p cc-swarm -- run --profile membership --seeds 10000 --jobs 4 --require-beacon membership-change
+      - run: cargo run --locked -p cc-swarm -- run --profile wipe --seeds 2000 --jobs 4 --require-beacon snapshot-install
+      - run: cargo run --locked -p cc-swarm -- run --profile brutal --seeds 2000 --jobs 4 --require-beacon disk-loss
+      - run: cargo run --locked -p cc-swarm -- regress
       - run: ./scripts/ci/sim-throughput.sh
       - run: ./scripts/ci/porcupine-crosscheck.sh

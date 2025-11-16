@@ -2,7 +2,9 @@
 name = "cc-cluster"
 version.workspace = true
 edition.workspace = true
+description = "The composition boundary: one Raft node, one KV state machine, value-only effects."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

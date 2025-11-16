@@ -1,6 +1,6 @@
 # ADR-0002: Keep the real-host adapter dependency-light
 
-- Status: accepted for the 0.1 lab host
+- Status: Accepted for the 0.1 lab host
 - Date: 2025-11-05
 
 ## Context

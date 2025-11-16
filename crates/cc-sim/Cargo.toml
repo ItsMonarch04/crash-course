@@ -2,7 +2,9 @@
 name = "cc-sim"
 version.workspace = true
 edition.workspace = true
+description = "A small deterministic discrete-event host used by tests and cluster work."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

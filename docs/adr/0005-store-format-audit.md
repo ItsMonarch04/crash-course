@@ -1,8 +1,7 @@
 # ADR-0005: Store format audit boundary for v1
 
-## Status
-
-Accepted for the fixture release.
+- Status: Accepted for the fixture release
+- Date: 2025-11-10
 
 ## Decision
 

@@ -2,7 +2,9 @@
 name = "cc-swarm"
 version.workspace = true
 edition.workspace = true
+description = "The deterministic cluster fixture, campaign runner, and bounded model checker."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

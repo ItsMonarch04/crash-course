@@ -52,6 +52,18 @@ if (version && existsSync(path.join(root, "theater/package.json"))) {
   }
 }
 
+// The service worker names its cache after the build. If that name stops
+// tracking the version, `activate` no longer evicts the previous build and
+// returning visitors are pinned to a stale `index.html`.
+if (version && existsSync(path.join(root, "theater/public/sw.js"))) {
+  const cache = read("theater/public/sw.js").match(
+    new RegExp(`const CACHE = "crash-course-theater-v${semver}"`),
+  )?.[1];
+  if (cache !== version) {
+    errors.push(`theater/public/sw.js cache ${cache ?? "missing"} != ${version}`);
+  }
+}
+
 for (const file of ["exhibits/manifest.json", "theater/public/exhibits/manifest.json"]) {
   if (!version || !existsSync(path.join(root, file))) continue;
   const build = JSON.parse(read(file)).build;

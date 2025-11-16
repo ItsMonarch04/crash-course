@@ -10,9 +10,10 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -20,9 +21,9 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: ./scripts/ci/forbidden-grep.sh
-      - run: cargo test --workspace --all-targets
+      - run: cargo test --locked --workspace --all-targets
       # Exhaustive, not sampled: this asserts the log<=4 / term<=3 / messages<=8
       # envelope closes without hitting the state cap. It fails loudly if a
       # change to `cc-raft` makes the reachable state space grow.
-      - run: cargo run --release -p cc-swarm -- model-check
+      - run: cargo run --locked --release -p cc-swarm -- model-check
       - run: cargo doc --workspace --no-deps

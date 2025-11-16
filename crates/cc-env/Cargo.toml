@@ -2,7 +2,9 @@
 name = "cc-env"
 version.workspace = true
 edition.workspace = true
+description = "The value-only boundary between deterministic cores and their hosts."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

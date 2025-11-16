@@ -64,8 +64,8 @@ if [[ "$total_operations" -lt 1 ]]; then
 fi
 
 if [[ -n "${PORCUPINE_COMMAND:-}" ]]; then
-  # The owner may point this gate at a pinned Porcupine binary in CI. Any
-  # disagreement between the two checkers is release-blocking for one of them.
+  # I can point this gate at a pinned Porcupine binary in CI. Any disagreement
+  # between the two checkers is release-blocking for one of them.
   for json in "$cross_dir"/*.json; do
     sh -c "$PORCUPINE_COMMAND '$json'"
   done

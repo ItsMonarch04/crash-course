@@ -2,7 +2,9 @@
 name = "cc-raft"
 version.workspace = true
 edition.workspace = true
+description = "Sans-IO Raft core: deterministic elections, replication, and read barriers."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

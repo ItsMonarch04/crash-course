@@ -2,7 +2,9 @@
 name = "cc-store"
 version.workspace = true
 edition.workspace = true
+description = "A deterministic, single-keyspace LSM store built on the Crash Course WAL."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

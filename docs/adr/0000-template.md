@@ -1,5 +1,8 @@
 # ADR-NNNN: Short decision title
 
+- Status: Accepted
+- Date: YYYY-MM-DD
+
 ## Context
 
 What problem or constraint makes a decision necessary?

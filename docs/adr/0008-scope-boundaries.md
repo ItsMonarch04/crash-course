@@ -9,8 +9,8 @@ Four capabilities were repeatedly proposed for this laboratory and are
 individually reasonable. Each was left open long enough to be re-proposed, and
 each carries a cost that is easy to under-count at proposal time and expensive
 to reverse once merged. Leaving them nominally "open" invites a future
-contributor — or a future automated agent — to spend the project's credibility
-implementing one.
+contributor — or a future me — to spend the project's credibility implementing
+one.
 
 This record closes them so the answer is written down once rather than
 re-argued.

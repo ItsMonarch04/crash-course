@@ -14,6 +14,13 @@ cargo run -p cc-swarm -- sequence artifacts/42.json --output artifacts/42.svg
 cargo run -p cc-swarm -- search --profile brutal --iterations 1000
 ```
 
+To check a history captured outside the simulator — a real-host run, or a
+trace exported from another tool — hand the TSV to the checker directly:
+
+```sh
+./scripts/check-real-history.sh --file history.tsv
+```
+
 The theater includes guided figure-8, asymmetric-election, thundering-herd,
 and snapshot-catch-up lessons. Cluster size is part of the scenario: the
 control offers 3, 5, and 7 voters and rebuilds the engine at the chosen size,

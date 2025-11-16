@@ -2,7 +2,9 @@
 name = "cc-kv"
 version.workspace = true
 edition.workspace = true
+description = "Replicated key/value state machine with log-time TTL and sessions."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

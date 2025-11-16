@@ -1,4 +1,4 @@
-# Determinism lint: exporting the perimeter
+# 09 — Determinism lint: exporting the perimeter
 
 `cc-detlint` turns Crash Course's determinism constitution into a reusable,
 zero-dependency command. `check` scans an explicit set of Rust paths for

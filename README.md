@@ -22,6 +22,11 @@ watching the survivors elect a new one without losing an acknowledged write.](th
 The animation above is generated, not staged: `./scripts/record-gif.sh` drives
 the real theater with Playwright and encodes the captured frames.
 
+**[Open the theater →](https://itsmonarch04.github.io/crash-course/)** The same
+WebAssembly engine runs in your browser: resize the cluster, kill the leader,
+step the timeline, inject faults, and share the resulting run as a URL. No
+toolchain required.
+
 ## Try the current workspace
 
 ```sh
@@ -63,6 +68,40 @@ target. The real listener is a lab tool and does not provide authentication,
 authorization, encryption, or TLS. See [limitations](docs/LIMITATIONS.md)
 before interpreting any result.
 
+## Going deeper
+
+The write-ups are the point of the project — each one names a failure mode and
+shows the machinery that catches it.
+
+- [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) — what this does and does not
+  prove; read it before interpreting any result
+- [`docs/writeups/`](docs/writeups/) — the nine essays:
+  [determinism as a boundary](docs/writeups/01-determinism.md),
+  [fsync and the page cache](docs/writeups/02-fsync-page-cache.md),
+  [Raft traps worth naming](docs/writeups/03-raft-traps.md),
+  [what the simulator cannot promise](docs/writeups/04-real-faults.md),
+  [histories as proof](docs/writeups/05-linearizability.md),
+  [membership as a two-quorum story](docs/writeups/06-membership.md),
+  [benchmarking without theater](docs/writeups/07-benchmark-honesty.md),
+  [the flight recorder](docs/writeups/08-theater.md), and
+  [exporting the determinism perimeter](docs/writeups/09-determinism-lint.md)
+- [`docs/consistency.md`](docs/consistency.md) — what a successful write and a
+  leader read actually guarantee, and the ReadIndex fixture behind them
+- [`docs/sim.md`](docs/sim.md) — scenarios as data: seeds, profiles, fault
+  plans, and the replay/shrink/diff commands
+- [`docs/formats.md`](docs/formats.md) — every persisted and wire format, with
+  magic values, versions, and bounds
+- [`docs/ops.md`](docs/ops.md) — running the real `ccdb` host: journal layout,
+  replication frames, and snapshot recovery
+- [`docs/adr/`](docs/adr/) — nine numbered decisions, append-only
+- [`docs/talk-kit.md`](docs/talk-kit.md) — a fifteen-minute run of show, with
+  [slides](docs/crash-course-talk-kit.pptx)
+- [`theater/README.md`](theater/README.md) — the browser theater
+- [`bench/README.md`](bench/README.md) — the benchmark harness and what it
+  refuses to claim
+- [`exhibits/README.md`](exhibits/README.md) — the museum, empty by default and
+  deliberately so
+
 ## Contributing
 
 See [the contribution guide](docs/contributing.md), the numbered decisions in
@@ -72,8 +111,18 @@ versioned decision record.
 
 ## License
 
-AGPL-3.0-only. See [LICENSE](LICENSE).
+Copyright (c) 2025 Sidakpreet Singh.
+
+Crash Course is free software: you may redistribute it and modify it under the
+terms of the GNU Affero General Public License, **version 3 only** — not any
+later version. The complete license text is in [LICENSE](LICENSE); the SPDX
+identifier is `AGPL-3.0-only`.
+
+The Affero clause is the point rather than an accident. The browser theater is
+this project's main surface, and section 13 means anyone who serves a modified
+theater over a network owes its users the corresponding source. A fork that
+publishes an altered simulator as a website cannot keep those changes closed.
 
 ---
 
-**Version:** v0.10.6
+**Version:** v0.11.0

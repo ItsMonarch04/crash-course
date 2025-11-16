@@ -1,6 +1,6 @@
 # ADR-0003: Use wasm-bindgen for the theater bridge
 
-- Status: accepted
+- Status: Accepted
 - Date: 2025-11-10
 
 ## Context

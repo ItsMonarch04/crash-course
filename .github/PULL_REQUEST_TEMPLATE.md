@@ -15,6 +15,6 @@
 - [ ] Every touched failure mode has a named regression test.
 - [ ] No frozen surface changed without a new ADR and version note.
 - [ ] Persisted/wire layout and limits are documented.
-- [ ] Changelog and public rustdoc are updated.
+- [ ] Public rustdoc is updated.
 - [ ] Any benchmark number includes its environment and workload.
 

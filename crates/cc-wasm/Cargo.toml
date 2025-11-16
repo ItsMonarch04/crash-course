@@ -2,7 +2,9 @@
 name = "cc-wasm"
 version.workspace = true
 edition.workspace = true
+description = "Persistent JSON-facing theater bridge over the deterministic cluster fixture."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [lib]

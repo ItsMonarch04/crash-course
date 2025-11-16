@@ -5,6 +5,14 @@ services:
   n1:
     build: .
     command: ["run", "--config", "/var/lib/ccdb/ccdb.toml"]
+    healthcheck:
+      # `admin status` opens a real client connection and follows a leader
+      # redirect, so it fails while a node is still recovering its journal.
+      test: ["CMD", "ccdb", "admin", "status", "--addr", "127.0.0.1:7101"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     volumes: ["n1:/var/lib/ccdb"]
     ports: ["7101:7101", "7301:7301"]
     environment:
@@ -16,6 +24,14 @@ services:
   n2:
     build: .
     command: ["run", "--config", "/var/lib/ccdb/ccdb.toml"]
+    healthcheck:
+      # `admin status` opens a real client connection and follows a leader
+      # redirect, so it fails while a node is still recovering its journal.
+      test: ["CMD", "ccdb", "admin", "status", "--addr", "127.0.0.1:7102"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     volumes: ["n2:/var/lib/ccdb"]
     ports: ["7102:7102", "7302:7302"]
     environment:
@@ -27,6 +43,14 @@ services:
   n3:
     build: .
     command: ["run", "--config", "/var/lib/ccdb/ccdb.toml"]
+    healthcheck:
+      # `admin status` opens a real client connection and follows a leader
+      # redirect, so it fails while a node is still recovering its journal.
+      test: ["CMD", "ccdb", "admin", "status", "--addr", "127.0.0.1:7103"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     volumes: ["n3:/var/lib/ccdb"]
     ports: ["7103:7103", "7303:7303"]
     environment:

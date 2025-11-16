@@ -2,7 +2,9 @@
 name = "cc-bench"
 version.workspace = true
 edition.workspace = true
+description = "Deterministic closed-loop benchmark harness with disclosed environment metadata."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

@@ -1,0 +1,17 @@
+# Line-ending policy. Everything checks out as LF on every platform, so a
+# Windows clone cannot rewrite text files to CRLF. This repository depends on
+# exact bytes more than most: the determinism gate compares two `.cctrace`
+# runs with `cmp`, trace hashes are shown as proof in the theater, and the
+# pinned fixtures and exhibit manifests are compared verbatim. A CRLF rewrite
+# breaks those comparisons for a reason that is slow to diagnose.
+* text=auto eol=lf
+
+# Binary — never convert
+*.gif binary
+*.png binary
+*.ico binary
+*.woff2 binary
+*.wasm binary
+*.pptx binary
+*.pdf binary
+*.zip binary

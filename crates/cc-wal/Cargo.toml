@@ -2,7 +2,9 @@
 name = "cc-wal"
 version.workspace = true
 edition.workspace = true
+description = "Checksummed, torn-write-tolerant write-ahead log primitives."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

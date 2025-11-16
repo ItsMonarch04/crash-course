@@ -10,36 +10,39 @@ permissions:
 jobs:
   double-run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - run: node scripts/check-version-coherence.mjs
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
           toolchain: stable
-      - run: cargo run -p cc-swarm -- --determinism > trace-a.cctrace
-      - run: cargo run -p cc-swarm -- --determinism > trace-b.cctrace
+      - run: cargo run --locked -p cc-swarm -- --determinism > trace-a.cctrace
+      - run: cargo run --locked -p cc-swarm -- --determinism > trace-b.cctrace
       - run: cmp trace-a.cctrace trace-b.cctrace
   cross-platform:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-14]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - run: node scripts/check-version-coherence.mjs
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
           toolchain: stable
-      - run: cargo run -p cc-swarm -- --determinism > trace-${{ matrix.os }}.cctrace
-      - uses: actions/upload-artifact@v4
+      - run: cargo run --locked -p cc-swarm -- --determinism > trace-${{ matrix.os }}.cctrace
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: determinism-${{ matrix.os }}
           path: trace-${{ matrix.os }}.cctrace
   compare:
     needs: cross-platform
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: determinism-*
           path: traces
@@ -47,12 +50,13 @@ jobs:
       - run: cmp traces/trace-ubuntu-latest.cctrace traces/trace-macos-14.cctrace
   wasm-equivalence:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+          node-version-file: theater/.nvmrc
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
           toolchain: stable
       - run: rustup target add wasm32-unknown-unknown

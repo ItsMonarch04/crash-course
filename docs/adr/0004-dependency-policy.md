@@ -1,6 +1,6 @@
 # ADR-0004: Keep the core dependency-light
 
-- Status: accepted
+- Status: Accepted
 - Date: 2025-11-10
 
 ## Context

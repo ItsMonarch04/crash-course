@@ -2,7 +2,9 @@
 name = "cc-node"
 version.workspace = true
 edition.workspace = true
+description = "The ccdb lab host: RESP listener, CRC-checked journal, and TCP replication."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

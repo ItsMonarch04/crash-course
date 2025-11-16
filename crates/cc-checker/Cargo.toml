@@ -2,7 +2,9 @@
 name = "cc-checker"
 version.workspace = true
 edition.workspace = true
+description = "History, linearizability, and lightweight trace invariant checking."
 license.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]
