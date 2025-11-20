@@ -9,11 +9,12 @@ tool under active construction, not a production database and not a benchmark
 claim.
 
 The consensus core is written as synchronous, host-independent state machines,
-and the same core runs in two places: inside the deterministic simulator and,
-compiled to WebAssembly, inside the browser theater. The `ccdb` lab host is a
-third, deliberately simpler program — it shares the storage and RESP vocabulary
-but replicates over a static primary/backup path with no elections and no
-terms. Which component runs consensus, and which does not, is spelled out in
+and the same core runs in three places: inside the deterministic simulator,
+compiled to WebAssembly inside the browser theater, and behind the real
+`ccdb` socket/filesystem adapter. The real adapter drives `cc-host::Driver`,
+uses the same Raft message codec and durability continuations, and performs a
+checked peer hello before it accepts a peer frame. Its storage and snapshot
+work are still intentionally incomplete; the exact boundary is spelled out in
 [limitations](docs/LIMITATIONS.md).
 
 ![The browser theater running a five-node cluster, killing the leader, and
@@ -39,12 +40,14 @@ cargo run --release -p cc-bench -- --workload A --clients 1 --ops 10000
 
 The repository currently contains:
 
-- `ccdb`, a bounded RESP lab host with a CRC-checked restart journal, three-node
-  TCP replication, leader redirects, snapshot catch-up, and durable fsync
-  failure shims;
-- a deterministic simulator that composes real `cc-cluster::Node` instances,
+- `ccdb`, a bounded RESP lab host that adapts the shared Raft driver to TCP,
+  CCHL/CCPF peer connections, a framed durable Raft WAL, leader redirects, and
+  fail-closed durable-write/fsync shims;
+- a deterministic simulator that drives real `cc-cluster::Node` instances
+  only through `cc-host::Driver`,
   drives workload actors, captures client histories, checks invariants, runs
-  campaigns, catches wiped nodes up by snapshot install, shrinks reproduced
+  campaigns, catches wiped nodes up through ordinary Raft replication without
+  an out-of-band state copy, shrinks reproduced
   failures, searches trace n-gram coverage, gates on reachability beacons, and
   explains first semantic trace divergence;
 - a bounded model checker that exhaustively explores the reachable `cc-raft`
@@ -91,9 +94,11 @@ shows the machinery that catches it.
   plans, and the replay/shrink/diff commands
 - [`docs/formats.md`](docs/formats.md) — every persisted and wire format, with
   magic values, versions, and bounds
-- [`docs/ops.md`](docs/ops.md) — running the real `ccdb` host: journal layout,
-  replication frames, and snapshot recovery
-- [`docs/adr/`](docs/adr/) — nine numbered decisions, append-only
+- [`docs/compatibility.md`](docs/compatibility.md) — the current compatibility
+  boundary and fixture-manifest contract
+- [`docs/ops.md`](docs/ops.md) — running the real `ccdb` host: shared-driver
+  WAL layout, peer handshake, and current recovery limits
+- [`docs/adr/`](docs/adr/) — numbered decisions, append-only
 - [`docs/talk-kit.md`](docs/talk-kit.md) — a fifteen-minute run of show, with
   [slides](docs/crash-course-talk-kit.pptx)
 - [`theater/README.md`](theater/README.md) — the browser theater
@@ -125,4 +130,4 @@ publishes an altered simulator as a website cannot keep those changes closed.
 
 ---
 
-**Version:** v0.11.0
+**Version:** v0.11.1

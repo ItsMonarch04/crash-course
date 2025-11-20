@@ -5,6 +5,7 @@ members = [
     "crates/cc-env",
     "crates/cc-sim",
     "crates/cc-wal",
+    "crates/cc-log",
     "crates/cc-store",
     "crates/cc-raft",
     "crates/cc-kv",
@@ -19,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.11.1"
 authors = ["Sidakpreet Singh"]
 edition = "2024"
 license = "AGPL-3.0-only"

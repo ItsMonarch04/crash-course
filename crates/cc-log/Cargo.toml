@@ -1,8 +1,8 @@
 [package]
-name = "cc-store"
+name = "cc-log"
 version.workspace = true
 edition.workspace = true
-description = "A deterministic, single-keyspace LSM store built on the Crash Course WAL."
+description = "One durable Raft-log value layer over checksummed WAL records."
 license.workspace = true
 authors.workspace = true
 publish = false
@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 cc-core = { path = "../cc-core" }
 cc-env = { path = "../cc-env" }
+cc-raft = { path = "../cc-raft" }
 cc-wal = { path = "../cc-wal" }
 
 [lints]
