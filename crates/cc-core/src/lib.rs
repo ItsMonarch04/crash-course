@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 #![doc = "Deterministic, host-independent vocabulary shared by Crash Course crates."]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::{Add, Sub};
 
@@ -47,6 +48,82 @@ id_type!(Term, "t");
 id_type!(LogIndex, "i");
 id_type!(IoId, "io");
 id_type!(TimerId, "timer");
+
+/// Immutable, non-secret identity for one logical cluster.  The text form is
+/// deliberately fixed-width lowercase hexadecimal so configuration parsing
+/// cannot admit aliases for the same on-disk/wire value.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct ClusterId([u8; 16]);
+
+impl ClusterId {
+    #[must_use]
+    pub const fn new(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        let mut index = 0;
+        while index < self.0.len() {
+            if self.0[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    /// Parse exactly 32 lowercase hexadecimal characters.  Cluster IDs are
+    /// identifiers, not secrets, but accepting alternative spellings makes
+    /// audit and identity comparisons needlessly ambiguous.
+    pub fn from_hex(value: &str) -> Result<Self, &'static str> {
+        if value.len() != 32 {
+            return Err("cluster id must be exactly 32 lowercase hexadecimal characters");
+        }
+        let mut bytes = [0_u8; 16];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_nibble(pair[0])?;
+            let low = hex_nibble(pair[1])?;
+            bytes[index] = (high << 4) | low;
+        }
+        let id = Self(bytes);
+        if id.is_zero() {
+            Err("cluster id must not be all zero")
+        } else {
+            Ok(id)
+        }
+    }
+
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(32);
+        for byte in self.0 {
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        output
+    }
+}
+
+fn hex_nibble(value: u8) -> Result<u8, &'static str> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err("cluster id must be exactly 32 lowercase hexadecimal characters"),
+    }
+}
+
+impl fmt::Display for ClusterId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
 
 /// Nanoseconds from the host-defined epoch. Core code never reads a wall clock.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
@@ -318,6 +395,931 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 
 pub const MAX_CODEC_BYTES: usize = 4 * 1024 * 1024;
 
+/// Local, non-replicated resource limits. Unlike [`ClusterPolicy`], these
+/// values cannot change the result of an accepted replicated command; they
+/// bound host admission, queues, tracing, and file operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostLimits {
+    pub max_pending_peer: usize,
+    pub max_pending_timer: usize,
+    pub max_pending_io: usize,
+    pub max_pending_client: usize,
+    /// Aggregate admission caps for Driver's class-separated input queues.
+    /// These are host-only: overflowing them changes only whether a caller is
+    /// admitted, never the result of an accepted replicated command.
+    pub max_driver_pending_inputs: usize,
+    pub max_driver_pending_input_bytes: usize,
+    pub max_events: u64,
+    pub max_events_per_instant: u64,
+    pub max_trace_bytes: usize,
+    pub max_snapshot_bytes: u64,
+    pub max_block_read_bytes: u32,
+    pub max_manifest_record_bytes: u32,
+    pub max_threads: usize,
+    pub thread_stack_bytes: usize,
+}
+
+impl Default for HostLimits {
+    fn default() -> Self {
+        Self {
+            max_pending_peer: 4_096,
+            max_pending_timer: 1_024,
+            max_pending_io: 1_024,
+            max_pending_client: 4_096,
+            max_driver_pending_inputs: 16_384,
+            max_driver_pending_input_bytes: 128 * 1024 * 1024,
+            max_events: 2_000_000,
+            max_events_per_instant: 100_000,
+            max_trace_bytes: 64 * 1024 * 1024,
+            max_snapshot_bytes: 1024 * 1024 * 1024,
+            max_block_read_bytes: 4 * 1024 * 1024,
+            max_manifest_record_bytes: 4 * 1024 * 1024,
+            max_threads: 128,
+            thread_stack_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl HostLimits {
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.max_pending_peer > 0
+            && self.max_pending_timer > 0
+            && self.max_pending_io > 0
+            && self.max_pending_client > 0
+            && self.max_driver_pending_inputs > 0
+            && self.max_driver_pending_input_bytes > 0
+            && self.max_events > 0
+            && self.max_events_per_instant > 0
+            && self.max_trace_bytes > 0
+            && self.max_snapshot_bytes > 0
+            && self.max_block_read_bytes > 0
+            && self.max_manifest_record_bytes > 0
+            && self.max_threads > 0
+            && self.thread_stack_bytes > 0
+    }
+}
+
+/// Canonical, cluster-wide limits.  These are deliberately values rather than
+/// host configuration: changing one can change the answer a committed command
+/// produces, so peers must agree on the exact encoded value before serving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterPolicy {
+    pub max_members: u32,
+    pub max_key_bytes: u64,
+    pub max_value_bytes: u64,
+    pub max_live_logical_bytes: u64,
+    pub max_command_bytes: u64,
+    pub max_reply_bytes: u64,
+    pub max_scan_items: u32,
+    pub max_live_deadlines: u64,
+    pub max_sessions: u64,
+    pub max_session_bytes: u64,
+    pub max_session_tombstones: u64,
+    pub session_idle_ns: u64,
+    pub session_retry_grace_ns: u64,
+    pub leader_transfer_timeout_ns: u64,
+    pub max_keys_per_expiry_sweep: u32,
+    pub max_batch_commands: u32,
+    pub max_batch_bytes: u64,
+    pub max_batch_reply_bytes: u64,
+}
+
+pub const CLUSTER_POLICY_MAGIC: u32 = u32::from_le_bytes(*b"CCPL");
+pub const CLUSTER_POLICY_VERSION: u16 = 1;
+pub const MAX_POLICY_MEMBERS: u32 = 4_096;
+pub const MAX_POLICY_LIVE_LOGICAL_BYTES: u64 = 1 << 40;
+pub const MAX_POLICY_LIVE_DEADLINES: u64 = 10_000_000;
+pub const MAX_POLICY_SESSIONS: u64 = 1_000_000;
+pub const MAX_POLICY_SESSION_BYTES: u64 = 1 << 30;
+pub const MAX_POLICY_SESSION_TOMBSTONES: u64 = 1_000_000;
+pub const MAX_POLICY_DURATION_NS: u64 = 365 * 24 * 60 * 60 * 1_000_000_000;
+pub const MAX_POLICY_EXPIRY_SWEEP: u32 = 1_000_000;
+
+impl Default for ClusterPolicy {
+    fn default() -> Self {
+        Self {
+            max_members: 64,
+            max_key_bytes: 4 * 1024,
+            max_value_bytes: 1024 * 1024,
+            max_live_logical_bytes: 1024 * 1024 * 1024,
+            max_command_bytes: 2 * 1024 * 1024,
+            max_reply_bytes: 2 * 1024 * 1024,
+            max_scan_items: 4_096,
+            max_live_deadlines: 1_000_000,
+            max_sessions: 100_000,
+            max_session_bytes: 64 * 1024 * 1024,
+            max_session_tombstones: 100_000,
+            session_idle_ns: 30 * 60 * 1_000_000_000,
+            session_retry_grace_ns: 5 * 60 * 1_000_000_000,
+            leader_transfer_timeout_ns: 15 * 1_000_000_000,
+            max_keys_per_expiry_sweep: 1_024,
+            max_batch_commands: 256,
+            max_batch_bytes: 2 * 1024 * 1024,
+            max_batch_reply_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl ClusterPolicy {
+    /// Encodes the exact little-endian CCPL v1 record, including its CRC.
+    #[must_use]
+    pub fn encode(self) -> Vec<u8> {
+        let mut enc = Enc::with_capacity(160);
+        enc.header(CLUSTER_POLICY_MAGIC, CLUSTER_POLICY_VERSION);
+        enc.u32(self.max_members);
+        enc.u64(self.max_key_bytes);
+        enc.u64(self.max_value_bytes);
+        enc.u64(self.max_live_logical_bytes);
+        enc.u64(self.max_command_bytes);
+        enc.u64(self.max_reply_bytes);
+        enc.u32(self.max_scan_items);
+        enc.u64(self.max_live_deadlines);
+        enc.u64(self.max_sessions);
+        enc.u64(self.max_session_bytes);
+        enc.u64(self.max_session_tombstones);
+        enc.u64(self.session_idle_ns);
+        enc.u64(self.session_retry_grace_ns);
+        enc.u64(self.leader_transfer_timeout_ns);
+        enc.u32(self.max_keys_per_expiry_sweep);
+        enc.u32(self.max_batch_commands);
+        enc.u64(self.max_batch_bytes);
+        enc.u64(self.max_batch_reply_bytes);
+        let mut bytes = enc.finish();
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        let crc = crc32c_zeroed_tail(&bytes);
+        let checksum_start = bytes.len() - 4;
+        bytes[checksum_start..].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        const RECORD_LEN: usize = 138;
+        if bytes.len() != RECORD_LEN {
+            return Err(if bytes.len() < RECORD_LEN {
+                DecodeError::UnexpectedEof {
+                    offset: bytes.len(),
+                    needed: RECORD_LEN.saturating_sub(bytes.len()),
+                }
+            } else {
+                DecodeError::TrailingBytes { offset: RECORD_LEN }
+            });
+        }
+        let expected = u32::from_le_bytes(bytes[RECORD_LEN - 4..].try_into().expect("CRC"));
+        if crc32c_zeroed_tail(bytes) != expected {
+            return Err(DecodeError::InvalidTag {
+                offset: RECORD_LEN - 4,
+                tag: 0,
+            });
+        }
+        let mut dec = Dec::new(&bytes[..RECORD_LEN - 4]);
+        dec.header(CLUSTER_POLICY_MAGIC, CLUSTER_POLICY_VERSION)?;
+        let policy = Self {
+            max_members: dec.u32()?,
+            max_key_bytes: dec.u64()?,
+            max_value_bytes: dec.u64()?,
+            max_live_logical_bytes: dec.u64()?,
+            max_command_bytes: dec.u64()?,
+            max_reply_bytes: dec.u64()?,
+            max_scan_items: dec.u32()?,
+            max_live_deadlines: dec.u64()?,
+            max_sessions: dec.u64()?,
+            max_session_bytes: dec.u64()?,
+            max_session_tombstones: dec.u64()?,
+            session_idle_ns: dec.u64()?,
+            session_retry_grace_ns: dec.u64()?,
+            leader_transfer_timeout_ns: dec.u64()?,
+            max_keys_per_expiry_sweep: dec.u32()?,
+            max_batch_commands: dec.u32()?,
+            max_batch_bytes: dec.u64()?,
+            max_batch_reply_bytes: dec.u64()?,
+        };
+        dec.finish()?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(self) -> Result<(), DecodeError> {
+        let nonzero = self.max_members != 0
+            && self.max_key_bytes != 0
+            && self.max_value_bytes != 0
+            && self.max_live_logical_bytes != 0
+            && self.max_command_bytes != 0
+            && self.max_reply_bytes != 0
+            && self.max_scan_items != 0
+            && self.max_live_deadlines != 0
+            && self.max_sessions != 0
+            && self.max_session_bytes != 0
+            && self.max_session_tombstones != 0
+            && self.session_idle_ns != 0
+            && self.session_retry_grace_ns != 0
+            && self.leader_transfer_timeout_ns != 0
+            && self.max_keys_per_expiry_sweep != 0
+            && self.max_batch_commands != 0
+            && self.max_batch_bytes != 0
+            && self.max_batch_reply_bytes != 0;
+        let coherent = self.max_batch_bytes <= self.max_command_bytes
+            && self.max_batch_reply_bytes <= self.max_reply_bytes
+            && self.max_key_bytes <= self.max_command_bytes
+            && self.max_value_bytes <= self.max_command_bytes
+            && self.max_session_bytes <= self.max_live_logical_bytes;
+        let hard_bounded = self.max_members <= MAX_POLICY_MEMBERS
+            && self.max_key_bytes <= MAX_CODEC_BYTES as u64
+            && self.max_value_bytes <= MAX_CODEC_BYTES as u64
+            && self.max_command_bytes <= MAX_CODEC_BYTES as u64
+            && self.max_reply_bytes <= MAX_CODEC_BYTES as u64
+            && self.max_batch_bytes <= MAX_CODEC_BYTES as u64
+            && self.max_batch_reply_bytes <= MAX_CODEC_BYTES as u64
+            && self.max_live_logical_bytes <= MAX_POLICY_LIVE_LOGICAL_BYTES
+            && self.max_scan_items <= 1_000_000
+            && self.max_live_deadlines <= MAX_POLICY_LIVE_DEADLINES
+            && self.max_sessions <= MAX_POLICY_SESSIONS
+            && self.max_session_bytes <= MAX_POLICY_SESSION_BYTES
+            && self.max_session_tombstones <= MAX_POLICY_SESSION_TOMBSTONES
+            && self.session_idle_ns <= MAX_POLICY_DURATION_NS
+            && self.session_retry_grace_ns <= MAX_POLICY_DURATION_NS
+            && self.leader_transfer_timeout_ns <= MAX_POLICY_DURATION_NS
+            && self.max_keys_per_expiry_sweep <= MAX_POLICY_EXPIRY_SWEEP
+            && self.max_batch_commands <= 65_536;
+        if nonzero && coherent && hard_bounded {
+            Ok(())
+        } else {
+            Err(DecodeError::InvalidTag { offset: 0, tag: 0 })
+        }
+    }
+
+    #[must_use]
+    pub fn hash(self) -> u64 {
+        fnv1a(&self.encode())
+    }
+}
+
+/// A canonical peer endpoint.  We store address bytes instead of `SocketAddr`
+/// so the replicated form cannot inherit platform formatting differences.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PeerAddress {
+    V4 { ip: [u8; 4], port: u16 },
+    V6 { ip: [u8; 16], port: u16 },
+}
+
+impl PeerAddress {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        let (bytes, port) = match self {
+            Self::V4 { ip, port } => (ip.as_slice(), *port),
+            Self::V6 { ip, port } => (ip.as_slice(), *port),
+        };
+        let unspecified = bytes.iter().all(|byte| *byte == 0);
+        let multicast = match self {
+            Self::V4 { ip, .. } => (ip[0] & 0xf0) == 0xe0,
+            Self::V6 { ip, .. } => ip[0] == 0xff,
+        };
+        let v4_mapped_v6 = matches!(self, Self::V6 { ip, .. } if ip[..10].iter().all(|byte| *byte == 0) && ip[10] == 0xff && ip[11] == 0xff);
+        if port == 0 || unspecified || multicast || v4_mapped_v6 {
+            Err(DecodeError::InvalidTag { offset: 0, tag: 0 })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn encode(&self, enc: &mut Enc) {
+        match self {
+            Self::V4 { ip, port } => {
+                enc.u8(1);
+                for byte in ip {
+                    enc.u8(*byte);
+                }
+                enc.u16(*port);
+            }
+            Self::V6 { ip, port } => {
+                enc.u8(2);
+                for byte in ip {
+                    enc.u8(*byte);
+                }
+                enc.u16(*port);
+            }
+        }
+    }
+
+    fn decode(dec: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        let address = match dec.u8()? {
+            1 => Self::V4 {
+                ip: [dec.u8()?, dec.u8()?, dec.u8()?, dec.u8()?],
+                port: dec.u16()?,
+            },
+            2 => Self::V6 {
+                ip: [
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                    dec.u8()?,
+                ],
+                port: dec.u16()?,
+            },
+            tag => {
+                return Err(DecodeError::InvalidTag {
+                    offset: dec.position().saturating_sub(1),
+                    tag,
+                });
+            }
+        };
+        address.validate()?;
+        Ok(address)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JointMembership {
+    pub old_voters: BTreeSet<NodeId>,
+    pub new_voters: BTreeSet<NodeId>,
+    pub enter_index: LogIndex,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MembershipState {
+    pub voters: BTreeSet<NodeId>,
+    pub learners: BTreeSet<NodeId>,
+    pub joint: Option<JointMembership>,
+    pub addresses: BTreeMap<NodeId, PeerAddress>,
+}
+
+pub const MEMBERSHIP_MAGIC: u32 = u32::from_le_bytes(*b"CCMS");
+pub const MEMBERSHIP_FORMAT_VERSION: u16 = 1;
+
+impl MembershipState {
+    pub fn new(voters: BTreeSet<NodeId>) -> Result<Self, DecodeError> {
+        let state = Self {
+            voters,
+            learners: BTreeSet::new(),
+            joint: None,
+            addresses: BTreeMap::new(),
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.voters.is_empty()
+            || self.voters.iter().any(|id| id.get() == 0)
+            || self.learners.iter().any(|id| id.get() == 0)
+            || !self.voters.is_disjoint(&self.learners)
+            || self.voters.len() + self.learners.len() > 4_096
+        {
+            return Err(DecodeError::InvalidTag { offset: 0, tag: 0 });
+        }
+        for (id, address) in &self.addresses {
+            if id.get() == 0 || (!self.voters.contains(id) && !self.learners.contains(id)) {
+                return Err(DecodeError::InvalidTag { offset: 0, tag: 0 });
+            }
+            address.validate()?;
+        }
+        if let Some(joint) = &self.joint
+            && (joint.old_voters.is_empty()
+                || joint.new_voters.is_empty()
+                || joint.enter_index.get() == 0
+                || !joint.old_voters.is_subset(&self.voters)
+                || !joint.new_voters.is_subset(&self.voters))
+        {
+            return Err(DecodeError::InvalidTag { offset: 0, tag: 0 });
+        }
+        Ok(())
+    }
+
+    /// A complete, versioned membership image for snapshots and durable
+    /// genesis.  The append projection may still contain uncommitted config
+    /// entries; this value is the committed base from which that suffix is
+    /// replayed.
+    pub fn encode(&self) -> Result<Vec<u8>, DecodeError> {
+        self.validate()?;
+        let mut enc = Enc::new();
+        enc.header(MEMBERSHIP_MAGIC, MEMBERSHIP_FORMAT_VERSION);
+        encode_member_set(&mut enc, &self.voters);
+        encode_member_set(&mut enc, &self.learners);
+        match &self.joint {
+            None => enc.u8(0),
+            Some(joint) => {
+                enc.u8(1);
+                encode_member_set(&mut enc, &joint.old_voters);
+                encode_member_set(&mut enc, &joint.new_voters);
+                enc.u64(joint.enter_index.get());
+            }
+        }
+        enc.u32(
+            u32::try_from(self.addresses.len()).map_err(|_| DecodeError::LengthTooLarge {
+                offset: 0,
+                length: u32::MAX,
+                max: MAX_POLICY_MEMBERS as usize,
+            })?,
+        );
+        for (id, address) in &self.addresses {
+            enc.u64(id.get());
+            address.encode(&mut enc);
+        }
+        let mut bytes = enc.finish();
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        let crc = crc32c_zeroed_tail(&bytes);
+        let checksum_start = bytes.len() - 4;
+        bytes[checksum_start..].copy_from_slice(&crc.to_le_bytes());
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < 4 {
+            return Err(DecodeError::UnexpectedEof {
+                offset: bytes.len(),
+                needed: 4 - bytes.len(),
+            });
+        }
+        let body_len = bytes.len() - 4;
+        let expected = u32::from_le_bytes(bytes[body_len..].try_into().expect("membership CRC"));
+        if crc32c_zeroed_tail(bytes) != expected {
+            return Err(DecodeError::InvalidTag {
+                offset: body_len,
+                tag: 0,
+            });
+        }
+        let mut dec = Dec::new(&bytes[..body_len]);
+        dec.header(MEMBERSHIP_MAGIC, MEMBERSHIP_FORMAT_VERSION)?;
+        let voters = decode_member_set(&mut dec, false)?;
+        let learners = decode_member_set(&mut dec, true)?;
+        let joint = match dec.u8()? {
+            0 => None,
+            1 => Some(JointMembership {
+                old_voters: decode_member_set(&mut dec, false)?,
+                new_voters: decode_member_set(&mut dec, false)?,
+                enter_index: decode_nonzero_index(&mut dec)?,
+            }),
+            tag => {
+                return Err(DecodeError::InvalidTag {
+                    offset: dec.position().saturating_sub(1),
+                    tag,
+                });
+            }
+        };
+        let address_count = dec.u32()?;
+        if address_count > MAX_POLICY_MEMBERS {
+            return Err(DecodeError::LengthTooLarge {
+                offset: dec.position().saturating_sub(4),
+                length: address_count,
+                max: MAX_POLICY_MEMBERS as usize,
+            });
+        }
+        let mut addresses = BTreeMap::new();
+        for _ in 0..address_count {
+            let id = decode_nonzero_id(&mut dec)?;
+            let address = PeerAddress::decode(&mut dec)?;
+            if addresses.insert(id, address).is_some() {
+                return Err(DecodeError::InvalidTag {
+                    offset: dec.position().saturating_sub(1),
+                    tag: 0,
+                });
+            }
+        }
+        dec.finish()?;
+        let state = Self {
+            voters,
+            learners,
+            joint,
+            addresses,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigOperation {
+    AddLearner {
+        id: NodeId,
+        address: Option<PeerAddress>,
+    },
+    RemoveLearner {
+        id: NodeId,
+    },
+    UpdateAddress {
+        id: NodeId,
+        address: PeerAddress,
+    },
+    EnterJoint {
+        new_voters: BTreeSet<NodeId>,
+    },
+    LeaveJoint {
+        enter_index: LogIndex,
+    },
+    BeginLeaderTransfer {
+        target: NodeId,
+    },
+    FinishLeaderTransfer {
+        intent_index: LogIndex,
+        result: TransferResult,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TransferResult {
+    Success = 1,
+    Timeout = 2,
+    Superseded = 3,
+}
+
+impl TransferResult {
+    fn decode(tag: u8) -> Result<Self, DecodeError> {
+        match tag {
+            1 => Ok(Self::Success),
+            2 => Ok(Self::Timeout),
+            3 => Ok(Self::Superseded),
+            _ => Err(DecodeError::InvalidTag { offset: 0, tag }),
+        }
+    }
+}
+
+impl ConfigOperation {
+    #[must_use]
+    pub const fn tag(&self) -> u8 {
+        match self {
+            Self::AddLearner { .. } => 1,
+            Self::RemoveLearner { .. } => 2,
+            Self::UpdateAddress { .. } => 3,
+            Self::EnterJoint { .. } => 4,
+            Self::LeaveJoint { .. } => 5,
+            Self::BeginLeaderTransfer { .. } => 6,
+            Self::FinishLeaderTransfer { .. } => 7,
+        }
+    }
+
+    #[must_use]
+    pub fn encode_body(&self) -> Vec<u8> {
+        let mut enc = Enc::new();
+        match self {
+            Self::AddLearner { id, address } => {
+                enc.u64(id.get());
+                encode_optional_address(&mut enc, address);
+            }
+            Self::RemoveLearner { id } | Self::BeginLeaderTransfer { target: id } => {
+                enc.u64(id.get())
+            }
+            Self::UpdateAddress { id, address } => {
+                enc.u64(id.get());
+                address.encode(&mut enc);
+            }
+            Self::EnterJoint { new_voters } => encode_members(&mut enc, new_voters),
+            Self::LeaveJoint { enter_index } => enc.u64(enter_index.get()),
+            Self::FinishLeaderTransfer {
+                intent_index,
+                result,
+            } => {
+                enc.u64(intent_index.get());
+                enc.u8(*result as u8);
+            }
+        }
+        enc.finish()
+    }
+
+    pub fn decode(tag: u8, body: &[u8]) -> Result<Self, DecodeError> {
+        let mut dec = Dec::new(body);
+        let operation = match tag {
+            1 => Self::AddLearner {
+                id: decode_nonzero_id(&mut dec)?,
+                address: decode_optional_address(&mut dec)?,
+            },
+            2 => Self::RemoveLearner {
+                id: decode_nonzero_id(&mut dec)?,
+            },
+            3 => Self::UpdateAddress {
+                id: decode_nonzero_id(&mut dec)?,
+                address: PeerAddress::decode(&mut dec)?,
+            },
+            4 => Self::EnterJoint {
+                new_voters: decode_members(&mut dec)?,
+            },
+            5 => Self::LeaveJoint {
+                enter_index: decode_nonzero_index(&mut dec)?,
+            },
+            6 => Self::BeginLeaderTransfer {
+                target: decode_nonzero_id(&mut dec)?,
+            },
+            7 => Self::FinishLeaderTransfer {
+                intent_index: decode_nonzero_index(&mut dec)?,
+                result: TransferResult::decode(dec.u8()?)?,
+            },
+            _ => return Err(DecodeError::InvalidTag { offset: 0, tag }),
+        };
+        dec.finish()?;
+        Ok(operation)
+    }
+}
+
+pub const CONFIG_ENVELOPE_MAGIC: u32 = u32::from_le_bytes(*b"CCCF");
+pub const ADMIN_REPLY_MAGIC: u32 = u32::from_le_bytes(*b"CCAR");
+pub const CONFIG_FORMAT_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionNamespace {
+    UserRequest = 0,
+    AdminRequest = 1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SessionKey {
+    pub namespace: u8,
+    pub client: ClientId,
+}
+
+impl SessionKey {
+    pub fn new(namespace: u8, client: ClientId) -> Result<Self, DecodeError> {
+        if namespace > SessionNamespace::AdminRequest as u8 || client.get() == 0 {
+            return Err(DecodeError::InvalidTag {
+                offset: 0,
+                tag: namespace,
+            });
+        }
+        Ok(Self { namespace, client })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigEnvelope {
+    pub admin_session: Option<(SessionKey, u64)>,
+    pub leader_time: Time,
+    pub operation: ConfigOperation,
+}
+
+impl ConfigEnvelope {
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut enc = Enc::new();
+        enc.header(CONFIG_ENVELOPE_MAGIC, CONFIG_FORMAT_VERSION);
+        match self.admin_session {
+            Some((key, sequence)) => {
+                enc.u8(1);
+                enc.u8(key.namespace);
+                enc.u64(key.client.get());
+                enc.u64(sequence);
+            }
+            None => {
+                enc.u8(0);
+                enc.u8(0);
+                enc.u64(0);
+                enc.u64(0);
+            }
+        }
+        enc.u64(self.leader_time.as_nanos());
+        enc.u8(self.operation.tag());
+        enc.bytes(&self.operation.encode_body());
+        let mut bytes = enc.finish();
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        let crc = crc32c_zeroed_tail(&bytes);
+        let checksum_start = bytes.len() - 4;
+        bytes[checksum_start..].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < 4 {
+            return Err(DecodeError::UnexpectedEof {
+                offset: bytes.len(),
+                needed: 4 - bytes.len(),
+            });
+        }
+        let body_len = bytes.len() - 4;
+        let crc = u32::from_le_bytes(bytes[body_len..].try_into().expect("CRC"));
+        if crc32c_zeroed_tail(bytes) != crc {
+            return Err(DecodeError::InvalidTag {
+                offset: body_len,
+                tag: 0,
+            });
+        }
+        let mut dec = Dec::new(&bytes[..body_len]);
+        dec.header(CONFIG_ENVELOPE_MAGIC, CONFIG_FORMAT_VERSION)?;
+        let has_session = dec.u8()?;
+        let namespace = dec.u8()?;
+        let client = ClientId::new(dec.u64()?);
+        let sequence = dec.u64()?;
+        let admin_session = match has_session {
+            0 if namespace == 0 && client.get() == 0 && sequence == 0 => None,
+            1 if namespace == SessionNamespace::AdminRequest as u8 && sequence != 0 => {
+                Some((SessionKey::new(namespace, client)?, sequence))
+            }
+            _ => {
+                return Err(DecodeError::InvalidTag {
+                    offset: 6,
+                    tag: has_session,
+                });
+            }
+        };
+        let leader_time = Time::from_nanos(dec.u64()?);
+        let tag = dec.u8()?;
+        let operation = ConfigOperation::decode(tag, &dec.bytes()?)?;
+        dec.finish()?;
+        Ok(Self {
+            admin_session,
+            leader_time,
+            operation,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AdminResultTag {
+    Applied = 1,
+    TransferSuccess = 2,
+    TransferTimeout = 3,
+    TransferSuperseded = 4,
+    InProgress = 5,
+    RequestConflict = 6,
+    RequestExpired = 7,
+    Rejected = 8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminReply {
+    pub operation_tag: u8,
+    pub result: AdminResultTag,
+    pub source_index: LogIndex,
+    pub detail: Bytes,
+}
+
+impl AdminReply {
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut enc = Enc::new();
+        enc.header(ADMIN_REPLY_MAGIC, CONFIG_FORMAT_VERSION);
+        enc.u8(self.operation_tag);
+        enc.u8(self.result as u8);
+        enc.u64(self.source_index.get());
+        enc.bytes(&self.detail);
+        let mut bytes = enc.finish();
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        let crc = crc32c_zeroed_tail(&bytes);
+        let checksum_start = bytes.len() - 4;
+        bytes[checksum_start..].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < 4 {
+            return Err(DecodeError::UnexpectedEof {
+                offset: bytes.len(),
+                needed: 4 - bytes.len(),
+            });
+        }
+        let body_len = bytes.len() - 4;
+        if crc32c_zeroed_tail(bytes)
+            != u32::from_le_bytes(bytes[body_len..].try_into().expect("CRC"))
+        {
+            return Err(DecodeError::InvalidTag {
+                offset: body_len,
+                tag: 0,
+            });
+        }
+        let mut dec = Dec::new(&bytes[..body_len]);
+        dec.header(ADMIN_REPLY_MAGIC, CONFIG_FORMAT_VERSION)?;
+        let operation_tag = dec.u8()?;
+        if !(1..=7).contains(&operation_tag) {
+            return Err(DecodeError::InvalidTag {
+                offset: dec.position() - 1,
+                tag: operation_tag,
+            });
+        }
+        let result_tag = dec.u8()?;
+        let result = match result_tag {
+            1 => AdminResultTag::Applied,
+            2 => AdminResultTag::TransferSuccess,
+            3 => AdminResultTag::TransferTimeout,
+            4 => AdminResultTag::TransferSuperseded,
+            5 => AdminResultTag::InProgress,
+            6 => AdminResultTag::RequestConflict,
+            7 => AdminResultTag::RequestExpired,
+            8 => AdminResultTag::Rejected,
+            _ => {
+                return Err(DecodeError::InvalidTag {
+                    offset: dec.position() - 1,
+                    tag: result_tag,
+                });
+            }
+        };
+        let source_index = LogIndex::new(dec.u64()?);
+        if matches!(
+            result,
+            AdminResultTag::Applied
+                | AdminResultTag::TransferSuccess
+                | AdminResultTag::TransferTimeout
+                | AdminResultTag::TransferSuperseded
+        ) && source_index.get() == 0
+        {
+            return Err(DecodeError::InvalidTag {
+                offset: dec.position() - 8,
+                tag: 0,
+            });
+        }
+        let detail = dec.bytes()?;
+        dec.finish()?;
+        Ok(Self {
+            operation_tag,
+            result,
+            source_index,
+            detail,
+        })
+    }
+}
+
+fn decode_nonzero_id(dec: &mut Dec<'_>) -> Result<NodeId, DecodeError> {
+    let id = NodeId::new(dec.u64()?);
+    if id.get() == 0 {
+        Err(DecodeError::InvalidTag {
+            offset: dec.position().saturating_sub(8),
+            tag: 0,
+        })
+    } else {
+        Ok(id)
+    }
+}
+
+fn decode_nonzero_index(dec: &mut Dec<'_>) -> Result<LogIndex, DecodeError> {
+    let index = LogIndex::new(dec.u64()?);
+    if index.get() == 0 {
+        Err(DecodeError::InvalidTag {
+            offset: dec.position().saturating_sub(8),
+            tag: 0,
+        })
+    } else {
+        Ok(index)
+    }
+}
+
+fn encode_optional_address(enc: &mut Enc, address: &Option<PeerAddress>) {
+    match address {
+        Some(address) => {
+            enc.u8(1);
+            address.encode(enc);
+        }
+        None => enc.u8(0),
+    }
+}
+
+fn decode_optional_address(dec: &mut Dec<'_>) -> Result<Option<PeerAddress>, DecodeError> {
+    match dec.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(PeerAddress::decode(dec)?)),
+        tag => Err(DecodeError::InvalidTag {
+            offset: dec.position().saturating_sub(1),
+            tag,
+        }),
+    }
+}
+
+fn encode_members(enc: &mut Enc, members: &BTreeSet<NodeId>) {
+    encode_member_set(enc, members);
+}
+
+fn encode_member_set(enc: &mut Enc, members: &BTreeSet<NodeId>) {
+    enc.u32(u32::try_from(members.len()).expect("member count fits"));
+    for member in members {
+        enc.u64(member.get());
+    }
+}
+
+fn decode_members(dec: &mut Dec<'_>) -> Result<BTreeSet<NodeId>, DecodeError> {
+    decode_member_set(dec, false)
+}
+
+fn decode_member_set(
+    dec: &mut Dec<'_>,
+    allow_empty: bool,
+) -> Result<BTreeSet<NodeId>, DecodeError> {
+    let count = dec.u32()?;
+    if (!allow_empty && count == 0) || count > MAX_POLICY_MEMBERS {
+        return Err(DecodeError::LengthTooLarge {
+            offset: dec.position().saturating_sub(4),
+            length: count,
+            max: MAX_POLICY_MEMBERS as usize,
+        });
+    }
+    let mut members = BTreeSet::new();
+    for _ in 0..count {
+        if !members.insert(decode_nonzero_id(dec)?) {
+            return Err(DecodeError::InvalidTag {
+                offset: dec.position().saturating_sub(8),
+                tag: 0,
+            });
+        }
+    }
+    Ok(members)
+}
+
 /// Error returned by total, bounds-checked decoding.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecodeError {
@@ -530,6 +1532,14 @@ impl<'a> Dec<'a> {
         self.offset
     }
 
+    /// Bytes still available to this bounded decoder.  Collection codecs use
+    /// this for a cheap minimum-layout preflight before allocating from an
+    /// attacker-controlled count field.
+    #[must_use]
+    pub const fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
     pub fn finish(self) -> Result<(), DecodeError> {
         if self.offset == self.bytes.len() {
             Ok(())
@@ -544,9 +1554,27 @@ impl<'a> Dec<'a> {
 /// CRC-32C (Castagnoli), kept dependency-free for the core vocabulary crate.
 #[must_use]
 pub fn crc32c(bytes: &[u8]) -> u32 {
+    crc32c_with_zeroed_tail(bytes, false)
+}
+
+/// CRC-32C over a record whose final four-byte checksum field is treated as
+/// zero.  Keeping this operation allocation-free makes it safe to use while
+/// rejecting a bounded but malformed wire record.
+#[must_use]
+pub fn crc32c_zeroed_tail(bytes: &[u8]) -> u32 {
+    crc32c_with_zeroed_tail(bytes, true)
+}
+
+fn crc32c_with_zeroed_tail(bytes: &[u8], zero_tail: bool) -> u32 {
     let mut crc = u32::MAX;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
+    let zero_from = bytes.len().saturating_sub(4);
+    for (index, original) in bytes.iter().enumerate() {
+        let byte = if zero_tail && index >= zero_from {
+            0
+        } else {
+            *original
+        };
+        crc ^= u32::from(byte);
         for _ in 0..8 {
             let mask = 0u32.wrapping_sub(crc & 1);
             crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
@@ -729,6 +1757,22 @@ impl Event {
             payload,
         })
     }
+
+    /// Canonical standalone encoding for value-boundary diagnostic codecs.
+    #[must_use]
+    pub fn encode_value(&self) -> Vec<u8> {
+        let mut enc = Enc::new();
+        self.encode(&mut enc);
+        enc.finish()
+    }
+
+    /// Decode one exact standalone diagnostic event value.
+    pub fn decode_value(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut dec = Dec::new(bytes);
+        let event = Self::decode(&mut dec)?;
+        dec.finish()?;
+        Ok(event)
+    }
 }
 
 pub const TRACE_MAGIC: u32 = u32::from_le_bytes(*b"CCTR");
@@ -853,56 +1897,6 @@ fn hex(bytes: &[u8]) -> String {
     result
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Command {
-    Set {
-        key: Bytes,
-        value: Bytes,
-    },
-    Get {
-        key: Bytes,
-    },
-    Del {
-        key: Bytes,
-    },
-    Incr {
-        key: Bytes,
-    },
-    Cas {
-        key: Bytes,
-        expected: Option<Bytes>,
-        value: Bytes,
-    },
-    Expire {
-        key: Bytes,
-        ttl: Duration,
-    },
-    Ping,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ErrorCode {
-    NotLeader,
-    Busy,
-    StaleSequence,
-    SessionExpired,
-    CasMismatch,
-    NotNumeric,
-    TooLarge,
-    UnknownCommand,
-    ReadOnlyDuringTransfer,
-    Internal,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Response {
-    Ok,
-    Value(Option<Bytes>),
-    Integer(i64),
-    Error(ErrorCode),
-    Redirect(NodeId),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,6 +1912,28 @@ mod tests {
         assert_eq!(Term::new(7).to_string(), "t7");
         assert_eq!(LogIndex::new(412).to_string(), "i412");
         assert_eq!(Seed::new(1).to_string(), "0x0000000000000001");
+    }
+
+    #[test]
+    fn trap_cluster_id_has_one_nonzero_canonical_text_form() {
+        let id = ClusterId::from_hex("00112233445566778899aabbccddeeff").expect("canonical id");
+        assert_eq!(id.to_hex(), "00112233445566778899aabbccddeeff");
+        assert_eq!(
+            id.bytes(),
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]
+        );
+        for invalid in [
+            "00112233445566778899AABBCCDDEEFF",
+            "00112233445566778899aabbccddeef",
+            "00112233445566778899aabbccddeeff0",
+            "00000000000000000000000000000000",
+            "00112233445566778899aabbccddeefg",
+        ] {
+            assert!(ClusterId::from_hex(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]
@@ -988,5 +2004,151 @@ mod tests {
         trace.push(Time::from_nanos(1), None, EventKind::Fault, vec![0xab]);
         assert!(trace.to_json().contains("build\\n1"));
         assert!(trace.to_json().contains("ab"));
+    }
+
+    #[test]
+    fn golden_cluster_policy_v1() {
+        let policy = ClusterPolicy::default();
+        let bytes = policy.encode();
+        assert_eq!(bytes.len(), 138);
+        assert_eq!(&bytes[..4], b"CCPL");
+        assert_eq!(ClusterPolicy::decode(&bytes), Ok(policy));
+        assert_eq!(policy.hash(), fnv1a(&bytes));
+    }
+
+    #[test]
+    fn trap_cluster_policy_codec_is_bounded_and_canonical() {
+        let mut bytes = ClusterPolicy::default().encode();
+        bytes.push(0);
+        assert!(matches!(
+            ClusterPolicy::decode(&bytes),
+            Err(DecodeError::TrailingBytes { .. })
+        ));
+        let mut corrupt = ClusterPolicy::default().encode();
+        corrupt[6..10].copy_from_slice(&0_u32.to_le_bytes());
+        let last = corrupt.len() - 4;
+        let checksum = crc32c_zeroed_tail(&corrupt);
+        corrupt[last..].copy_from_slice(&checksum.to_le_bytes());
+        assert!(ClusterPolicy::decode(&corrupt).is_err());
+    }
+
+    #[test]
+    fn golden_cccf_v1_and_ccar_v1() {
+        let envelope = ConfigEnvelope {
+            admin_session: Some((SessionKey::new(1, ClientId::new(9)).expect("key"), 4)),
+            leader_time: Time::from_nanos(12),
+            operation: ConfigOperation::AddLearner {
+                id: NodeId::new(3),
+                address: Some(PeerAddress::V4 {
+                    ip: [127, 0, 0, 1],
+                    port: 9000,
+                }),
+            },
+        };
+        let encoded = envelope.encode();
+        assert_eq!(ConfigEnvelope::decode(&encoded), Ok(envelope));
+        let reply = AdminReply {
+            operation_tag: 1,
+            result: AdminResultTag::Applied,
+            source_index: LogIndex::new(7),
+            detail: vec![1, 2],
+        };
+        assert_eq!(AdminReply::decode(&reply.encode()), Ok(reply));
+    }
+
+    #[test]
+    fn trap_config_envelope_admin_absence_is_canonical() {
+        let envelope = ConfigEnvelope {
+            admin_session: None,
+            leader_time: Time::from_nanos(0),
+            operation: ConfigOperation::RemoveLearner { id: NodeId::new(2) },
+        };
+        let mut bytes = envelope.encode();
+        // `has_admin_session=0` permits no hidden identity fields.
+        bytes[8] = 1;
+        let last = bytes.len() - 4;
+        let checksum = crc32c_zeroed_tail(&bytes);
+        bytes[last..].copy_from_slice(&checksum.to_le_bytes());
+        assert!(ConfigEnvelope::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn trap_membership_address_codec_is_canonical() {
+        assert!(
+            PeerAddress::V4 {
+                ip: [0, 0, 0, 0],
+                port: 1
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            PeerAddress::V4 {
+                ip: [224, 0, 0, 1],
+                port: 1
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            PeerAddress::V4 {
+                ip: [127, 0, 0, 1],
+                port: 0
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn golden_membership_state_v1_round_trips_joint_projection() {
+        let voters = [
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+        ]
+        .into_iter()
+        .collect();
+        let state = MembershipState {
+            voters,
+            learners: [NodeId::new(5)].into_iter().collect(),
+            joint: Some(JointMembership {
+                old_voters: [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+                    .into_iter()
+                    .collect(),
+                new_voters: [NodeId::new(1), NodeId::new(2), NodeId::new(4)]
+                    .into_iter()
+                    .collect(),
+                enter_index: LogIndex::new(9),
+            }),
+            addresses: [(
+                NodeId::new(5),
+                PeerAddress::V4 {
+                    ip: [127, 0, 0, 1],
+                    port: 7205,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let bytes = state.encode().expect("membership encode");
+        assert_eq!(&bytes[..4], b"CCMS");
+        assert_eq!(MembershipState::decode(&bytes), Ok(state));
+    }
+
+    #[test]
+    fn trap_unknown_config_tag_fails_closed() {
+        assert!(ConfigOperation::decode(99, &[]).is_err());
+    }
+
+    #[test]
+    fn trap_host_limits_reject_zero_admission_caps() {
+        assert!(HostLimits::default().is_valid());
+        let invalid = HostLimits {
+            max_pending_io: 0,
+            ..HostLimits::default()
+        };
+        assert!(!invalid.is_valid());
     }
 }

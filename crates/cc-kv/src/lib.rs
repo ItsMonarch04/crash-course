@@ -12,8 +12,15 @@ use cc_store::{Checkpoint, Store, StoreConfig, StoreError};
 
 pub const SNAPSHOT_VERSION: u16 = 1;
 pub const KV_MAGIC: u32 = u32::from_le_bytes(*b"CCKV");
+pub const REPLY_MAGIC: u32 = u32::from_le_bytes(*b"CCKR");
 pub const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_SCAN: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetCondition {
+    Nx,
+    Xx,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KvCommand {
@@ -21,6 +28,15 @@ pub enum KvCommand {
         key: Vec<u8>,
         value: Vec<u8>,
         ttl: Option<Duration>,
+    },
+    /// A condition and its mutation are one replicated state-machine action.
+    /// It exists specifically so an adapter cannot race a local read with a
+    /// later replicated write when implementing SET NX/XX.
+    ConditionalSet {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        condition: SetCondition,
     },
     Del {
         key: Vec<u8>,
@@ -89,6 +105,7 @@ impl KvCommand {
     pub fn key(&self) -> Option<&[u8]> {
         match self {
             Self::Set { key, .. }
+            | Self::ConditionalSet { key, .. }
             | Self::Del { key }
             | Self::Cas { key, .. }
             | Self::Incr { key, .. }
@@ -113,6 +130,7 @@ pub enum KvError {
     Store(StoreError),
     Decode(DecodeError),
     StaleSequence,
+    SequenceConflict,
     SessionExpired,
     NotNumeric,
     CasMismatch,
@@ -126,6 +144,7 @@ impl fmt::Display for KvError {
             Self::Store(error) => write!(f, "store: {error}"),
             Self::Decode(error) => write!(f, "decode: {error}"),
             Self::StaleSequence => write!(f, "stale-seq"),
+            Self::SequenceConflict => write!(f, "sequence-conflict"),
             Self::SessionExpired => write!(f, "session-expired"),
             Self::NotNumeric => write!(f, "not-numeric"),
             Self::CasMismatch => write!(f, "cas-mismatch"),
@@ -155,6 +174,7 @@ pub enum KvReply {
     Value(Option<Vec<u8>>),
     Integer(i64),
     Cas(bool),
+    Conditional(bool),
     Scan(Vec<(Vec<u8>, Vec<u8>)>),
     Error(KvError),
 }
@@ -173,6 +193,7 @@ pub struct KvSnapshot {
     pub ttl: BTreeMap<Vec<u8>, Time>,
     pub applied_index: LogIndex,
     pub applied_term: Term,
+    pub last_leader_time: Time,
 }
 
 pub struct Kv {
@@ -213,13 +234,19 @@ impl Kv {
                 > SESSION_IDLE_TTL.as_nanos()
             {
                 self.sessions.remove(&client);
-                return Ok(KvReply::Error(KvError::SessionExpired));
+                let reply = KvReply::Error(KvError::SessionExpired);
+                self.advance_applied(index, term);
+                return Ok(reply);
             }
             if sequence < session.last_seq {
-                return Ok(KvReply::Error(KvError::StaleSequence));
+                let reply = KvReply::Error(KvError::StaleSequence);
+                self.advance_applied(index, term);
+                return Ok(reply);
             }
             if sequence == session.last_seq {
-                return Ok(session.cached.clone());
+                let reply = session.cached.clone();
+                self.advance_applied(index, term);
+                return Ok(reply);
             }
         }
         let reply = self.apply_command(command, leader_time)?;
@@ -233,9 +260,39 @@ impl Kv {
                 },
             );
         }
+        self.advance_applied(index, term);
+        Ok(reply)
+    }
+
+    /// Command-only apply surface used by the composite state machine.  Retry
+    /// ownership belongs above `Kv`; this method deliberately knows nothing
+    /// about client identities or request sequences.
+    pub fn apply_command_only(
+        &mut self,
+        index: LogIndex,
+        term: Term,
+        command: KvCommand,
+        leader_time: Time,
+    ) -> KvReply {
+        let time = self.monotonic_time(leader_time);
+        let reply = self
+            .apply_command(command, time)
+            .unwrap_or_else(KvReply::Error);
+        self.advance_applied(index, term);
+        reply
+    }
+
+    fn advance_applied(&mut self, index: LogIndex, term: Term) {
         self.applied_index = index;
         self.applied_term = term;
-        Ok(reply)
+    }
+
+    /// Advance the composite-state watermark for a committed no-op or config
+    /// entry.  Such entries have no KV mutation, but they are still a state
+    /// machine transition and must never leave Raft ahead of the snapshot.
+    pub fn mark_applied(&mut self, index: LogIndex, term: Term, leader_time: Time) {
+        self.monotonic_time(leader_time);
+        self.advance_applied(index, term);
     }
 
     pub fn read(&self, command: KvCommand, at: Time) -> Result<KvReply, KvError> {
@@ -263,6 +320,28 @@ impl Kv {
                     self.ttl.remove(&key);
                 }
                 Ok(KvReply::Ok)
+            }
+            KvCommand::ConditionalSet {
+                key,
+                value,
+                ttl,
+                condition,
+            } => {
+                let exists = self.visible_get(&key, now).is_some();
+                let matches = match condition {
+                    SetCondition::Nx => !exists,
+                    SetCondition::Xx => exists,
+                };
+                if !matches {
+                    return Ok(KvReply::Conditional(false));
+                }
+                self.store.put(&key, &value)?;
+                if let Some(ttl) = ttl {
+                    self.ttl.insert(key, now + ttl);
+                } else {
+                    self.ttl.remove(&key);
+                }
+                Ok(KvReply::Conditional(true))
             }
             KvCommand::Del { key } => {
                 self.store.delete(&key)?;
@@ -443,6 +522,7 @@ impl Kv {
             ttl: self.ttl.clone(),
             applied_index: self.applied_index,
             applied_term: self.applied_term,
+            last_leader_time: self.last_leader_time,
         })
     }
 
@@ -467,7 +547,7 @@ impl Kv {
             ttl: snapshot.ttl,
             applied_index: snapshot.applied_index,
             applied_term: snapshot.applied_term,
-            last_leader_time: Time::from_nanos(0),
+            last_leader_time: snapshot.last_leader_time,
         })
     }
 }
@@ -481,6 +561,21 @@ pub fn encode_command(command: &KvCommand) -> Vec<u8> {
             enc.bytes(key);
             enc.bytes(value);
             encode_optional_duration(&mut enc, *ttl);
+        }
+        KvCommand::ConditionalSet {
+            key,
+            value,
+            ttl,
+            condition,
+        } => {
+            enc.u8(17);
+            enc.bytes(key);
+            enc.bytes(value);
+            encode_optional_duration(&mut enc, *ttl);
+            enc.u8(match condition {
+                SetCondition::Nx => 1,
+                SetCondition::Xx => 2,
+            });
         }
         KvCommand::Del { key } => {
             enc.u8(2);
@@ -566,6 +661,27 @@ pub fn decode_command(bytes: &[u8]) -> Result<KvCommand, KvError> {
             ttl: decode_optional_duration(&mut dec)?,
         },
         2 => KvCommand::Del { key: dec.bytes()? },
+        17 => {
+            let key = dec.bytes()?;
+            let value = dec.bytes()?;
+            let ttl = decode_optional_duration(&mut dec)?;
+            let condition = match dec.u8()? {
+                1 => SetCondition::Nx,
+                2 => SetCondition::Xx,
+                tag => {
+                    return Err(KvError::Decode(DecodeError::InvalidTag {
+                        offset: dec.position().saturating_sub(1),
+                        tag,
+                    }));
+                }
+            };
+            KvCommand::ConditionalSet {
+                key,
+                value,
+                ttl,
+                condition,
+            }
+        }
         3 => KvCommand::Cas {
             key: dec.bytes()?,
             expected: decode_optional_bytes(&mut dec)?,
@@ -616,6 +732,135 @@ pub fn decode_command(bytes: &[u8]) -> Result<KvCommand, KvError> {
     };
     dec.finish()?;
     Ok(command)
+}
+
+/// Stable reply bytes used by the cluster-wide session cache. Infrastructure
+/// errors are intentionally not encodable: they fail the node instead of
+/// becoming a successful deterministic response.
+#[must_use]
+pub fn encode_reply(reply: &KvReply) -> Vec<u8> {
+    let mut enc = Enc::new();
+    enc.header(REPLY_MAGIC, SNAPSHOT_VERSION);
+    match reply {
+        KvReply::Ok => enc.u8(1),
+        KvReply::Value(value) => {
+            enc.u8(2);
+            encode_optional_bytes(&mut enc, value);
+        }
+        KvReply::Integer(value) => {
+            enc.u8(3);
+            enc.u64(*value as u64);
+        }
+        KvReply::Cas(value) => {
+            enc.u8(4);
+            enc.u8(u8::from(*value));
+        }
+        KvReply::Conditional(value) => {
+            enc.u8(5);
+            enc.u8(u8::from(*value));
+        }
+        KvReply::Scan(items) => {
+            enc.u8(6);
+            enc.u32(u32::try_from(items.len()).expect("scan count fits"));
+            for (key, value) in items {
+                enc.bytes(key);
+                enc.bytes(value);
+            }
+        }
+        KvReply::Error(error) => {
+            enc.u8(7);
+            enc.u8(error_tag(error));
+        }
+    }
+    let mut bytes = enc.finish();
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    let crc = cc_core::crc32c_zeroed_tail(&bytes);
+    let checksum_start = bytes.len() - 4;
+    bytes[checksum_start..].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+pub fn decode_reply(bytes: &[u8]) -> Result<KvReply, KvError> {
+    if bytes.len() < 4 {
+        return Err(KvError::InvalidInput);
+    }
+    let body_len = bytes.len() - 4;
+    if cc_core::crc32c_zeroed_tail(bytes)
+        != u32::from_le_bytes(bytes[body_len..].try_into().expect("reply CRC"))
+    {
+        return Err(KvError::InvalidInput);
+    }
+    let mut dec = Dec::new(&bytes[..body_len]);
+    dec.header(REPLY_MAGIC, SNAPSHOT_VERSION)?;
+    let reply = match dec.u8()? {
+        1 => KvReply::Ok,
+        2 => KvReply::Value(decode_optional_bytes(&mut dec)?),
+        3 => KvReply::Integer(dec.u64()? as i64),
+        4 => KvReply::Cas(decode_bool(&mut dec)?),
+        5 => KvReply::Conditional(decode_bool(&mut dec)?),
+        6 => {
+            let count = dec.u32()?;
+            let max_by_remaining = dec.remaining() / 8;
+            if count > MAX_SCAN as u32 || count as usize > max_by_remaining {
+                return Err(KvError::Decode(DecodeError::LengthTooLarge {
+                    offset: dec.position().saturating_sub(4),
+                    length: count,
+                    max: MAX_SCAN.min(max_by_remaining),
+                }));
+            }
+            let mut items = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                items.push((dec.bytes()?, dec.bytes()?));
+            }
+            KvReply::Scan(items)
+        }
+        7 => KvReply::Error(error_from_tag(dec.u8()?)?),
+        tag => {
+            return Err(KvError::Decode(DecodeError::InvalidTag {
+                offset: dec.position().saturating_sub(1),
+                tag,
+            }));
+        }
+    };
+    dec.finish()?;
+    Ok(reply)
+}
+
+fn decode_bool(dec: &mut Dec<'_>) -> Result<bool, KvError> {
+    match dec.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        tag => Err(KvError::Decode(DecodeError::InvalidTag {
+            offset: dec.position().saturating_sub(1),
+            tag,
+        })),
+    }
+}
+
+fn error_tag(error: &KvError) -> u8 {
+    match error {
+        KvError::StaleSequence => 1,
+        KvError::SequenceConflict => 2,
+        KvError::SessionExpired => 3,
+        KvError::NotNumeric => 4,
+        KvError::CasMismatch => 5,
+        KvError::TooLarge => 6,
+        KvError::InvalidInput => 7,
+        KvError::Store(_) | KvError::Decode(_) => 8,
+    }
+}
+
+fn error_from_tag(tag: u8) -> Result<KvError, KvError> {
+    match tag {
+        1 => Ok(KvError::StaleSequence),
+        2 => Ok(KvError::SequenceConflict),
+        3 => Ok(KvError::SessionExpired),
+        4 => Ok(KvError::NotNumeric),
+        5 => Ok(KvError::CasMismatch),
+        6 => Ok(KvError::TooLarge),
+        7 => Ok(KvError::InvalidInput),
+        _ => Err(KvError::Decode(DecodeError::InvalidTag { offset: 0, tag })),
+    }
 }
 
 fn encode_optional_bytes(enc: &mut Enc, value: &Option<Vec<u8>>) {
@@ -918,5 +1163,185 @@ mod tests {
         .expect("apply");
         assert_eq!(kv.applied_index, LogIndex::new(4));
         assert_eq!(kv.applied_term, Term::new(2));
+    }
+
+    #[test]
+    fn trap_conditional_set_is_one_replicated_apply() {
+        let mut kv = kv();
+        let reply = kv.apply_command_only(
+            LogIndex::new(1),
+            Term::new(1),
+            KvCommand::ConditionalSet {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                ttl: None,
+                condition: SetCondition::Nx,
+            },
+            Time::from_nanos(1),
+        );
+        assert_eq!(reply, KvReply::Conditional(true));
+        assert_eq!(kv.store.get(b"k", None), Some(b"v".to_vec()));
+        assert_eq!(kv.store.image().sequence, 1);
+    }
+
+    #[test]
+    fn trap_failed_conditional_set_preserves_value_and_ttl() {
+        let mut kv = kv();
+        let at = Time::from_nanos(1);
+        kv.apply_command_only(
+            LogIndex::new(1),
+            Term::new(1),
+            KvCommand::Set {
+                key: b"k".to_vec(),
+                value: b"old".to_vec(),
+                ttl: Some(Duration::from_secs(4)),
+            },
+            at,
+        );
+        let sequence = kv.store.image().sequence;
+        assert_eq!(
+            kv.apply_command_only(
+                LogIndex::new(2),
+                Term::new(1),
+                KvCommand::ConditionalSet {
+                    key: b"k".to_vec(),
+                    value: b"new".to_vec(),
+                    ttl: None,
+                    condition: SetCondition::Nx
+                },
+                at
+            ),
+            KvReply::Conditional(false)
+        );
+        assert_eq!(kv.store.get(b"k", None), Some(b"old".to_vec()));
+        assert_eq!(kv.store.image().sequence, sequence);
+        assert_eq!(
+            kv.read(KvCommand::Ttl { key: b"k".to_vec() }, at),
+            Ok(KvReply::Integer(4))
+        );
+    }
+
+    #[test]
+    fn trap_conditional_set_treats_expired_key_as_absent() {
+        let mut kv = kv();
+        kv.apply_command_only(
+            LogIndex::new(1),
+            Term::new(1),
+            KvCommand::Set {
+                key: b"k".to_vec(),
+                value: b"expired".to_vec(),
+                ttl: Some(Duration::from_nanos(1)),
+            },
+            Time::from_nanos(10),
+        );
+        assert_eq!(
+            kv.apply_command_only(
+                LogIndex::new(2),
+                Term::new(1),
+                KvCommand::ConditionalSet {
+                    key: b"k".to_vec(),
+                    value: b"replacement".to_vec(),
+                    ttl: None,
+                    condition: SetCondition::Nx,
+                },
+                Time::from_nanos(12),
+            ),
+            KvReply::Conditional(true)
+        );
+        assert_eq!(kv.store.get(b"k", None), Some(b"replacement".to_vec()));
+    }
+
+    #[test]
+    fn trap_cas_writes_once() {
+        let mut kv = kv();
+        kv.apply_command_only(
+            LogIndex::new(1),
+            Term::new(1),
+            KvCommand::Set {
+                key: b"k".to_vec(),
+                value: b"old".to_vec(),
+                ttl: None,
+            },
+            Time::from_nanos(1),
+        );
+        let before = kv.store.image().sequence;
+        assert_eq!(
+            kv.apply_command_only(
+                LogIndex::new(2),
+                Term::new(1),
+                KvCommand::Cas {
+                    key: b"k".to_vec(),
+                    expected: Some(b"old".to_vec()),
+                    value: Some(b"new".to_vec()),
+                },
+                Time::from_nanos(2),
+            ),
+            KvReply::Cas(true)
+        );
+        assert_eq!(kv.store.image().sequence, before + 1);
+        assert_eq!(kv.store.get(b"k", None), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn trap_committed_apply_never_returns_busy() {
+        let config = StoreConfig {
+            memtable_bytes: 1,
+            ..StoreConfig::default()
+        };
+        let mut kv = Kv::new(config).expect("small store");
+        for index in 1..=4 {
+            let reply = kv.apply_command_only(
+                LogIndex::new(index),
+                Term::new(1),
+                KvCommand::Set {
+                    key: format!("k{index}").into_bytes(),
+                    value: b"v".to_vec(),
+                    ttl: None,
+                },
+                Time::from_nanos(index),
+            );
+            assert!(
+                !matches!(reply, KvReply::Error(KvError::Store(StoreError::Busy))),
+                "a frozen derived memtable must flush before a committed mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn trap_last_leader_time_survives_snapshot_and_restore() {
+        let mut kv = kv();
+        kv.apply_command_only(
+            LogIndex::new(1),
+            Term::new(1),
+            KvCommand::Ping,
+            Time::from_nanos(90),
+        );
+        let restored =
+            Kv::restore(kv.snapshot().expect("snapshot"), StoreConfig::default()).expect("restore");
+        assert_eq!(restored.last_leader_time, Time::from_nanos(90));
+    }
+
+    #[test]
+    fn golden_cckr_v1_round_trips_and_rejects_corruption() {
+        let reply = KvReply::Scan(vec![(vec![0], vec![0xff])]);
+        let encoded = encode_reply(&reply);
+        assert_eq!(decode_reply(&encoded), Ok(reply));
+        let mut corrupt = encoded;
+        corrupt[8] ^= 1;
+        assert!(decode_reply(&corrupt).is_err());
+    }
+
+    #[test]
+    fn trap_cckr_scan_count_is_bounded_by_remaining_bytes() {
+        let mut encoded = encode_reply(&KvReply::Scan(vec![(b"k".to_vec(), b"v".to_vec())]));
+        // CCKR header (6), tag (1), then scan count (4).
+        encoded[7..11].copy_from_slice(&2_u32.to_le_bytes());
+        let last = encoded.len() - 4;
+        let crc = cc_core::crc32c_zeroed_tail(&encoded);
+        encoded[last..].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            decode_reply(&encoded),
+            Err(KvError::Decode(DecodeError::LengthTooLarge { .. }))
+        ));
     }
 }
