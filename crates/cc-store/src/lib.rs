@@ -7,8 +7,12 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
-use cc_core::{Dec, DecodeError, Enc, MAX_CODEC_BYTES, crc32c};
+use cc_core::{Dec, DecodeError, Duration, Enc, MAX_CODEC_BYTES, crc32c};
+use cc_env::FileId;
 use cc_wal::{RecordType, Wal, WalConfig, WalError};
 
 pub const FORMAT_VERSION: u16 = 1;
@@ -83,6 +87,208 @@ impl Default for StoreConfig {
             max_value_bytes: 1024 * 1024,
             wal: WalConfig::default(),
         }
+    }
+}
+
+impl StoreConfig {
+    /// Rebuild a complete store configuration from bounded host-neutral
+    /// fields without forcing callers above the store boundary to name the
+    /// WAL implementation type.
+    #[must_use]
+    pub const fn from_parts(
+        memtable_bytes: usize,
+        max_key_bytes: usize,
+        max_value_bytes: usize,
+        wal_segment_size: usize,
+        wal_max_record_size: usize,
+    ) -> Self {
+        Self {
+            memtable_bytes,
+            max_key_bytes,
+            max_value_bytes,
+            wal: WalConfig {
+                segment_size: wal_segment_size,
+                max_record_size: wal_max_record_size,
+            },
+        }
+    }
+}
+
+/// A synchronous read boundary shared by real storage and simulation. The
+/// returned service duration belongs to the request that caused it, never the
+/// next driver input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockRead {
+    pub bytes: Vec<u8>,
+    pub service: Duration,
+}
+
+/// A failed synchronous read still consumes service time that belongs to the
+/// input which requested it. Keeping that value with the typed error prevents
+/// hosts from accidentally charging the next unrelated operation instead.
+#[derive(Debug)]
+pub struct BlockReadError {
+    pub error: StoreError,
+    pub service: Duration,
+}
+
+impl From<StoreError> for BlockReadError {
+    fn from(error: StoreError) -> Self {
+        Self {
+            error,
+            service: Duration::from_nanos(0),
+        }
+    }
+}
+
+pub trait BlockSource {
+    fn read_block(
+        &mut self,
+        file: FileId,
+        offset: u64,
+        len: u32,
+    ) -> Result<BlockRead, BlockReadError>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MemoryBlockSource {
+    files: BTreeMap<FileId, Vec<u8>>,
+    pub service_per_read: Duration,
+}
+
+impl MemoryBlockSource {
+    pub fn insert(&mut self, file: FileId, bytes: Vec<u8>) {
+        self.files.insert(file, bytes);
+    }
+}
+
+impl BlockSource for MemoryBlockSource {
+    fn read_block(
+        &mut self,
+        file: FileId,
+        offset: u64,
+        len: u32,
+    ) -> Result<BlockRead, BlockReadError> {
+        if usize::try_from(len).unwrap_or(usize::MAX) > MAX_CODEC_BYTES {
+            return Err(StoreError::TooLarge {
+                what: "block read",
+                size: usize::try_from(len).unwrap_or(usize::MAX),
+                max: MAX_CODEC_BYTES,
+            }
+            .into());
+        }
+        let data = self
+            .files
+            .get(&file)
+            .ok_or(StoreError::MissingTable {
+                file_no: file_number(file),
+            })
+            .map_err(BlockReadError::from)?;
+        let start = usize::try_from(offset)
+            .map_err(|_| BlockReadError::from(StoreError::InvalidInput("block offset")))?;
+        let end = start
+            .checked_add(len as usize)
+            .ok_or(StoreError::InvalidInput("block range"))
+            .map_err(BlockReadError::from)?;
+        let bytes = data
+            .get(start..end)
+            .ok_or(StoreError::InvalidInput("block range"))
+            .map_err(BlockReadError::from)?
+            .to_vec();
+        Ok(BlockRead {
+            bytes,
+            service: self.service_per_read,
+        })
+    }
+}
+
+/// Filesystem-backed implementation used by the real host. Paths are derived
+/// only from a logical `FileId`; caller-provided path components never reach a
+/// storage read.
+#[derive(Clone, Debug)]
+pub struct FileBlockSource {
+    root: PathBuf,
+}
+
+impl FileBlockSource {
+    pub fn new(root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let root = root.as_ref();
+        if !root.is_dir() {
+            return Err(StoreError::InvalidInput("block source root"));
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+    fn path(&self, file: FileId) -> PathBuf {
+        self.root.join(file_name(file))
+    }
+}
+
+impl BlockSource for FileBlockSource {
+    fn read_block(
+        &mut self,
+        file: FileId,
+        offset: u64,
+        len: u32,
+    ) -> Result<BlockRead, BlockReadError> {
+        let length = usize::try_from(len).unwrap_or(usize::MAX);
+        if length > MAX_CODEC_BYTES {
+            return Err(StoreError::TooLarge {
+                what: "block read",
+                size: length,
+                max: MAX_CODEC_BYTES,
+            }
+            .into());
+        }
+        let path = self.path(file);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| StoreError::MissingTable {
+                file_no: file_number(file),
+            })
+            .map_err(BlockReadError::from)?;
+        if !metadata.file_type().is_file() {
+            return Err(StoreError::InvalidInput("block source requires regular file").into());
+        }
+        let mut handle = File::open(path)
+            .map_err(|_| StoreError::MissingTable {
+                file_no: file_number(file),
+            })
+            .map_err(BlockReadError::from)?;
+        handle
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| StoreError::InvalidInput("block offset"))
+            .map_err(BlockReadError::from)?;
+        let mut bytes = vec![0; length];
+        handle
+            .read_exact(&mut bytes)
+            .map_err(|_| StoreError::InvalidInput("block range"))
+            .map_err(BlockReadError::from)?;
+        Ok(BlockRead {
+            bytes,
+            service: Duration::from_nanos(0),
+        })
+    }
+}
+
+fn file_number(file: FileId) -> u64 {
+    match file {
+        FileId::Wal { segment } => segment,
+        FileId::Sst { file_no } => file_no,
+        FileId::Manifest { generation } | FileId::Snapshot { generation } => generation,
+        FileId::Meta => 0,
+        FileId::Temp { sequence } => sequence,
+    }
+}
+
+fn file_name(file: FileId) -> String {
+    match file {
+        FileId::Wal { segment } => format!("wal-{segment}"),
+        FileId::Sst { file_no } => format!("sst-{file_no}"),
+        FileId::Manifest { generation } => format!("manifest-{generation}"),
+        FileId::Snapshot { generation } => format!("snapshot-{generation}"),
+        FileId::Meta => String::from("META"),
+        FileId::Temp { sequence } => format!("tmp-{sequence}"),
     }
 }
 
@@ -370,7 +576,7 @@ pub struct Store {
     tables: Vec<SstTable>,
     manifest: Manifest,
     next_sequence: u64,
-    snapshots: BTreeSet<u64>,
+    snapshots: BTreeMap<u64, u64>,
 }
 
 impl Store {
@@ -383,7 +589,7 @@ impl Store {
             tables: Vec::new(),
             manifest: Manifest::default(),
             next_sequence: 0,
-            snapshots: BTreeSet::new(),
+            snapshots: BTreeMap::new(),
         })
     }
 
@@ -410,7 +616,7 @@ impl Store {
             tables,
             manifest: image.manifest,
             next_sequence: image.sequence,
-            snapshots: BTreeSet::new(),
+            snapshots: BTreeMap::new(),
         })
     }
 
@@ -451,7 +657,12 @@ impl Store {
             });
         }
         if self.frozen.is_some() {
-            return Err(StoreError::Busy);
+            // A committed state-machine transition is never allowed to fail
+            // merely because a derived memtable is awaiting publication.  The
+            // synchronous store rotates/flushes that derived structure before
+            // accepting the next mutation; an actual I/O failure still
+            // propagates as infrastructure failure.
+            let _ = self.flush()?;
         }
         let sequence = self.next_sequence + 1;
         let payload = encode_mutation(sequence, key, value, kind);
@@ -470,12 +681,24 @@ impl Store {
 
     pub fn snapshot(&mut self) -> Snapshot {
         let snapshot = Snapshot(self.next_sequence);
-        self.snapshots.insert(snapshot.0);
+        let count = self.snapshots.get(&snapshot.0).copied().unwrap_or(0);
+        self.snapshots.insert(snapshot.0, count.saturating_add(1));
         snapshot
     }
 
-    pub fn release_snapshot(&mut self, snapshot: Snapshot) {
-        self.snapshots.remove(&snapshot.0);
+    pub fn release_snapshot(&mut self, snapshot: Snapshot) -> Result<(), StoreError> {
+        let count = self.snapshots.get(&snapshot.0).copied().unwrap_or(0);
+        if count == 0 {
+            return Err(StoreError::InvalidInput(
+                "unknown or already released snapshot",
+            ));
+        }
+        if count == 1 {
+            self.snapshots.remove(&snapshot.0);
+        } else {
+            self.snapshots.insert(snapshot.0, count - 1);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -585,7 +808,7 @@ impl Store {
             .snapshots
             .iter()
             .next()
-            .copied()
+            .map(|(watermark, _)| *watermark)
             .unwrap_or(self.next_sequence);
         let mut keep = Vec::new();
         let mut seen_keys = BTreeSet::new();
@@ -699,6 +922,23 @@ mod tests {
     }
 
     #[test]
+    fn store_config_from_parts_keeps_wal_limits_inside_store_ownership() {
+        let config = StoreConfig::from_parts(64, 32, 16, 256, 128);
+        assert_eq!(
+            config,
+            StoreConfig {
+                memtable_bytes: 64,
+                max_key_bytes: 32,
+                max_value_bytes: 16,
+                wal: WalConfig {
+                    segment_size: 256,
+                    max_record_size: 128,
+                },
+            }
+        );
+    }
+
+    #[test]
     fn wal_first_put_get_delete_and_mvcc_snapshot() {
         let mut store = Store::new(config()).expect("store");
         store.put(b"a", b"one").expect("put");
@@ -708,6 +948,21 @@ mod tests {
         assert_eq!(store.get(b"a", Some(snapshot)), Some(b"one".to_vec()));
         store.delete(b"a").expect("delete");
         assert_eq!(store.get(b"a", None), None);
+    }
+
+    #[test]
+    fn trap_equal_watermark_snapshot_pins_are_reference_counted() {
+        let mut store = Store::new(config()).expect("store");
+        store.put(b"a", b"one").expect("put");
+        let first = store.snapshot();
+        let second = store.snapshot();
+        assert_eq!(first, second);
+        store.release_snapshot(first).expect("first release");
+        store.put(b"a", b"two").expect("put");
+        let _ = store.compact().expect("compact");
+        assert_eq!(store.get(b"a", Some(second)), Some(b"one".to_vec()));
+        store.release_snapshot(second).expect("second release");
+        assert!(store.release_snapshot(second).is_err());
     }
 
     #[test]

@@ -1,0 +1,18 @@
+[package]
+name = "cc-host"
+version.workspace = true
+edition.workspace = true
+description = "Shared bounded host driver for Crash Course nodes."
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+cc-cluster = { path = "../cc-cluster" }
+cc-core = { path = "../cc-core" }
+cc-env = { path = "../cc-env" }
+cc-log = { path = "../cc-log" }
+cc-store = { path = "../cc-store" }
+
+[lints]
+workspace = true
