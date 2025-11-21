@@ -11,10 +11,9 @@ publish = false
 cc-core = { path = "../cc-core" }
 cc-env = { path = "../cc-env" }
 cc-kv = { path = "../cc-kv" }
+cc-log = { path = "../cc-log" }
 cc-raft = { path = "../cc-raft" }
 cc-store = { path = "../cc-store" }
-cc-wal = { path = "../cc-wal" }
 
 [lints]
 workspace = true
-
