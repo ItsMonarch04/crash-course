@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use cc_core::{
-    DelayDist, Duration, EventKind, NodeId, P16, Seed, Time, TimerId, Trace, Xoshiro256pp,
+    DelayDist, Duration, EventKind, NodeId, P16, Seed, Time, TimerId, Trace, Xoshiro256pp, crc32c,
 };
 use cc_env::{FileId, IoError, IoResult};
 
@@ -48,14 +48,22 @@ pub enum SimEvent {
     Message { target: Target, bytes: Vec<u8> },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct QueueItem {
+#[derive(Clone, Debug)]
+struct QueueItem<E> {
     at: Time,
     tie_seq: u64,
-    event: SimEvent,
+    event: E,
 }
 
-impl Ord for QueueItem {
+impl<E> PartialEq for QueueItem<E> {
+    fn eq(&self, other: &Self) -> bool {
+        self.at == other.at && self.tie_seq == other.tie_seq
+    }
+}
+
+impl<E> Eq for QueueItem<E> {}
+
+impl<E> Ord for QueueItem<E> {
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .at
@@ -64,9 +72,60 @@ impl Ord for QueueItem {
     }
 }
 
-impl PartialOrd for QueueItem {
+impl<E> PartialOrd for QueueItem<E> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// Shared deterministic scheduler. It orders events by virtual time and then
+/// insertion sequence, so hosts can share exact same-instant FIFO behavior
+/// without retaining private heap implementations.
+pub struct EventQueue<E> {
+    queue: BinaryHeap<QueueItem<E>>,
+    next_tie_seq: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledEvent<E> {
+    pub at: Time,
+    pub event: E,
+}
+
+impl<E> EventQueue<E> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            queue: BinaryHeap::new(),
+            next_tie_seq: 0,
+        }
+    }
+
+    pub fn schedule(&mut self, at: Time, event: E) {
+        let tie_seq = self.next_tie_seq;
+        self.next_tie_seq = self
+            .next_tie_seq
+            .checked_add(1)
+            .expect("invariant: scheduler tie sequence overflow");
+        self.queue.push(QueueItem { at, tie_seq, event });
+    }
+
+    #[must_use]
+    pub fn peek_time(&self) -> Option<Time> {
+        self.queue.peek().map(|item| item.at)
+    }
+
+    pub fn pop(&mut self) -> Option<ScheduledEvent<E>> {
+        self.queue.pop().map(|item| ScheduledEvent {
+            at: item.at,
+            event: item.event,
+        })
+    }
+}
+
+impl<E> Default for EventQueue<E> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -146,8 +205,7 @@ pub struct Sim {
     pub seed: Seed,
     pub now: Time,
     pub config: SimConfig,
-    queue: BinaryHeap<QueueItem>,
-    next_tie_seq: u64,
+    queue: EventQueue<SimEvent>,
     pub recorder: Recorder,
     pub nodes: Vec<ToyNode>,
     rng: Xoshiro256pp,
@@ -163,8 +221,7 @@ impl Sim {
             seed,
             now: Time::from_nanos(0),
             config,
-            queue: BinaryHeap::new(),
-            next_tie_seq: 0,
+            queue: EventQueue::new(),
             recorder: Recorder::new(seed, level),
             nodes,
             rng: Xoshiro256pp::stream(seed, "sim", 0),
@@ -172,12 +229,7 @@ impl Sim {
     }
 
     pub fn schedule(&mut self, at: Time, event: SimEvent) {
-        let tie_seq = self.next_tie_seq;
-        self.next_tie_seq = self
-            .next_tie_seq
-            .checked_add(1)
-            .expect("invariant: scheduler tie sequence overflow");
-        self.queue.push(QueueItem { at, tie_seq, event });
+        self.queue.schedule(at, event);
     }
 
     pub fn seed_toy_ticks(&mut self) {
@@ -298,11 +350,43 @@ pub enum DiskFault {
     TornNextWrite { prefix_len: usize },
 }
 
+/// Persistent deterministic service time added to disk operations.  This is
+/// deliberately separate from one-shot faults: a latency experiment must not
+/// silently turn into an EIO injection after its first write.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SlowDisk {
+    pub read_extra: Duration,
+    pub write_extra: Duration,
+    pub fsync_extra: Duration,
+    pub rename_extra: Duration,
+    pub dirsync_extra: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiskOperation {
+    Read,
+    Write,
+    Fsync,
+    Rename,
+    SyncDir,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SimFile {
     id: FileId,
     visible: Vec<u8>,
     durable: Vec<u8>,
+    /// Checksum recorded by the last successful fsync.  Keeping this
+    /// separately lets the simulator model an at-rest bit flip as corruption
+    /// that a recovery/read boundary must notice, rather than silently
+    /// handing the altered byte to the caller.
+    durable_crc32c: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BitRot {
+    file: FileId,
+    offset: u64,
 }
 
 /// A deterministic page-cache disk. Writes are visible before fsync; crash
@@ -311,6 +395,10 @@ struct SimFile {
 pub struct SimDisk {
     files: Vec<SimFile>,
     fault: Option<DiskFault>,
+    slow: SlowDisk,
+    enospc: bool,
+    quota: Option<u64>,
+    bitrot: Option<BitRot>,
 }
 
 impl SimDisk {
@@ -319,6 +407,16 @@ impl SimDisk {
         Self {
             files: Vec::new(),
             fault: None,
+            slow: SlowDisk {
+                read_extra: Duration::from_nanos(0),
+                write_extra: Duration::from_nanos(0),
+                fsync_extra: Duration::from_nanos(0),
+                rename_extra: Duration::from_nanos(0),
+                dirsync_extra: Duration::from_nanos(0),
+            },
+            enospc: false,
+            quota: None,
+            bitrot: None,
         }
     }
 
@@ -326,7 +424,42 @@ impl SimDisk {
         self.fault = Some(fault);
     }
 
+    pub fn set_slow_disk(&mut self, slow: SlowDisk) {
+        self.slow = slow;
+    }
+
+    pub fn set_enospc(&mut self, enabled: bool) {
+        self.enospc = enabled;
+    }
+
+    pub fn set_quota(&mut self, quota: Option<u64>) {
+        self.quota = quota;
+    }
+
+    pub fn inject_bitrot(&mut self, file: FileId, offset: u64) {
+        self.bitrot = Some(BitRot { file, offset });
+    }
+
+    #[must_use]
+    pub const fn slow_disk(&self) -> SlowDisk {
+        self.slow
+    }
+
+    #[must_use]
+    pub const fn service_time(&self, operation: DiskOperation) -> Duration {
+        match operation {
+            DiskOperation::Read => self.slow.read_extra,
+            DiskOperation::Write => self.slow.write_extra,
+            DiskOperation::Fsync => self.slow.fsync_extra,
+            DiskOperation::Rename => self.slow.rename_extra,
+            DiskOperation::SyncDir => self.slow.dirsync_extra,
+        }
+    }
+
     pub fn write(&mut self, file: FileId, at: u64, bytes: &[u8]) -> Result<IoResult, IoError> {
+        if self.enospc {
+            return Err(IoError::Enospc);
+        }
         if matches!(self.fault, Some(DiskFault::EioNextWrite)) {
             self.fault = None;
             return Err(IoError::Eio);
@@ -335,11 +468,26 @@ impl SimDisk {
         if let Some(DiskFault::TornNextWrite { prefix_len }) = self.fault.take() {
             bytes_to_write.truncate(prefix_len.min(bytes_to_write.len()));
         }
-        let file_state = self.file_mut(file);
         let at = usize::try_from(at).map_err(|_| IoError::InvalidRange)?;
         let end = at
             .checked_add(bytes_to_write.len())
             .ok_or(IoError::InvalidRange)?;
+        let current_len = self
+            .files
+            .iter()
+            .find(|entry| entry.id == file)
+            .map_or(0, |entry| entry.visible.len());
+        let new_len = current_len.max(end);
+        if let Some(quota) = self.quota {
+            let allocated = self.visible_bytes();
+            let projected = allocated
+                .saturating_sub(u64::try_from(current_len).unwrap_or(u64::MAX))
+                .saturating_add(u64::try_from(new_len).unwrap_or(u64::MAX));
+            if projected > quota {
+                return Err(IoError::Enospc);
+            }
+        }
+        let file_state = self.file_mut(file);
         if file_state.visible.len() < end {
             file_state.visible.resize(end, 0);
         }
@@ -355,6 +503,7 @@ impl SimDisk {
             .iter()
             .find(|entry| entry.id == file)
             .ok_or(IoError::NotFound)?;
+        self.verify_file(file_state)?;
         let at = usize::try_from(at).map_err(|_| IoError::InvalidRange)?;
         let len = usize::try_from(len).map_err(|_| IoError::InvalidRange)?;
         let end = at.checked_add(len).ok_or(IoError::InvalidRange)?;
@@ -369,8 +518,30 @@ impl SimDisk {
             self.fault = None;
             return Err(IoError::Eio);
         }
-        let file_state = self.file_mut(file);
-        file_state.durable.clone_from(&file_state.visible);
+        let bitrot = if self.bitrot.is_some_and(|fault| fault.file == file) {
+            self.bitrot.take()
+        } else {
+            None
+        };
+        if let Some(fault) = bitrot {
+            let offset = usize::try_from(fault.offset).map_err(|_| IoError::InvalidRange)?;
+            let visible_len = self
+                .files
+                .iter()
+                .find(|entry| entry.id == file)
+                .map_or(0, |entry| entry.visible.len());
+            if offset >= visible_len {
+                return Err(IoError::InvalidRange);
+            }
+            let file_state = self.file_mut(file);
+            file_state.durable.clone_from(&file_state.visible);
+            file_state.durable_crc32c = crc32c(&file_state.durable);
+            file_state.durable[offset] ^= 1;
+        } else {
+            let file_state = self.file_mut(file);
+            file_state.durable.clone_from(&file_state.visible);
+            file_state.durable_crc32c = crc32c(&file_state.durable);
+        }
         Ok(IoResult::Fsynced)
     }
 
@@ -395,6 +566,28 @@ impl SimDisk {
             .map(|entry| entry.durable.as_slice())
     }
 
+    /// Verify the durable image before a recovery boundary.  Page-cache bytes
+    /// are intentionally not substituted here: after a crash only this image
+    /// is authoritative.
+    pub fn verify_durable(&self, file: FileId) -> Result<(), IoError> {
+        let file_state = self
+            .files
+            .iter()
+            .find(|entry| entry.id == file)
+            .ok_or(IoError::NotFound)?;
+        self.verify_file(file_state)
+    }
+
+    fn verify_file(&self, file: &SimFile) -> Result<(), IoError> {
+        if crc32c(&file.durable) == file.durable_crc32c {
+            Ok(())
+        } else {
+            Err(IoError::Corrupt(
+                "simulated durable checksum mismatch".to_owned(),
+            ))
+        }
+    }
+
     fn file_mut(&mut self, file: FileId) -> &mut SimFile {
         if let Some(index) = self.files.iter().position(|entry| entry.id == file) {
             return &mut self.files[index];
@@ -403,10 +596,17 @@ impl SimDisk {
             id: file,
             visible: Vec::new(),
             durable: Vec::new(),
+            durable_crc32c: crc32c(&[]),
         });
         self.files
             .last_mut()
             .expect("invariant: file inserted into disk")
+    }
+
+    fn visible_bytes(&self) -> u64 {
+        self.files.iter().fold(0_u64, |total, file| {
+            total.saturating_add(u64::try_from(file.visible.len()).unwrap_or(u64::MAX))
+        })
     }
 }
 
@@ -417,6 +617,10 @@ pub struct LinkConfig {
     pub drop: P16,
     pub duplicate: P16,
     pub max_inflight: u64,
+    /// Reservations are per scheduled datagram copy, including duplicates.
+    /// This prevents a small count of very large frames from escaping the
+    /// simulator's resource model.
+    pub max_inflight_bytes: u64,
 }
 
 impl Default for LinkConfig {
@@ -427,6 +631,7 @@ impl Default for LinkConfig {
             drop: P16::ZERO,
             duplicate: P16::ZERO,
             max_inflight: 4_096,
+            max_inflight_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -434,8 +639,10 @@ impl Default for LinkConfig {
 #[derive(Clone, Debug)]
 struct LinkState {
     config: LinkConfig,
+    injected_delay: Duration,
     blocked: bool,
     inflight: u64,
+    inflight_bytes: u64,
     rng: Xoshiro256pp,
 }
 
@@ -475,8 +682,10 @@ impl Network {
                         (*from, *to),
                         LinkState {
                             config,
+                            injected_delay: Duration::default(),
                             blocked: false,
                             inflight: 0,
+                            inflight_bytes: 0,
                             rng: Xoshiro256pp::stream(seed, "link", index),
                         },
                     );
@@ -512,6 +721,35 @@ impl Network {
         Ok(())
     }
 
+    /// Return the complete effective configuration of one directed link. The
+    /// theater uses this to display the simulator's value rather than a stale
+    /// UI-local slider value.
+    pub fn config(&self, from: NodeId, to: NodeId) -> Result<LinkConfig, NetworkError> {
+        self.links
+            .get(&(from, to))
+            .map(|link| link.config)
+            .ok_or(NetworkError::UnknownLink { from, to })
+    }
+
+    pub fn set_injected_delay(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        extra: Duration,
+    ) -> Result<(), NetworkError> {
+        self.links
+            .get_mut(&(from, to))
+            .ok_or(NetworkError::UnknownLink { from, to })?
+            .injected_delay = extra;
+        Ok(())
+    }
+
+    pub fn clear_injected_delays(&mut self) {
+        for link in self.links.values_mut() {
+            link.injected_delay = Duration::default();
+        }
+    }
+
     pub fn send(
         &mut self,
         now: Time,
@@ -523,9 +761,15 @@ impl Network {
             .links
             .get_mut(&(from, to))
             .ok_or(NetworkError::UnknownLink { from, to })?;
-        if link.blocked
-            || link.inflight >= link.config.max_inflight
-            || link.rng.chance(link.config.drop)
+        if link.blocked || link.rng.chance(link.config.drop) {
+            return Ok(vec![NetworkDecision::Dropped]);
+        }
+        let duplicated = link.rng.chance(link.config.duplicate);
+        let copies = if duplicated { 2_u64 } else { 1 };
+        let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        let reserve_bytes = bytes.saturating_mul(copies);
+        if link.inflight.saturating_add(copies) > link.config.max_inflight
+            || link.inflight_bytes.saturating_add(reserve_bytes) > link.config.max_inflight_bytes
         {
             return Ok(vec![NetworkDecision::Dropped]);
         }
@@ -533,19 +777,22 @@ impl Network {
             .config
             .base_delay
             .checked_add(link.rng.sample_delay(link.config.jitter))
+            .and_then(|delay| delay.checked_add(link.injected_delay))
             .expect("invariant: network delay must not overflow virtual time");
-        link.inflight += 1;
+        link.inflight += copies;
+        link.inflight_bytes = link.inflight_bytes.saturating_add(reserve_bytes);
         let mut decisions = vec![NetworkDecision::Delivered(Delivery {
             at: now + delay,
             from,
             to,
             payload: payload.clone(),
         })];
-        if link.rng.chance(link.config.duplicate) {
+        if duplicated {
             let duplicate_delay = link
                 .config
                 .base_delay
                 .checked_add(link.rng.sample_delay(link.config.jitter))
+                .and_then(|delay| delay.checked_add(link.injected_delay))
                 .expect("invariant: network delay must not overflow virtual time");
             decisions.push(NetworkDecision::Delivered(Delivery {
                 at: now + duplicate_delay,
@@ -557,13 +804,24 @@ impl Network {
         Ok(decisions)
     }
 
-    pub fn complete(&mut self, from: NodeId, to: NodeId) -> Result<(), NetworkError> {
+    pub fn complete(&mut self, from: NodeId, to: NodeId, bytes: usize) -> Result<(), NetworkError> {
         let link = self
             .links
             .get_mut(&(from, to))
             .ok_or(NetworkError::UnknownLink { from, to })?;
         link.inflight = link.inflight.saturating_sub(1);
+        link.inflight_bytes = link
+            .inflight_bytes
+            .saturating_sub(u64::try_from(bytes).unwrap_or(u64::MAX));
         Ok(())
+    }
+
+    pub fn inflight(&self, from: NodeId, to: NodeId) -> Result<(u64, u64), NetworkError> {
+        let link = self
+            .links
+            .get(&(from, to))
+            .ok_or(NetworkError::UnknownLink { from, to })?;
+        Ok((link.inflight, link.inflight_bytes))
     }
 }
 
@@ -631,10 +889,70 @@ pub enum FaultAction {
         node: NodeId,
         write_latency: Duration,
     },
+    /// Persistently delay selected node disk operations. A zero value clears
+    /// that operation's additional service time.
+    SlowDisk {
+        node: NodeId,
+        slow: SlowDisk,
+    },
+    /// Every growth write fails from this point until an operator clears it.
+    EnospcFrom {
+        node: NodeId,
+    },
+    /// Flip one durable byte after the selected fsync and before recovery.
+    BitRotAtRest {
+        node: NodeId,
+        file: FileId,
+        offset: u64,
+    },
+    /// Lower the node's data-directory allocation cap. This is a persistent
+    /// model constraint, not an ambient host filesystem limit.
+    DiskQuota {
+        node: NodeId,
+        bytes: u64,
+    },
     LinkDegrade {
         from: NodeId,
         to: NodeId,
         config: LinkConfig,
+    },
+    /// Flip one bit after CCPF framing on a deterministic per-link outbound
+    /// ordinal. This exercises the transport CRC boundary, not Raft.
+    CorruptFrame {
+        from: NodeId,
+        to: NodeId,
+        nth: u64,
+        byte: usize,
+        bit: u8,
+    },
+    TruncateFrame {
+        from: NodeId,
+        to: NodeId,
+        nth: u64,
+        keep: usize,
+    },
+    /// Deliver the previously sent complete frame on this link a second time
+    /// when the selected outbound ordinal is observed.
+    ReplayFrame {
+        from: NodeId,
+        to: NodeId,
+        nth: u64,
+        at: Time,
+    },
+    /// Add deterministic latency to every datagram on one directed link until
+    /// `Heal` clears the injected delay.
+    DelayLink {
+        from: NodeId,
+        to: NodeId,
+        extra: Duration,
+    },
+    /// Change the decoded CCRP value bytes and then recompute the enclosing
+    /// CCPF checksum. This deliberately reaches the CCRP decoder.
+    MutateRaftAndRechecksum {
+        from: NodeId,
+        to: NodeId,
+        nth: u64,
+        mutation: CcrpMutation,
     },
     /// Move the voting set to `voters` via one joint-consensus transition. The
     /// simulator only carries the node ids; what a joint config means is the
@@ -642,6 +960,19 @@ pub enum FaultAction {
     Reconfigure {
         voters: Vec<NodeId>,
     },
+}
+
+/// Bounded, location-aware malformed CCRP mutations used only by the
+/// deterministic transport fault profile. They are values instead of raw byte
+/// offsets so campaigns remain stable if the outer framing changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CcrpMutation {
+    MessageTag(u8),
+    AppendEntryCount(u32),
+    EntryPayloadLength(u32),
+    OptionFlag(u8),
+    FromNodeId(u64),
+    Truncate(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -889,6 +1220,57 @@ pub fn materialize_fault_plan(
                 },
             });
         }
+        if matches!(profile, FaultProfile::Corruption) {
+            // Install all transport faults before the initial tick. Their
+            // ordinals are global per-link counters, so selecting the first
+            // four outbound frames makes the profile reach all decoder paths
+            // without depending on timing or a random draw at delivery time.
+            plan.push(FaultAt {
+                at: Time::from_nanos(0),
+                action: FaultAction::CorruptFrame {
+                    from: first,
+                    to: second,
+                    nth: 1,
+                    byte: 14,
+                    bit: 0,
+                },
+            });
+            plan.push(FaultAt {
+                at: Time::from_nanos(0),
+                action: FaultAction::TruncateFrame {
+                    from: first,
+                    to: second,
+                    nth: 2,
+                    keep: 4,
+                },
+            });
+            plan.push(FaultAt {
+                at: Time::from_nanos(0),
+                action: FaultAction::MutateRaftAndRechecksum {
+                    from: first,
+                    to: second,
+                    nth: 3,
+                    mutation: CcrpMutation::MessageTag(255),
+                },
+            });
+            plan.push(FaultAt {
+                at: Time::from_nanos(0),
+                action: FaultAction::ReplayFrame {
+                    from: first,
+                    to: second,
+                    nth: 4,
+                    at: Time::from_nanos(span / 2),
+                },
+            });
+            plan.push(FaultAt {
+                at: Time::from_nanos(0),
+                action: FaultAction::DelayLink {
+                    from: first,
+                    to: second,
+                    extra: Duration::from_millis(20),
+                },
+            });
+        }
     }
     // §7.3's rule is `end_time − 30× election timeout`, but a short campaign run
     // is shorter than that margin. Clamping to a fraction of the run keeps the
@@ -917,6 +1299,7 @@ pub enum NodeStatus {
     Up,
     Crashed,
     Wiped,
+    StorageFault,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -985,7 +1368,16 @@ impl Lifecycle {
             FaultAction::Partition { .. }
             | FaultAction::Heal
             | FaultAction::DiskDegrade { .. }
+            | FaultAction::SlowDisk { .. }
+            | FaultAction::EnospcFrom { .. }
+            | FaultAction::BitRotAtRest { .. }
+            | FaultAction::DiskQuota { .. }
             | FaultAction::LinkDegrade { .. }
+            | FaultAction::CorruptFrame { .. }
+            | FaultAction::TruncateFrame { .. }
+            | FaultAction::ReplayFrame { .. }
+            | FaultAction::DelayLink { .. }
+            | FaultAction::MutateRaftAndRechecksum { .. }
             | FaultAction::Reconfigure { .. } => {}
         }
     }
@@ -1010,7 +1402,16 @@ mod plan_coverage_tests {
             FaultAction::Wipe { .. } => "wipe",
             FaultAction::ClockSkew { .. } => "clock-skew",
             FaultAction::DiskDegrade { .. } => "disk-degrade",
+            FaultAction::SlowDisk { .. } => "slow-disk",
+            FaultAction::EnospcFrom { .. } => "enospc-from",
+            FaultAction::BitRotAtRest { .. } => "bitrot-at-rest",
+            FaultAction::DiskQuota { .. } => "disk-quota",
             FaultAction::LinkDegrade { .. } => "link-degrade",
+            FaultAction::CorruptFrame { .. } => "corrupt-frame",
+            FaultAction::TruncateFrame { .. } => "truncate-frame",
+            FaultAction::ReplayFrame { .. } => "replay-frame",
+            FaultAction::DelayLink { .. } => "delay-link",
+            FaultAction::MutateRaftAndRechecksum { .. } => "mutate-raft-and-rechecksum",
             FaultAction::Reconfigure { .. } => "reconfigure",
         }
     }
@@ -1027,6 +1428,7 @@ mod plan_coverage_tests {
                 FaultProfile::Rough,
                 FaultProfile::Brutal,
                 FaultProfile::Membership,
+                FaultProfile::Corruption,
                 FaultProfile::Wipe,
             ] {
                 for seed in 0..64_u64 {
@@ -1067,6 +1469,7 @@ mod plan_coverage_tests {
         for profile in [
             FaultProfile::Rough,
             FaultProfile::Brutal,
+            FaultProfile::Corruption,
             FaultProfile::Membership,
             FaultProfile::Wipe,
         ] {
@@ -1088,6 +1491,11 @@ mod plan_coverage_tests {
             "clock-skew",
             "disk-degrade",
             "link-degrade",
+            "corrupt-frame",
+            "truncate-frame",
+            "replay-frame",
+            "delay-link",
+            "mutate-raft-and-rechecksum",
             "reconfigure",
         ] {
             assert!(kinds.contains(expected), "{expected} is never generated");
@@ -1106,28 +1514,20 @@ mod tests {
 
     #[test]
     fn equal_time_events_use_insertion_order() {
-        let mut sim = Sim::new(Seed::new(1), SimConfig::default(), RecorderLevel::Gate);
-        sim.schedule(
-            Time::from_nanos(5),
-            SimEvent::Tick {
-                target: Target::Node(NodeId::new(2)),
-            },
+        let mut events = EventQueue::new();
+        events.schedule(Time::from_nanos(5), "first");
+        events.schedule(Time::from_nanos(5), "second");
+        events.schedule(Time::from_nanos(5), "third");
+        events.schedule(Time::from_nanos(6), "later");
+        assert_eq!(
+            [
+                events.pop().expect("first event").event,
+                events.pop().expect("second event").event,
+                events.pop().expect("third event").event,
+                events.pop().expect("fourth event").event,
+            ],
+            ["first", "second", "third", "later"]
         );
-        sim.schedule(
-            Time::from_nanos(5),
-            SimEvent::Tick {
-                target: Target::Node(NodeId::new(1)),
-            },
-        );
-        sim.schedule(
-            Time::from_nanos(5),
-            SimEvent::Tick {
-                target: Target::Node(NodeId::new(2)),
-            },
-        );
-        let trace = sim.run_toy().expect("run completes");
-        assert_eq!(trace.events[0].node, Some(NodeId::new(2)));
-        assert_eq!(trace.events[1].node, Some(NodeId::new(1)));
     }
 
     #[test]
@@ -1159,6 +1559,86 @@ mod tests {
         disk.crash();
         assert_eq!(disk.durable(first), Some(b"x".as_slice()));
         assert_eq!(disk.durable(second), Some([].as_slice()));
+    }
+
+    #[test]
+    fn slow_disk_is_persistent_and_operation_specific() {
+        let mut disk = SimDisk::new();
+        let slow = SlowDisk {
+            read_extra: Duration::from_millis(1),
+            write_extra: Duration::from_millis(2),
+            fsync_extra: Duration::from_millis(3),
+            rename_extra: Duration::from_millis(4),
+            dirsync_extra: Duration::from_millis(5),
+        };
+        disk.set_slow_disk(slow);
+        assert_eq!(
+            disk.service_time(DiskOperation::Read),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            disk.service_time(DiskOperation::Write),
+            Duration::from_millis(2)
+        );
+        assert_eq!(
+            disk.service_time(DiskOperation::Fsync),
+            Duration::from_millis(3)
+        );
+        assert_eq!(
+            disk.service_time(DiskOperation::Rename),
+            Duration::from_millis(4)
+        );
+        assert_eq!(
+            disk.service_time(DiskOperation::SyncDir),
+            Duration::from_millis(5)
+        );
+        let file = cc_env::FileId::Wal { segment: 0 };
+        disk.write(file, 0, b"durable").expect("write");
+        disk.fsync(file).expect("fsync");
+        assert_eq!(
+            disk.slow_disk(),
+            slow,
+            "ordinary I/O must not consume latency"
+        );
+    }
+
+    #[test]
+    fn disk_quota_and_enospc_reject_growth_without_corrupting_existing_bytes() {
+        let mut disk = SimDisk::new();
+        let file = cc_env::FileId::Wal { segment: 0 };
+        disk.set_quota(Some(3));
+        disk.write(file, 0, b"abc").expect("within quota");
+        assert_eq!(disk.write(file, 3, b"d"), Err(IoError::Enospc));
+        disk.write(file, 1, b"Z").expect("overwrite is not growth");
+        disk.fsync(file).expect("fsync");
+        assert_eq!(disk.durable(file), Some(b"aZc".as_slice()));
+        disk.set_enospc(true);
+        assert_eq!(disk.write(file, 0, b"x"), Err(IoError::Enospc));
+        assert_eq!(disk.durable(file), Some(b"aZc".as_slice()));
+    }
+
+    #[test]
+    fn bitrot_flips_one_durable_byte_after_the_selected_fsync() {
+        let mut disk = SimDisk::new();
+        let file = cc_env::FileId::Wal { segment: 0 };
+        disk.write(file, 0, b"stable").expect("write");
+        disk.inject_bitrot(file, 2);
+        disk.fsync(file).expect("fsync with bit rot");
+        assert_eq!(disk.durable(file), Some(b"st`ble".as_slice()));
+        disk.crash();
+        assert_eq!(
+            disk.read(file, 0, 6),
+            Err(IoError::Corrupt(
+                "simulated durable checksum mismatch".to_owned()
+            )),
+            "an at-rest corruption must fail closed rather than be served"
+        );
+        assert_eq!(
+            disk.verify_durable(file),
+            Err(IoError::Corrupt(
+                "simulated durable checksum mismatch".to_owned()
+            ))
+        );
     }
 
     #[test]
@@ -1206,6 +1686,33 @@ mod tests {
                 .count()
                 >= 1
         );
+        assert_eq!(network.inflight(nodes[0], nodes[1]), Ok((2, 2)));
+        for decision in decisions {
+            if let NetworkDecision::Delivered(delivery) = decision {
+                network
+                    .complete(nodes[0], nodes[1], delivery.payload.len())
+                    .expect("complete");
+            }
+        }
+        assert_eq!(network.inflight(nodes[0], nodes[1]), Ok((0, 0)));
+    }
+
+    #[test]
+    fn network_byte_cap_applies_to_each_duplicate_copy() {
+        let nodes = [NodeId::new(1), NodeId::new(2)];
+        let config = LinkConfig {
+            duplicate: P16::MAX,
+            max_inflight_bytes: 7,
+            ..LinkConfig::default()
+        };
+        let mut network = Network::new(&nodes, Seed::new(5), config);
+        assert_eq!(
+            network
+                .send(Time::from_nanos(0), nodes[0], nodes[1], vec![7; 4])
+                .expect("send"),
+            vec![NetworkDecision::Dropped]
+        );
+        assert_eq!(network.inflight(nodes[0], nodes[1]), Ok((0, 0)));
     }
 
     #[test]
@@ -1224,7 +1731,7 @@ mod tests {
             .send(Time::from_nanos(0), nodes[0], nodes[1], vec![2])
             .expect("second send");
         assert_eq!(second, vec![NetworkDecision::Dropped]);
-        network.complete(nodes[0], nodes[1]).expect("complete");
+        network.complete(nodes[0], nodes[1], 1).expect("complete");
         assert!(matches!(
             network
                 .send(Time::from_nanos(0), nodes[0], nodes[1], vec![3])

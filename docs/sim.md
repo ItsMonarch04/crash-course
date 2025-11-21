@@ -22,11 +22,35 @@ trace exported from another tool — hand the TSV to the checker directly:
 ```
 
 The theater includes guided figure-8, asymmetric-election, thundering-herd,
-and snapshot-catch-up lessons. Cluster size is part of the scenario: the
+and retained-log recovery lessons. Cluster size is part of the scenario: the
 control offers 3, 5, and 7 voters and rebuilds the engine at the chosen size,
 which `#nodes=7` also selects. An embeddable view uses the same live engine:
 append `#embed=1&seed=0x...&profile=rough` to the theater URL. It removes the
 chrome, not the simulator.
+
+The Theater's packet-loss slider targets the displayed directed link. It
+accepts an integer percentage from 0 through 100, converts it to the
+simulator's `P16` drop probability with nearest-integer rounding, and displays
+the inverse-rounded effective value read back from that link. The control
+therefore records a real `LinkDegrade` action in the shared scenario, rather
+than changing only a browser label.
+
+The disk-latency slider targets the selected node and records a persistent
+`SlowDisk` fault. Its 0–5,000 ms value configures the simulator's independent
+read, write, fsync, rename, and directory-sync delay fields. For the current
+Raft WAL path, write and fsync are separate scheduled completions: the node
+defers its own subsequent inputs and cannot send a dependent vote, append
+response, or client reply until the delayed fsync succeeds. Zero clears the
+additional delay. This is distinct from the `DiskDegrade` one-shot EIO fault
+used in fault profiles; N3's file-backed store will consume the remaining
+operation categories.
+
+Persistent storage faults are explicit scenario data as well: `EnospcFrom`
+rejects later space-growing writes, `DiskQuota` caps the simulated allocated
+bytes, and `BitRotAtRest` flips one byte immediately after its selected fsync.
+The simulator keeps the pre-flip durable checksum, so the next read or restart
+detects that corruption and places the node in `StorageFault`; it is never
+served as a plausible value.
 
 ## Gallery submissions
 

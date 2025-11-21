@@ -12,7 +12,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 cc-checker = { path = "../cc-checker" }
-cc-cluster = { path = "../cc-cluster" }
 cc-core = { path = "../cc-core" }
 cc-raft = { path = "../cc-raft" }
 cc-sim = { path = "../cc-sim" }

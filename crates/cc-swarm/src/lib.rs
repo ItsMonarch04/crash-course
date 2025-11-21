@@ -4,27 +4,35 @@
 #![forbid(unsafe_code)]
 #![doc = "The real deterministic cluster fixture used by cc-swarm and later theater work."]
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+mod ledger;
+pub use ledger::{
+    LEDGER_COLUMNS, LEDGER_HEADER, LedgerError, LedgerKey, LedgerRow, LedgerVerdict, SeedLedger,
+    Shard, ShardError,
+};
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use cc_checker::{
     CheckerConfig, History, LivenessReport, Operation, OperationKind, Outcome, Verdict, check,
     check_liveness,
 };
-use cc_cluster::{Node, NodeConfig, NodeEffect, NodeError, NodeInput};
+use cc_cluster::{NodeConfig, NodeError, RecoveredNode};
 use cc_core::{
-    ClientId, Duration, EventKind, NodeId, Seed, Time, TimerId, Trace, Xoshiro256pp, fnv1a,
+    ClientId, ClusterPolicy, Duration, EventKind, HostLimits, NodeId, Seed, Time, TimerId, Trace,
+    Xoshiro256pp, fnv1a,
 };
-use cc_env::FileId;
-use cc_kv::{KvCommand, KvReply};
-use cc_raft::{Entry, RaftConfig, Role, TimerKind};
+use cc_env::{Effect, FileId, Input, IoResult, WireMsg, decode_peer_frame, encode_peer_frame};
+use cc_host::{BootState, Driver, DriverPoll, HostError};
+use cc_kv::{KvCommand, KvReply, decode_reply, encode_command};
+use cc_raft::{RaftConfig, Role};
 use cc_sim::{
-    DiskFault, FaultAction, FaultAt, FaultPlan, FaultProfile, LinkConfig, Network, NetworkDecision,
-    Recorder, RecorderLevel, RunError, RunSpec, SimConfig, SimDisk, WorkloadActor,
-    WorkloadOperation, canonicalize_fault_plan, shrink_fault_plan,
+    CcrpMutation, DiskFault, DiskOperation, EventQueue, FaultAction, FaultAt, FaultPlan,
+    FaultProfile, LinkConfig, Network, NetworkDecision, Recorder, RecorderLevel, RunError, RunSpec,
+    SimConfig, SimDisk, WorkloadActor, WorkloadOperation, canonicalize_fault_plan,
+    shrink_fault_plan,
 };
-use cc_store::StoreConfig;
+use cc_store::{MemoryBlockSource, StoreConfig};
 
 pub const MAX_OPERATIONS_PER_RUN: u64 = 32;
 pub const REACHABILITY_BEACONS: [&str; 6] = [
@@ -44,12 +52,9 @@ const CLIENT_RETRY: Duration = Duration::from_millis(25);
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(750);
 /// How long a joint config is left open before the host closes it.
 const JOINT_SETTLE: Duration = Duration::from_millis(500);
+const JOINT_RETRY: Duration = Duration::from_millis(50);
 const FIRST_CLIENT_TIME: Duration = Duration::from_secs(1);
 const WAL_FILE: FileId = FileId::Wal { segment: 0 };
-/// `version u64 | term u64 | voted_for u64`, rewritten in place on every
-/// `PersistHard`. Log records are appended after it.
-const WAL_HARD_STATE_LEN: u64 = 24;
-const WAL_HARD_STATE_VERSION: u64 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ClusterEventKind {
@@ -57,12 +62,14 @@ enum ClusterEventKind {
     Timer {
         node: NodeId,
         id: TimerId,
-        kind: TimerKind,
+        generation: u64,
     },
     Message {
-        token: u64,
         from: NodeId,
         to: NodeId,
+        frame: Vec<u8>,
+        charged: bool,
+        expected_rejection: bool,
     },
     ClientIssue {
         client: u64,
@@ -71,50 +78,81 @@ enum ClusterEventKind {
     },
     ClientTimeout(u64),
     Fault(FaultAction),
+    /// A node durability barrier has completed its write half. The fsync is
+    /// scheduled separately so a persistent SlowDisk delay belongs to the
+    /// operation being serviced, never to the next unrelated input.
+    DiskWriteComplete {
+        node: NodeId,
+        file: FileId,
+        at: u64,
+        bytes: Vec<u8>,
+        id: cc_core::IoId,
+    },
+    DiskFsyncComplete {
+        node: NodeId,
+        file: FileId,
+        id: cc_core::IoId,
+    },
+    DeferredInput {
+        node: NodeId,
+        input: Input,
+    },
     /// Second half of a joint-consensus transition, scheduled by the host once
     /// the joint config has had time to replicate.
     LeaveJoint(NodeId),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ClusterEvent {
-    at: Time,
-    tie_seq: u64,
-    kind: ClusterEventKind,
-}
-
-impl Ord for ClusterEvent {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .at
-            .cmp(&self.at)
-            .then_with(|| other.tie_seq.cmp(&self.tie_seq))
-    }
-}
-
-impl PartialOrd for ClusterEvent {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 struct NodeSlot {
     config: NodeConfig,
-    node: Option<Node>,
+    genesis: cc_log::Genesis,
+    driver: Option<Driver>,
     status: cc_sim::NodeStatus,
     clock_offset: Duration,
     disk: SimDisk,
-    armed_timers: BTreeMap<TimerId, Time>,
-    /// Byte offset of each log index inside `WAL_FILE`, so a conflicting append
-    /// or a `TruncateSuffix` can rewind the log to a real byte boundary.
-    entry_offsets: BTreeMap<u64, u64>,
+    blocks: MemoryBlockSource,
+    /// End of the verified `cc-log` framed durable stream.  Every simulator
+    /// persistence operation appends one canonical CCLR record or record
+    /// batch; recovery owns the semantic replay of that prefix.
     wal_end: u64,
+    /// The Driver owns the continuation; this host-only deadline prevents a
+    /// later simulated arrival from calling into that Driver before its
+    /// scheduled write/fsync completion is delivered.
+    persistence_ready_at: Option<Time>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CorruptFrameFault {
+    nth: u64,
+    byte: usize,
+    bit: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FrameFault {
+    Corrupt(CorruptFrameFault),
+    Truncate { nth: u64, keep: usize },
+    Mutate { nth: u64, mutation: CcrpMutation },
+}
+
+impl FrameFault {
+    const fn nth(self) -> u64 {
+        match self {
+            Self::Corrupt(fault) => fault.nth,
+            Self::Truncate { nth, .. } => nth,
+            Self::Mutate { nth, .. } => nth,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplayFrameFault {
+    nth: u64,
+    at: Time,
 }
 
 impl NodeSlot {
     fn reset_wal(&mut self) {
-        self.entry_offsets.clear();
-        self.wal_end = WAL_HARD_STATE_LEN;
+        self.wal_end = 0;
     }
 }
 
@@ -147,6 +185,7 @@ pub struct ClusterNodeSnapshot {
     pub commit: u64,
     pub applied: u64,
     pub durable_bytes: u64,
+    pub disk_service_delay_ns: u64,
     pub log_tail: Vec<u64>,
     pub voters: Vec<u64>,
     pub joint: bool,
@@ -274,13 +313,10 @@ pub fn sequence_diagram_svg(trace: &Trace) -> String {
         let from = event.node.map_or(1, NodeId::get);
         let from_x = 80_u64.saturating_add(from.saturating_sub(1).saturating_mul(140));
         if event.kind == EventKind::NetSend {
-            let payload = String::from_utf8_lossy(&event.payload);
-            let to = payload
-                .split_once('>')
-                .and_then(|(_, tail)| tail.split(':').next())
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(from);
-            let to_x = 80_u64.saturating_add(to.saturating_sub(1).saturating_mul(140));
+            // Transport trace payloads are binary fingerprints, not a display
+            // string protocol. Keep the visual anchored at the sender rather
+            // than parsing the former `from>to:{kind:?}` debug payload.
+            let to_x = from_x;
             svg.push_str(&format!("<line class=\"msg\" x1=\"{from_x}\" y1=\"{y}\" x2=\"{to_x}\" y2=\"{y}\"/><text x=\"{}\" y=\"{}\" text-anchor=\"middle\">send #{}</text>", (from_x + to_x) / 2, y.saturating_sub(4), event.seq));
         } else {
             svg.push_str(&format!("<circle class=\"event\" cx=\"{from_x}\" cy=\"{y}\" r=\"4\"/><text x=\"{}\" y=\"{}\">{} #{}</text>", from_x.saturating_add(8), y.saturating_add(4), event.kind.as_str(), event.seq));
@@ -452,16 +488,167 @@ fn fault_action_json(action: &FaultAction) -> String {
             node.get(),
             write_latency.as_nanos()
         ),
+        FaultAction::SlowDisk { node, slow } => format!(
+            "{{\"kind\":\"slow-disk\",\"node\":{},\"read_extra_ns\":{},\"write_extra_ns\":{},\"fsync_extra_ns\":{},\"rename_extra_ns\":{},\"dirsync_extra_ns\":{}}}",
+            node.get(),
+            slow.read_extra.as_nanos(),
+            slow.write_extra.as_nanos(),
+            slow.fsync_extra.as_nanos(),
+            slow.rename_extra.as_nanos(),
+            slow.dirsync_extra.as_nanos(),
+        ),
+        FaultAction::EnospcFrom { node } => {
+            format!("{{\"kind\":\"enospc-from\",\"node\":{}}}", node.get())
+        }
+        FaultAction::BitRotAtRest { node, file, offset } => {
+            let (kind, number) = file_id_json(*file);
+            format!(
+                "{{\"kind\":\"bitrot-at-rest\",\"node\":{},\"file_kind\":\"{kind}\",\"file_no\":{number},\"offset\":{}}}",
+                node.get(),
+                offset,
+            )
+        }
+        FaultAction::DiskQuota { node, bytes } => format!(
+            "{{\"kind\":\"disk-quota\",\"node\":{},\"bytes\":{}}}",
+            node.get(),
+            bytes,
+        ),
         FaultAction::LinkDegrade { from, to, .. } => format!(
             "{{\"kind\":\"link-degrade\",\"from\":{},\"to\":{}}}",
             from.get(),
             to.get()
+        ),
+        FaultAction::CorruptFrame {
+            from,
+            to,
+            nth,
+            byte,
+            bit,
+        } => format!(
+            "{{\"kind\":\"corrupt-frame\",\"from\":{},\"to\":{},\"nth\":{},\"byte\":{},\"bit\":{}}}",
+            from.get(),
+            to.get(),
+            nth,
+            byte,
+            bit,
+        ),
+        FaultAction::TruncateFrame {
+            from,
+            to,
+            nth,
+            keep,
+        } => format!(
+            "{{\"kind\":\"truncate-frame\",\"from\":{},\"to\":{},\"nth\":{},\"keep\":{}}}",
+            from.get(),
+            to.get(),
+            nth,
+            keep,
+        ),
+        FaultAction::ReplayFrame { from, to, nth, at } => format!(
+            "{{\"kind\":\"replay-frame\",\"from\":{},\"to\":{},\"nth\":{},\"at_ns\":{}}}",
+            from.get(),
+            to.get(),
+            nth,
+            at.as_nanos(),
+        ),
+        FaultAction::DelayLink { from, to, extra } => format!(
+            "{{\"kind\":\"delay-link\",\"from\":{},\"to\":{},\"extra_ns\":{}}}",
+            from.get(),
+            to.get(),
+            extra.as_nanos(),
+        ),
+        FaultAction::MutateRaftAndRechecksum {
+            from,
+            to,
+            nth,
+            mutation,
+        } => format!(
+            "{{\"kind\":\"mutate-raft-and-rechecksum\",\"from\":{},\"to\":{},\"nth\":{},\"mutation\":\"{}\"}}",
+            from.get(),
+            to.get(),
+            nth,
+            ccrp_mutation_json(*mutation),
         ),
         FaultAction::Reconfigure { voters } => format!(
             "{{\"kind\":\"reconfigure\",\"voters\":{}}}",
             node_ids_json(voters)
         ),
     }
+}
+
+fn ccrp_mutation_json(mutation: CcrpMutation) -> String {
+    match mutation {
+        CcrpMutation::MessageTag(value) => format!("message-tag:{value}"),
+        CcrpMutation::AppendEntryCount(value) => format!("append-entry-count:{value}"),
+        CcrpMutation::EntryPayloadLength(value) => format!("entry-payload-length:{value}"),
+        CcrpMutation::OptionFlag(value) => format!("option-flag:{value}"),
+        CcrpMutation::FromNodeId(value) => format!("from-node-id:{value}"),
+        CcrpMutation::Truncate(value) => format!("truncate:{value}"),
+    }
+}
+
+const fn file_id_json(file: FileId) -> (&'static str, u64) {
+    match file {
+        FileId::Wal { segment } => ("wal", segment),
+        FileId::Sst { file_no } => ("sst", file_no),
+        FileId::Manifest { generation } => ("manifest", generation),
+        FileId::Snapshot { generation } => ("snapshot", generation),
+        FileId::Meta => ("meta", 0),
+        FileId::Temp { sequence } => ("temp", sequence),
+    }
+}
+
+/// Change a deliberately selected CCRP field and rebuild CCPF around it. The
+/// CCPF envelope therefore remains valid and the CCRP decoder is the component
+/// under test. Offsets are the fixed v1 CCRP layout and are checked before
+/// every write; a nonsensical mutation is a bad fault plan, never a panic.
+fn mutate_and_rechecksum(frame: &mut Vec<u8>, mutation: CcrpMutation) -> Result<(), ()> {
+    let (wire, used) = decode_peer_frame(frame).map_err(|_| ())?;
+    if used != frame.len() {
+        return Err(());
+    }
+    let mut payload = wire.payload;
+    const TAG: usize = 32;
+    const APPEND_COUNT: usize = 65;
+    const ENTRY_PAYLOAD_LENGTH: usize = 86;
+    const APPEND_RESPONSE_OPTION: usize = 42;
+    const FROM_NODE_ID: usize = 8;
+    match mutation {
+        CcrpMutation::MessageTag(tag) => *payload.get_mut(TAG).ok_or(())? = tag,
+        CcrpMutation::AppendEntryCount(count) => {
+            if payload.get(TAG).copied() != Some(5) || payload.len() < APPEND_COUNT + 4 {
+                return Err(());
+            }
+            payload[APPEND_COUNT..APPEND_COUNT + 4].copy_from_slice(&count.to_le_bytes());
+        }
+        CcrpMutation::EntryPayloadLength(length) => {
+            if payload.get(TAG).copied() != Some(5) || payload.len() < ENTRY_PAYLOAD_LENGTH + 4 {
+                return Err(());
+            }
+            payload[ENTRY_PAYLOAD_LENGTH..ENTRY_PAYLOAD_LENGTH + 4]
+                .copy_from_slice(&length.to_le_bytes());
+        }
+        CcrpMutation::OptionFlag(flag) => {
+            if payload.get(TAG).copied() != Some(6) || payload.len() <= APPEND_RESPONSE_OPTION {
+                return Err(());
+            }
+            payload[APPEND_RESPONSE_OPTION] = flag;
+        }
+        CcrpMutation::FromNodeId(id) => {
+            if payload.len() < FROM_NODE_ID + 8 {
+                return Err(());
+            }
+            payload[FROM_NODE_ID..FROM_NODE_ID + 8].copy_from_slice(&id.to_le_bytes());
+        }
+        CcrpMutation::Truncate(keep) => {
+            if keep >= payload.len() {
+                return Err(());
+            }
+            payload.truncate(keep);
+        }
+    }
+    *frame = encode_peer_frame(&WireMsg::new(wire.proto_version, payload)).map_err(|_| ())?;
+    Ok(())
 }
 
 fn node_ids_json(nodes: &[NodeId]) -> String {
@@ -502,6 +689,7 @@ fn verdict_json(verdict: &Verdict) -> String {
 pub enum ClusterError {
     Run(RunError),
     Node { node: NodeId, error: NodeError },
+    Host { node: NodeId, error: HostError },
     Network { from: NodeId, to: NodeId },
 }
 
@@ -510,9 +698,14 @@ impl fmt::Display for ClusterError {
         match self {
             Self::Run(error) => error.fmt(f),
             Self::Node { node, error } => write!(f, "node {node}: {error}"),
+            Self::Host { node, error } => write!(f, "host {node}: {error}"),
             Self::Network { from, to } => write!(f, "network link missing {from}->{to}"),
         }
     }
+}
+
+fn cluster_host_error(node: NodeId, error: HostError) -> ClusterError {
+    ClusterError::Host { node, error }
 }
 
 impl std::error::Error for ClusterError {}
@@ -527,18 +720,20 @@ impl From<RunError> for ClusterError {
 pub struct SimCluster {
     spec: RunSpec,
     now: Time,
-    events: BinaryHeap<ClusterEvent>,
-    next_tie_seq: u64,
-    next_message_token: u64,
+    events: EventQueue<ClusterEventKind>,
     next_operation_id: u64,
     processed_events: u64,
+    current_instant: Option<Time>,
+    events_at_instant: u64,
     total_issued: u64,
     had_leader: bool,
     recorder: Recorder,
     network: Network,
+    frame_ordinals: BTreeMap<(NodeId, NodeId), u64>,
+    frame_faults: BTreeMap<(NodeId, NodeId), Vec<FrameFault>>,
+    replay_faults: BTreeMap<(NodeId, NodeId), Vec<ReplayFrameFault>>,
+    replay_frames: BTreeMap<(NodeId, NodeId), Vec<u8>>,
     nodes: BTreeMap<NodeId, NodeSlot>,
-    voters: BTreeSet<NodeId>,
-    messages: BTreeMap<u64, cc_raft::Message>,
     pending: BTreeMap<u64, PendingOperation>,
     actors: BTreeMap<u64, WorkloadActor>,
     history: History,
@@ -549,6 +744,12 @@ impl SimCluster {
         let node_count = usize::try_from(spec.config.node_count).unwrap_or(0);
         let node_ids: Vec<NodeId> = (1..=node_count as u64).map(NodeId::new).collect();
         let voters: BTreeSet<NodeId> = node_ids.iter().copied().collect();
+        let bootstrap_membership =
+            cc_core::MembershipState::new(voters.clone()).map_err(|_| ClusterError::Node {
+                node: NodeId::new(1),
+                error: NodeError::Environment("invalid simulator membership"),
+            })?;
+        let cluster_id = simulated_cluster_id(spec.seed);
         let network = Network::new(&node_ids, spec.seed, link_config(spec.profile));
         let mut nodes = BTreeMap::new();
         for id in &node_ids {
@@ -563,20 +764,49 @@ impl SimCluster {
                     ..RaftConfig::default()
                 },
                 store: StoreConfig::default(),
+                policy: ClusterPolicy::default(),
+                host_limits: HostLimits::default(),
             };
-            let node = Node::new(config, voters.clone())
-                .map_err(|error| ClusterError::Node { node: *id, error })?;
+            let genesis = cc_log::Genesis {
+                origin: cc_log::Origin::Bootstrap,
+                cluster_id,
+                policy: config.policy,
+                membership: bootstrap_membership.clone(),
+            };
+            let genesis_bytes = cc_log::encode_framed_durable_record(
+                &cc_log::DurableRecord::Genesis(Box::new(genesis.clone())),
+            )
+            .map_err(|_| ClusterError::Node {
+                node: *id,
+                error: NodeError::Durability,
+            })?;
+            let mut disk = SimDisk::new();
+            disk.write(WAL_FILE, 0, &genesis_bytes)
+                .and_then(|_| disk.fsync(WAL_FILE))
+                .map_err(|_| ClusterError::Node {
+                    node: *id,
+                    error: NodeError::Durability,
+                })?;
+            let driver = Driver::boot_with_wal_offset(
+                config,
+                BootState::Fresh {
+                    bootstrap: bootstrap_membership.clone(),
+                },
+                u64::try_from(genesis_bytes.len()).unwrap_or(u64::MAX),
+            )
+            .map_err(|error| cluster_host_error(*id, error))?;
             nodes.insert(
                 *id,
                 NodeSlot {
                     config,
-                    node: Some(node),
+                    genesis,
+                    driver: Some(driver),
                     status: cc_sim::NodeStatus::Up,
                     clock_offset: Duration::default(),
-                    disk: SimDisk::new(),
-                    armed_timers: BTreeMap::new(),
-                    entry_offsets: BTreeMap::new(),
-                    wal_end: WAL_HARD_STATE_LEN,
+                    disk,
+                    blocks: MemoryBlockSource::default(),
+                    wal_end: u64::try_from(genesis_bytes.len()).unwrap_or(u64::MAX),
+                    persistence_ready_at: None,
                 },
             );
         }
@@ -584,17 +814,19 @@ impl SimCluster {
             recorder: Recorder::new(spec.seed, level),
             spec,
             now: Time::from_nanos(0),
-            events: BinaryHeap::new(),
-            next_tie_seq: 0,
-            next_message_token: 1,
+            events: EventQueue::new(),
             next_operation_id: 1,
             processed_events: 0,
+            current_instant: None,
+            events_at_instant: 0,
             total_issued: 0,
             had_leader: false,
             network,
+            frame_ordinals: BTreeMap::new(),
+            frame_faults: BTreeMap::new(),
+            replay_faults: BTreeMap::new(),
+            replay_frames: BTreeMap::new(),
             nodes,
-            voters,
-            messages: BTreeMap::new(),
             pending: BTreeMap::new(),
             actors: BTreeMap::new(),
             history: History::default(),
@@ -645,6 +877,14 @@ impl SimCluster {
         &self.spec
     }
 
+    /// Expose the applied transport configuration without exposing the
+    /// mutable network. Hosts can render the effective value after a typed
+    /// fault action instead of remembering what they asked for.
+    #[must_use]
+    pub fn link_config(&self, from: NodeId, to: NodeId) -> Option<LinkConfig> {
+        self.network.config(from, to).ok()
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> ClusterSnapshot {
         let nodes = self
@@ -652,10 +892,11 @@ impl SimCluster {
             .iter()
             .map(|(id, slot)| {
                 let (role, term, commit, applied, log_tail, voters, joint) =
-                    slot.node.as_ref().map_or(
+                    slot.driver.as_ref().map_or(
                         (Role::Follower, 0, 0, 0, Vec::new(), Vec::new(), false),
-                        |node| {
-                            let (voters, _, joint) = node.membership();
+                        |driver| {
+                            let node = driver.node();
+                            let (voters, _, joint) = driver.membership();
                             (
                                 node.role(),
                                 node.raft.hard_state.term.get(),
@@ -677,6 +918,7 @@ impl SimCluster {
                     .disk
                     .durable(WAL_FILE)
                     .map_or(0, |bytes| bytes.len() as u64);
+                let disk_service_delay_ns = slot.disk.slow_disk().write_extra.as_nanos();
                 ClusterNodeSnapshot {
                     id: id.get(),
                     status: slot.status,
@@ -685,6 +927,7 @@ impl SimCluster {
                     commit,
                     applied,
                     durable_bytes,
+                    disk_service_delay_ns,
                     log_tail,
                     voters,
                     joint,
@@ -715,7 +958,7 @@ impl SimCluster {
     }
 
     fn process_until(&mut self, limit: Time) -> Result<(), ClusterError> {
-        while self.events.peek().is_some_and(|event| event.at <= limit) {
+        while self.events.peek_time().is_some_and(|at| at <= limit) {
             let event = self
                 .events
                 .pop()
@@ -726,8 +969,20 @@ impl SimCluster {
                     limit: self.spec.config.max_events,
                 }));
             }
+            if self.current_instant == Some(event.at) {
+                self.events_at_instant = self.events_at_instant.saturating_add(1);
+            } else {
+                self.current_instant = Some(event.at);
+                self.events_at_instant = 1;
+            }
+            if self.events_at_instant > self.spec.config.max_events_per_instant {
+                return Err(ClusterError::Run(RunError::InstantLimit {
+                    at: event.at,
+                    limit: self.spec.config.max_events_per_instant,
+                }));
+            }
             self.now = event.at;
-            self.handle(event.kind)?;
+            self.handle(event.event)?;
         }
         self.now = limit;
         Ok(())
@@ -739,8 +994,8 @@ impl SimCluster {
             && self
                 .nodes
                 .values()
-                .filter_map(|slot| slot.node.as_ref())
-                .all(|node| node.raft.invariants().is_ok());
+                .filter_map(|slot| slot.driver.as_ref())
+                .all(|driver| driver.node().raft.invariants().is_ok());
         let verdict = check(
             &self.history,
             CheckerConfig {
@@ -764,7 +1019,8 @@ impl SimCluster {
             .nodes
             .iter()
             .map(|(id, slot)| {
-                let (last, applied) = slot.node.as_ref().map_or((0, 0), |node| {
+                let (last, applied) = slot.driver.as_ref().map_or((0, 0), |driver| {
+                    let node = driver.node();
                     (node.raft.last_index().get(), node.raft.applied_index.get())
                 });
                 (id.get(), last, applied)
@@ -824,17 +1080,25 @@ impl SimCluster {
 
     fn schedule(&mut self, at: Time, kind: ClusterEventKind) {
         if at <= self.spec.end_time {
-            let tie_seq = self.next_tie_seq;
-            self.next_tie_seq = self.next_tie_seq.saturating_add(1);
-            self.events.push(ClusterEvent { at, tie_seq, kind });
+            self.events.schedule(at, kind);
         }
     }
 
     fn handle(&mut self, event: ClusterEventKind) -> Result<(), ClusterError> {
         match event {
             ClusterEventKind::Tick(node) => self.handle_tick(node),
-            ClusterEventKind::Timer { node, id, kind } => self.handle_timer(node, id, kind),
-            ClusterEventKind::Message { token, from, to } => self.handle_message(token, from, to),
+            ClusterEventKind::Timer {
+                node,
+                id,
+                generation,
+            } => self.handle_timer(node, id, generation),
+            ClusterEventKind::Message {
+                from,
+                to,
+                frame,
+                charged,
+                expected_rejection,
+            } => self.handle_delivery(from, to, frame, charged, expected_rejection),
             ClusterEventKind::ClientIssue {
                 client,
                 sequence,
@@ -848,37 +1112,64 @@ impl SimCluster {
                 self.handle_fault(action)?;
                 Ok(())
             }
+            ClusterEventKind::DiskWriteComplete {
+                node,
+                file,
+                at,
+                bytes,
+                id,
+            } => self.handle_disk_write_complete(node, file, at, bytes, id),
+            ClusterEventKind::DiskFsyncComplete { node, file, id } => {
+                self.handle_disk_fsync_complete(node, file, id)
+            }
+            ClusterEventKind::DeferredInput { node, input } => {
+                if self.is_up(node) {
+                    self.drive_node(node, input)
+                } else {
+                    Ok(())
+                }
+            }
             ClusterEventKind::LeaveJoint(node) => self.handle_leave_joint(node),
         }
     }
 
-    /// Close a joint transition on the node that opened it, provided it is
-    /// still up and still leading. If it is not, the joint config stays open
-    /// and the next leader inherits it through the log.
-    fn handle_leave_joint(&mut self, node: NodeId) -> Result<(), ClusterError> {
-        if !self.is_up(node) {
+    /// Close a joint transition only through its current leader.  A leadership
+    /// change or an uncommitted EnterJoint is retried instead of letting an
+    /// arbitrary follower manufacture the paired configuration entry.
+    fn handle_leave_joint(&mut self, scheduled_node: NodeId) -> Result<(), ClusterError> {
+        let Some(node) = self.leader().filter(|id| {
+            self.nodes
+                .get(id)
+                .and_then(|slot| slot.driver.as_ref())
+                .is_some_and(|driver| driver.membership().2)
+        }) else {
+            self.schedule(
+                self.now + JOINT_RETRY,
+                ClusterEventKind::LeaveJoint(scheduled_node),
+            );
             return Ok(());
-        }
-        let leading_in_joint = self
-            .nodes
-            .get(&node)
-            .and_then(|slot| slot.node.as_ref())
-            .is_some_and(|node| node.role() == Role::Leader && node.membership().2);
-        if !leading_in_joint {
-            return Ok(());
-        }
+        };
+        let host_time = self.host_time(node);
         let effects = {
             let slot = self
                 .nodes
                 .get_mut(&node)
                 .expect("invariant: node slot exists");
-            let composition = slot
-                .node
+            let driver = slot
+                .driver
                 .as_mut()
-                .expect("invariant: up node has a composition");
-            composition
-                .leave_joint()
-                .map_err(|error| ClusterError::Node { node, error })?
+                .expect("invariant: up node has a driver");
+            match driver.leave_joint(host_time) {
+                Ok((_, effects)) => effects,
+                Err(HostError::Node(NodeError::Raft(cc_raft::RaftError::Busy))) => {
+                    self.schedule(
+                        self.now + JOINT_RETRY,
+                        ClusterEventKind::LeaveJoint(scheduled_node),
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(cluster_host_error(node, error)),
+            }
         };
         self.record(self.now, Some(node), EventKind::ConfChange, Vec::new());
         self.consume_effects(node, effects)
@@ -886,8 +1177,7 @@ impl SimCluster {
 
     fn handle_tick(&mut self, id: NodeId) -> Result<(), ClusterError> {
         if self.is_up(id) {
-            let input_time = self.host_time(id);
-            self.drive_node(id, NodeInput::Tick { now: input_time })?;
+            self.drive_node(id, Input::Tick)?;
         }
         Ok(())
     }
@@ -896,55 +1186,102 @@ impl SimCluster {
         &mut self,
         id: NodeId,
         timer_id: TimerId,
-        kind: TimerKind,
+        generation: u64,
     ) -> Result<(), ClusterError> {
-        let armed = self
-            .nodes
-            .get(&id)
-            .and_then(|slot| slot.armed_timers.get(&timer_id).copied());
+        let armed = self.nodes.get(&id).and_then(|slot| {
+            slot.driver.as_ref().and_then(|driver| {
+                driver
+                    .armed_timers()
+                    .find(|(armed_id, _, armed_generation)| {
+                        *armed_id == timer_id && *armed_generation == generation
+                    })
+                    .map(|(_, at, _)| at)
+            })
+        });
         if armed != Some(self.now) || !self.is_up(id) {
             return Ok(());
         }
-        let input_time = self.host_time(id);
         self.drive_node(
             id,
-            NodeInput::Timer {
-                now: input_time,
-                kind,
+            Input::TimerFired {
+                id: timer_id,
+                generation,
             },
         )
     }
 
-    fn handle_message(&mut self, token: u64, from: NodeId, to: NodeId) -> Result<(), ClusterError> {
-        let Some(message) = self.messages.get(&token).cloned() else {
-            return Ok(());
-        };
-        self.messages.remove(&token);
-        self.network
-            .complete(from, to)
-            .map_err(|_| ClusterError::Network { from, to })?;
+    #[cfg(test)]
+    fn handle_message(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        frame: Vec<u8>,
+    ) -> Result<(), ClusterError> {
+        self.handle_delivery(from, to, frame, false, false)
+    }
+
+    fn handle_delivery(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        frame: Vec<u8>,
+        charged: bool,
+        expected_rejection: bool,
+    ) -> Result<(), ClusterError> {
+        if charged {
+            self.network
+                .complete(from, to, frame.len())
+                .map_err(|_| ClusterError::Network { from, to })?;
+        }
         if !self.is_up(to) {
             self.record(
                 self.now,
                 Some(to),
                 EventKind::NetDrop,
-                token.to_le_bytes().to_vec(),
+                transport_fingerprint_from_frame(&frame, cc_raft::PROTOCOL_VERSION, &[]),
             );
             return Ok(());
+        }
+        let (wire, used) = match decode_peer_frame(&frame) {
+            Ok(decoded) => decoded,
+            Err(_) if expected_rejection => {
+                self.record(
+                    self.now,
+                    Some(to),
+                    EventKind::NetDrop,
+                    transport_fingerprint_from_frame(&frame, cc_raft::PROTOCOL_VERSION, &[]),
+                );
+                return Ok(());
+            }
+            Err(_) => return Err(ClusterError::Network { from, to }),
+        };
+        if used != frame.len() || wire.proto_version != cc_raft::PROTOCOL_VERSION {
+            return Err(ClusterError::Network { from, to });
         }
         self.record(
             self.now,
             Some(to),
             EventKind::NetRecv,
-            message_fingerprint(&message),
+            transport_fingerprint_from_frame(&frame, wire.proto_version, &wire.payload),
         );
-        self.drive_node(
-            to,
-            NodeInput::MessageAt {
-                now: self.host_time(to),
-                message,
-            },
-        )
+        match self.drive_node(to, Input::Recv { from, msg: wire }) {
+            // A malformed inner CCRP frame is an untrusted datagram, not a
+            // fatal host condition. The Driver owns the decoder; the network
+            // host records the drop without duplicating it.
+            Err(ClusterError::Host {
+                error: HostError::Node(NodeError::Environment("peer CCRP")),
+                ..
+            }) if expected_rejection => {
+                self.record(
+                    self.now,
+                    Some(to),
+                    EventKind::NetDrop,
+                    transport_fingerprint_from_frame(&frame, cc_raft::PROTOCOL_VERSION, &[]),
+                );
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     fn handle_client_issue(
@@ -967,7 +1304,7 @@ impl SimCluster {
             );
             return Ok(());
         };
-        let command = command_for(&operation);
+        let command = encode_command(&command_for(&operation));
         let kind = operation_kind(&operation);
         let id = self.next_operation_id;
         self.next_operation_id = self.next_operation_id.saturating_add(1);
@@ -988,23 +1325,13 @@ impl SimCluster {
             EventKind::ClientInvoke,
             id.to_le_bytes().to_vec(),
         );
-        // Reads go through the ReadIndex barrier rather than the log, so the
-        // quorum-confirmation round is exercised by every campaign instead of
-        // living only in unit tests.
-        let input = if matches!(operation, WorkloadOperation::Get { .. }) {
-            NodeInput::Read {
-                client: ClientId::new(client),
-                sequence,
-                command,
-                at: self.host_time(leader),
-            }
-        } else {
-            NodeInput::ClientRequest {
-                client: ClientId::new(client),
-                sequence,
-                command,
-                leader_time: self.host_time(leader),
-            }
+        // Reads pass through Driver as ordinary unsessioned commands; the
+        // core chooses its ReadIndex path from the canonical command bytes.
+        let input = Input::ClientRequest {
+            client: ClientId::new(client),
+            req: cc_core::RequestSeq::new(sequence),
+            session: None,
+            command,
         };
         match self.drive_node(leader, input) {
             Ok(()) => {
@@ -1020,6 +1347,18 @@ impl SimCluster {
                         cc_raft::RaftError::Busy
                         | cc_raft::RaftError::NotLeader
                         | cc_raft::RaftError::ReadBarrierNotReady,
+                    ),
+                ..
+            })
+            | Err(ClusterError::Host {
+                error:
+                    HostError::Node(
+                        NodeError::NotLeader
+                        | NodeError::Raft(
+                            cc_raft::RaftError::Busy
+                            | cc_raft::RaftError::NotLeader
+                            | cc_raft::RaftError::ReadBarrierNotReady,
+                        ),
                     ),
                 ..
             }) => {
@@ -1059,7 +1398,7 @@ impl SimCluster {
             self.now,
             None,
             EventKind::Fault,
-            format!("{action:?}").into_bytes(),
+            fault_action_json(&action).into_bytes(),
         );
         match action {
             FaultAction::Partition { left, right } => {
@@ -1079,6 +1418,10 @@ impl SimCluster {
                         }
                     }
                 }
+                self.frame_faults.clear();
+                self.replay_faults.clear();
+                self.replay_frames.clear();
+                self.network.clear_injected_delays();
             }
             FaultAction::Crash { node } => {
                 // A crash is a process death: every byte of volatile state goes
@@ -1086,8 +1429,8 @@ impl SimCluster {
                 // path exercise recovery instead of resuming a paused node.
                 if let Some(slot) = self.nodes.get_mut(&node) {
                     slot.status = cc_sim::NodeStatus::Crashed;
-                    slot.node = None;
-                    slot.armed_timers.clear();
+                    slot.driver = None;
+                    slot.persistence_ready_at = None;
                     slot.disk.crash();
                 }
             }
@@ -1099,29 +1442,22 @@ impl SimCluster {
                 {
                     return Ok(());
                 }
-                // A wiped node has no durable bytes to recover from, so
-                // `recover_node` rebuilds it empty. Catching it up is the
-                // leader's job, and it needs state transfer rather than log
-                // replay — the same path the real host uses when it installs a
-                // journal snapshot into a cleared data directory.
-                let was_wiped = self
-                    .nodes
-                    .get(&node)
-                    .is_some_and(|slot| slot.status == cc_sim::NodeStatus::Wiped);
                 self.recover_node(node)?;
-                if let Some(slot) = self.nodes.get_mut(&node) {
-                    slot.status = cc_sim::NodeStatus::Up;
+                let recovered = self.nodes.get(&node).is_some_and(|slot| {
+                    slot.status != cc_sim::NodeStatus::StorageFault && slot.driver.is_some()
+                });
+                if recovered {
+                    if let Some(slot) = self.nodes.get_mut(&node) {
+                        slot.status = cc_sim::NodeStatus::Up;
+                    }
+                    self.schedule(self.now, ClusterEventKind::Tick(node));
                 }
-                if was_wiped {
-                    self.install_leader_snapshot(node)?;
-                }
-                self.schedule(self.now, ClusterEventKind::Tick(node));
             }
             FaultAction::Wipe { node } => {
                 if let Some(slot) = self.nodes.get_mut(&node) {
                     slot.status = cc_sim::NodeStatus::Wiped;
-                    slot.node = None;
-                    slot.armed_timers.clear();
+                    slot.driver = None;
+                    slot.persistence_ready_at = None;
                     slot.disk = SimDisk::new();
                     slot.reset_wal();
                 }
@@ -1141,10 +1477,87 @@ impl SimCluster {
                     slot.disk.inject(DiskFault::EioNextWrite);
                 }
             }
+            FaultAction::SlowDisk { node, slow } => {
+                if let Some(slot) = self.nodes.get_mut(&node) {
+                    slot.disk.set_slow_disk(slow);
+                }
+            }
+            FaultAction::EnospcFrom { node } => {
+                if let Some(slot) = self.nodes.get_mut(&node) {
+                    slot.disk.set_enospc(true);
+                }
+            }
+            FaultAction::BitRotAtRest { node, file, offset } => {
+                if let Some(slot) = self.nodes.get_mut(&node) {
+                    slot.disk.inject_bitrot(file, offset);
+                }
+            }
+            FaultAction::DiskQuota { node, bytes } => {
+                if let Some(slot) = self.nodes.get_mut(&node) {
+                    slot.disk.set_quota(Some(bytes));
+                }
+            }
             FaultAction::LinkDegrade { from, to, config } => {
                 self.network
                     .configure(from, to, config)
                     .map_err(|_| ClusterError::Network { from, to })?;
+            }
+            FaultAction::CorruptFrame {
+                from,
+                to,
+                nth,
+                byte,
+                bit,
+            } => {
+                if nth == 0 || bit >= 8 {
+                    return Err(ClusterError::Network { from, to });
+                }
+                self.frame_faults
+                    .entry((from, to))
+                    .or_default()
+                    .push(FrameFault::Corrupt(CorruptFrameFault { nth, byte, bit }));
+            }
+            FaultAction::TruncateFrame {
+                from,
+                to,
+                nth,
+                keep,
+            } => {
+                if nth == 0 {
+                    return Err(ClusterError::Network { from, to });
+                }
+                self.frame_faults
+                    .entry((from, to))
+                    .or_default()
+                    .push(FrameFault::Truncate { nth, keep });
+            }
+            FaultAction::ReplayFrame { from, to, nth, at } => {
+                if nth == 0 || at < self.now {
+                    return Err(ClusterError::Network { from, to });
+                }
+                self.replay_faults
+                    .entry((from, to))
+                    .or_default()
+                    .push(ReplayFrameFault { nth, at });
+            }
+            FaultAction::DelayLink { from, to, extra } => {
+                self.network
+                    .set_injected_delay(from, to, extra)
+                    .map_err(|_| ClusterError::Network { from, to })?;
+            }
+            FaultAction::MutateRaftAndRechecksum {
+                from,
+                to,
+                nth,
+                mutation,
+            } => {
+                if nth == 0 {
+                    return Err(ClusterError::Network { from, to });
+                }
+                self.frame_faults
+                    .entry((from, to))
+                    .or_default()
+                    .push(FrameFault::Mutate { nth, mutation });
             }
             FaultAction::Reconfigure { voters } => {
                 let Some(leader) = self.leader() else {
@@ -1155,29 +1568,25 @@ impl SimCluster {
                     return Ok(());
                 }
                 let effects = {
+                    let now = self.host_time(leader);
                     let slot = self
                         .nodes
                         .get_mut(&leader)
                         .expect("invariant: leader slot exists");
-                    let node = slot
-                        .node
+                    let driver = slot
+                        .driver
                         .as_mut()
-                        .expect("invariant: leader has a composition");
-                    if node.membership().0 == target || node.membership().2 {
+                        .expect("invariant: leader has a driver");
+                    if driver.membership().0 == target || driver.membership().2 {
                         // Already there, or a transition is still open.
                         return Ok(());
                     }
-                    match node.enter_joint(target) {
-                        Ok(effects) => effects,
+                    match driver.enter_joint(now, target) {
+                        Ok((_, effects)) => effects,
                         // A leader that cannot open a transition right now is a
                         // legitimate outcome, not a host error.
-                        Err(NodeError::Raft(_)) => return Ok(()),
-                        Err(error) => {
-                            return Err(ClusterError::Node {
-                                node: leader,
-                                error,
-                            });
-                        }
+                        Err(HostError::Node(NodeError::Raft(_))) => return Ok(()),
+                        Err(error) => return Err(cluster_host_error(leader, error)),
                     }
                 };
                 self.record(self.now, Some(leader), EventKind::ConfChange, Vec::new());
@@ -1191,27 +1600,43 @@ impl SimCluster {
         Ok(())
     }
 
-    fn drive_node(&mut self, id: NodeId, input: NodeInput) -> Result<(), ClusterError> {
-        let (before_role, effects) = {
+    fn drive_node(&mut self, id: NodeId, input: Input) -> Result<(), ClusterError> {
+        if let Some(ready_at) = self
+            .nodes
+            .get(&id)
+            .and_then(|slot| slot.persistence_ready_at)
+        {
+            self.schedule(
+                ready_at + Duration::from_nanos(1),
+                ClusterEventKind::DeferredInput { node: id, input },
+            );
+            return Ok(());
+        }
+        let now = self.host_time(id);
+        let (before_role, poll, effects) = {
             let slot = self
                 .nodes
                 .get_mut(&id)
                 .expect("invariant: node slot exists");
-            let node = slot
-                .node
+            let driver = slot
+                .driver
                 .as_mut()
-                .expect("invariant: up node has a composition");
-            let before = node.role();
-            let effects = node
-                .on_input(input)
-                .map_err(|error| ClusterError::Node { node: id, error })?;
-            (before, effects)
+                .expect("invariant: up node has a driver");
+            let before = driver.role();
+            let (poll, effects) = driver
+                .deliver(now, input.clone(), &mut slot.blocks)
+                .map_err(|error| cluster_host_error(id, error))?;
+            (before, poll, effects)
         };
+        if let DriverPoll::BlockedUntil(until) = poll {
+            self.schedule(until, ClusterEventKind::DeferredInput { node: id, input });
+            return Ok(());
+        }
         let after_role = self
             .nodes
             .get(&id)
-            .and_then(|slot| slot.node.as_ref())
-            .map(Node::role)
+            .and_then(|slot| slot.driver.as_ref())
+            .map(Driver::role)
             .unwrap_or(Role::Follower);
         if before_role != after_role {
             self.record(
@@ -1230,269 +1655,468 @@ impl SimCluster {
     fn consume_effects(
         &mut self,
         source: NodeId,
-        effects: Vec<NodeEffect>,
+        effects: Vec<Effect>,
     ) -> Result<(), ClusterError> {
         for effect in effects {
             match effect {
-                NodeEffect::Send(message) => self.send_message(message)?,
-                NodeEffect::PersistHard(hard) => {
-                    let mut bytes = Vec::with_capacity(WAL_HARD_STATE_LEN as usize);
-                    bytes.extend_from_slice(&WAL_HARD_STATE_VERSION.to_le_bytes());
-                    bytes.extend_from_slice(&hard.term.get().to_le_bytes());
-                    bytes.extend_from_slice(&hard.voted_for.map_or(0, NodeId::get).to_le_bytes());
-                    self.persist(source, 0, &bytes);
+                Effect::Send { to, msg } => self.send_wire(source, to, msg)?,
+                Effect::DiskWrite {
+                    file,
+                    at,
+                    bytes,
+                    id,
+                } => self.begin_persistence(source, file, at, bytes, id)?,
+                Effect::DiskFsync { file, id } => self.begin_fsync(source, file, id)?,
+                Effect::ClientReply { client, req, reply } => {
+                    let reply = decode_reply(&reply).map_err(|_| ClusterError::Node {
+                        node: source,
+                        error: NodeError::Environment("CCKR reply"),
+                    })?;
+                    self.complete_client(source, client.get(), req.get(), reply);
                 }
-                NodeEffect::PersistEntries(entries) => self.append_entries(source, &entries),
-                NodeEffect::TruncateSuffix(index) => self.truncate_from(source, index.get()),
-                NodeEffect::ClientReply {
-                    client,
-                    sequence,
-                    reply,
-                } => {
-                    if self
+                Effect::SetTimer { id, fire_at } => {
+                    let generation = self
                         .nodes
                         .get(&source)
-                        .and_then(|slot| slot.node.as_ref())
-                        .is_some_and(|node| node.role() == Role::Leader)
-                    {
-                        self.complete_client(source, client.get(), sequence, reply);
-                    }
-                }
-                NodeEffect::ReadReply {
-                    client,
-                    sequence,
-                    reply,
-                } => {
-                    // The sequence matters: a read whose barrier completes after
-                    // its client already timed out must not be matched against
-                    // whatever that client issued next.
-                    self.complete_client(source, client.get(), sequence, reply);
-                }
-                NodeEffect::ArmTimer { id, at, kind } => {
-                    if let Some(slot) = self.nodes.get_mut(&source) {
-                        slot.armed_timers.insert(id, at);
-                    }
+                        .and_then(|slot| slot.driver.as_ref())
+                        .and_then(|driver| {
+                            driver
+                                .armed_timers()
+                                .find(|(timer, _, _)| *timer == id)
+                                .map(|(_, _, generation)| generation)
+                        })
+                        .ok_or(ClusterError::Node {
+                            node: source,
+                            error: NodeError::Environment("unarmed driver timer"),
+                        })?;
                     self.record(
                         self.now,
                         Some(source),
                         EventKind::TimerSet,
-                        at.as_nanos().to_le_bytes().to_vec(),
+                        fire_at.as_nanos().to_le_bytes().to_vec(),
                     );
                     self.schedule(
-                        at,
+                        fire_at,
                         ClusterEventKind::Timer {
                             node: source,
                             id,
-                            kind,
+                            generation,
                         },
                     );
                 }
-                NodeEffect::Trace(name) => {
-                    self.record(
-                        self.now,
-                        Some(source),
-                        EventKind::CheckerNote,
-                        name.as_bytes().to_vec(),
-                    );
+                Effect::CancelTimer { .. } => {}
+                Effect::Trace(event) => self.record(
+                    self.now,
+                    Some(source),
+                    EventKind::CheckerNote,
+                    event.payload,
+                ),
+                Effect::DiskRead { .. }
+                | Effect::DiskTruncate { .. }
+                | Effect::DiskCreateTemp { .. }
+                | Effect::DiskRename { .. }
+                | Effect::DiskDelete { .. }
+                | Effect::DiskSyncDir { .. } => {
+                    return Err(ClusterError::Node {
+                        node: source,
+                        error: NodeError::Environment("unsupported simulator storage effect"),
+                    });
                 }
             }
         }
         Ok(())
     }
 
+    #[cfg(test)]
     fn send_message(&mut self, message: cc_raft::Message) -> Result<(), ClusterError> {
         let from = message.from;
         let to = message.to;
-        let token = self.next_message_token;
-        self.next_message_token = self.next_message_token.saturating_add(1);
-        self.messages.insert(token, message.clone());
+        let wire = cc_cluster::encode_peer_effect(&message)
+            .map_err(|_| ClusterError::Network { from, to })?;
+        self.send_wire(from, to, wire)
+    }
+
+    fn send_wire(&mut self, from: NodeId, to: NodeId, wire: WireMsg) -> Result<(), ClusterError> {
+        let mut frame = encode_peer_frame(&wire).map_err(|_| ClusterError::Network { from, to })?;
+        let mut expected_rejection = false;
+        let ordinal = *self
+            .frame_ordinals
+            .entry((from, to))
+            .and_modify(|value| *value = value.saturating_add(1))
+            .or_insert(1);
+        if let Some(faults) = self.frame_faults.get(&(from, to)) {
+            for fault in faults
+                .iter()
+                .copied()
+                .filter(|fault| fault.nth() == ordinal)
+            {
+                match fault {
+                    FrameFault::Corrupt(fault) => {
+                        if fault.bit >= 8 || fault.byte >= frame.len() {
+                            return Err(ClusterError::Network { from, to });
+                        }
+                        frame[fault.byte] ^= 1_u8 << fault.bit;
+                        expected_rejection = true;
+                    }
+                    FrameFault::Truncate { keep, .. } => {
+                        if keep >= frame.len() {
+                            return Err(ClusterError::Network { from, to });
+                        }
+                        frame.truncate(keep);
+                        expected_rejection = true;
+                    }
+                    FrameFault::Mutate { mutation, .. } => {
+                        mutate_and_rechecksum(&mut frame, mutation)
+                            .map_err(|_| ClusterError::Network { from, to })?;
+                        expected_rejection = true;
+                    }
+                }
+            }
+        }
+        let fingerprint =
+            transport_fingerprint_from_frame(&frame, wire.proto_version, &wire.payload);
+        let replay_at: Vec<Time> = self
+            .replay_faults
+            .get(&(from, to))
+            .into_iter()
+            .flatten()
+            .filter(|fault| fault.nth == ordinal)
+            .map(|fault| fault.at)
+            .collect();
+        if let Some(previous) = self.replay_frames.get(&(from, to)).cloned() {
+            for at in replay_at {
+                self.schedule(
+                    at.max(self.now),
+                    ClusterEventKind::Message {
+                        from,
+                        to,
+                        frame: previous.clone(),
+                        charged: false,
+                        expected_rejection: false,
+                    },
+                );
+            }
+        }
+        self.replay_frames.insert((from, to), frame.clone());
         if !self.is_up(from) || !self.is_up(to) {
-            self.messages.remove(&token);
             self.record(
                 self.now,
                 Some(from),
                 EventKind::NetDrop,
-                message_fingerprint(&message),
+                fingerprint.clone(),
             );
             return Ok(());
         }
         let decisions = self
             .network
-            .send(self.now, from, to, token.to_le_bytes().to_vec())
+            .send(self.now, from, to, frame)
             .map_err(|_| ClusterError::Network { from, to })?;
         let mut delivered = false;
         for decision in decisions {
             match decision {
                 NetworkDecision::Delivered(delivery) => {
                     delivered = true;
-                    self.record(
-                        self.now,
-                        Some(from),
-                        EventKind::NetSend,
-                        message_fingerprint(&message),
-                    );
-                    self.schedule(delivery.at, ClusterEventKind::Message { token, from, to });
+                    if delivery.at <= self.spec.end_time {
+                        self.record(
+                            self.now,
+                            Some(from),
+                            EventKind::NetSend,
+                            fingerprint.clone(),
+                        );
+                        self.schedule(
+                            delivery.at,
+                            ClusterEventKind::Message {
+                                from,
+                                to,
+                                frame: delivery.payload,
+                                charged: true,
+                                expected_rejection,
+                            },
+                        );
+                    } else {
+                        // Scheduling stops at the declared horizon, but the
+                        // network already reserved this delivery. Releasing
+                        // it here is the modeled cancellation outcome rather
+                        // than leaking capacity into a later run.
+                        self.network
+                            .complete(from, to, delivery.payload.len())
+                            .map_err(|_| ClusterError::Network { from, to })?;
+                        self.record(
+                            self.now,
+                            Some(from),
+                            EventKind::NetDrop,
+                            fingerprint.clone(),
+                        );
+                    }
                 }
                 NetworkDecision::Dropped => {
                     self.record(
                         self.now,
                         Some(from),
                         EventKind::NetDrop,
-                        message_fingerprint(&message),
+                        fingerprint.clone(),
                     );
                 }
             }
         }
-        if !delivered {
-            self.messages.remove(&token);
-        }
+        let _ = delivered;
         Ok(())
     }
 
-    fn persist(&mut self, node: NodeId, offset: u64, bytes: &[u8]) {
-        self.record(self.now, Some(node), EventKind::IoIssue, bytes.to_vec());
-        let result = self
+    fn begin_persistence(
+        &mut self,
+        node: NodeId,
+        file: FileId,
+        at: u64,
+        bytes: Vec<u8>,
+        id: cc_core::IoId,
+    ) -> Result<(), ClusterError> {
+        let write_delay = self
             .nodes
-            .get_mut(&node)
-            .map(|slot| slot.disk.write(WAL_FILE, offset, bytes));
-        if result.is_some_and(|result| result.is_ok()) {
-            let synced = self
-                .nodes
-                .get_mut(&node)
-                .map(|slot| slot.disk.fsync(WAL_FILE));
-            if synced.is_some_and(|result| result.is_ok()) {
-                self.record(self.now, Some(node), EventKind::IoDone, Vec::new());
-                self.record(self.now, Some(node), EventKind::Flush, Vec::new());
-            } else {
-                self.record(self.now, Some(node), EventKind::IoLost, Vec::new());
-            }
-        } else {
-            self.record(self.now, Some(node), EventKind::IoLost, Vec::new());
-        }
-    }
-
-    /// Append log records at the byte offset the first entry index maps to. An
-    /// index already on disk means this append conflicts with a stale suffix,
-    /// so the log rewinds to that offset and overwrites from there.
-    fn append_entries(&mut self, node: NodeId, entries: &[Entry]) {
-        let Some(first) = entries.first() else {
-            return;
-        };
-        let Some(slot) = self.nodes.get_mut(&node) else {
-            return;
-        };
-        let start = slot
-            .entry_offsets
-            .get(&first.index.get())
-            .copied()
-            .unwrap_or(slot.wal_end);
-        slot.entry_offsets
-            .retain(|index, _| *index < first.index.get());
-        let mut offset = start;
-        let mut bytes = Vec::new();
-        for entry in entries {
-            slot.entry_offsets.insert(entry.index.get(), offset);
-            let encoded = encode_entry(entry);
-            offset = offset.saturating_add(encoded.len() as u64);
-            bytes.extend_from_slice(&encoded);
-        }
-        slot.wal_end = offset;
-        self.persist(node, start, &bytes);
-    }
-
-    /// Drop every log record at or after `index`, as Raft's conflict path asks.
-    fn truncate_from(&mut self, node: NodeId, index: u64) {
-        let Some(slot) = self.nodes.get_mut(&node) else {
-            return;
-        };
-        let end = slot
-            .entry_offsets
-            .get(&index)
-            .copied()
-            .unwrap_or(slot.wal_end);
-        slot.entry_offsets.retain(|existing, _| *existing < index);
-        slot.wal_end = end;
-        let result = slot.disk.truncate(WAL_FILE, end);
-        self.record(
-            self.now,
-            Some(node),
-            EventKind::IoIssue,
-            index.to_le_bytes().to_vec(),
-        );
-        if result.is_ok() {
-            self.record(self.now, Some(node), EventKind::IoDone, Vec::new());
-        } else {
-            self.record(self.now, Some(node), EventKind::IoLost, Vec::new());
-        }
-    }
-
-    /// Rebuild a node from whatever survived on its disk. Everything volatile
-    /// is gone; the log is replayed by Raft once a leader re-establishes commit.
-    /// Transfer the leader's applied state to a node that came back with an
-    /// empty disk.
-    ///
-    /// This is a real state transfer: the leader's own `create_snapshot` output
-    /// is installed into the target's `Node`, carrying the KV image and the
-    /// `last_included` index/term that `install_snapshot_state` uses to retire
-    /// the log prefix. It is *modelled* rather than chunked over the network —
-    /// `cc-raft` can frame `SnapshotChunk` messages, but `cc-cluster::Node`
-    /// does not intercept them, so routing chunks would move raft's indices
-    /// without the state machine bytes and leave the follower confidently
-    /// wrong. `docs/LIMITATIONS.md` records that boundary.
-    fn install_leader_snapshot(&mut self, target: NodeId) -> Result<(), ClusterError> {
-        let Some(leader) = self.leader() else {
-            return Ok(());
-        };
-        if leader == target {
-            return Ok(());
-        }
-        let snapshot = {
-            let Some(slot) = self.nodes.get_mut(&leader) else {
-                return Ok(());
-            };
-            let Some(node) = slot.node.as_mut() else {
-                return Ok(());
-            };
-            node.create_snapshot().map_err(|error| ClusterError::Node {
-                node: leader,
-                error,
-            })?
-        };
-        let last_included = snapshot.last_included_index;
-        let Some(slot) = self.nodes.get_mut(&target) else {
-            return Ok(());
-        };
-        let Some(node) = slot.node.as_mut() else {
-            return Ok(());
-        };
-        node.install_snapshot(snapshot)
-            .map_err(|error| ClusterError::Node {
-                node: target,
-                error,
+            .get(&node)
+            .map(|slot| slot.disk.service_time(DiskOperation::Write))
+            .ok_or(ClusterError::Node {
+                node,
+                error: NodeError::Durability,
             })?;
-        self.record(
-            self.now,
-            Some(target),
-            EventKind::SnapshotInstall,
-            last_included.get().to_le_bytes().to_vec(),
+        let fsync_delay = self
+            .nodes
+            .get(&node)
+            .map(|slot| slot.disk.service_time(DiskOperation::Fsync))
+            .ok_or(ClusterError::Node {
+                node,
+                error: NodeError::Durability,
+            })?;
+        if let Some(slot) = self.nodes.get_mut(&node) {
+            slot.persistence_ready_at = Some(self.now + write_delay + fsync_delay);
+            slot.wal_end = at.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        }
+        self.record(self.now, Some(node), EventKind::IoIssue, bytes.clone());
+        self.schedule(
+            self.now + write_delay,
+            ClusterEventKind::DiskWriteComplete {
+                node,
+                file,
+                at,
+                bytes,
+                id,
+            },
         );
         Ok(())
+    }
+
+    fn handle_disk_write_complete(
+        &mut self,
+        node: NodeId,
+        file: FileId,
+        at: u64,
+        bytes: Vec<u8>,
+        id: cc_core::IoId,
+    ) -> Result<(), ClusterError> {
+        let result = {
+            let Some(slot) = self.nodes.get_mut(&node) else {
+                return Ok(());
+            };
+            if slot.status != cc_sim::NodeStatus::Up || slot.driver.is_none() {
+                return Ok(());
+            }
+            slot.disk.write(file, at, &bytes)
+        };
+        match result {
+            Ok(_) => self.complete_driver_io(
+                node,
+                id,
+                IoResult::Written {
+                    len: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+                },
+            ),
+            Err(error) => self.complete_driver_io(node, id, IoResult::Failed(error)),
+        }
+    }
+
+    fn begin_fsync(
+        &mut self,
+        node: NodeId,
+        file: FileId,
+        id: cc_core::IoId,
+    ) -> Result<(), ClusterError> {
+        let delay = self
+            .nodes
+            .get(&node)
+            .map(|slot| slot.disk.service_time(DiskOperation::Fsync))
+            .ok_or(ClusterError::Node {
+                node,
+                error: NodeError::Durability,
+            })?;
+        self.schedule(
+            self.now + delay,
+            ClusterEventKind::DiskFsyncComplete { node, file, id },
+        );
+        Ok(())
+    }
+
+    fn handle_disk_fsync_complete(
+        &mut self,
+        node: NodeId,
+        file: FileId,
+        id: cc_core::IoId,
+    ) -> Result<(), ClusterError> {
+        let result = {
+            let Some(slot) = self.nodes.get_mut(&node) else {
+                return Ok(());
+            };
+            if slot.status != cc_sim::NodeStatus::Up || slot.driver.is_none() {
+                return Ok(());
+            }
+            slot.disk.fsync(file)
+        };
+        match result {
+            Ok(_) => self.complete_driver_io(node, id, IoResult::Fsynced),
+            Err(error) => self.complete_driver_io(node, id, IoResult::Failed(error)),
+        }
+    }
+
+    fn complete_driver_io(
+        &mut self,
+        node: NodeId,
+        id: cc_core::IoId,
+        result: IoResult,
+    ) -> Result<(), ClusterError> {
+        let was_fsync = matches!(result, IoResult::Fsynced);
+        let now = self.host_time(node);
+        let outcome = {
+            let Some(slot) = self.nodes.get_mut(&node) else {
+                return Ok(());
+            };
+            let Some(driver) = slot.driver.as_mut() else {
+                return Ok(());
+            };
+            driver.deliver(now, Input::IoDone { id, result }, &mut slot.blocks)
+        };
+        match outcome {
+            Ok((DriverPoll::Ready, effects)) => {
+                if was_fsync {
+                    if let Some(slot) = self.nodes.get_mut(&node) {
+                        slot.persistence_ready_at = None;
+                    }
+                    self.record(self.now, Some(node), EventKind::IoDone, Vec::new());
+                    self.record(self.now, Some(node), EventKind::Flush, Vec::new());
+                }
+                self.consume_effects(node, effects)
+            }
+            Ok((DriverPoll::BlockedUntil(until), _)) => {
+                self.schedule(
+                    until,
+                    ClusterEventKind::DeferredInput {
+                        node,
+                        input: Input::Tick,
+                    },
+                );
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(slot) = self.nodes.get_mut(&node) {
+                    slot.status = cc_sim::NodeStatus::StorageFault;
+                    slot.driver = None;
+                    slot.persistence_ready_at = None;
+                }
+                self.record(self.now, Some(node), EventKind::IoLost, Vec::new());
+                let _ = error;
+                Ok(())
+            }
+        }
     }
 
     fn recover_node(&mut self, id: NodeId) -> Result<(), ClusterError> {
-        let voters = self.voters.clone();
         let now = self.host_time(id);
         let Some(slot) = self.nodes.get_mut(&id) else {
             return Ok(());
         };
+        if slot.disk.durable(WAL_FILE).is_some() && slot.disk.verify_durable(WAL_FILE).is_err() {
+            // A durable checksum mismatch is not a torn tail.  Recovery has no
+            // authority to guess which bytes were intended, so preserve the
+            // image for inspection and fail-stop this node before it can vote,
+            // answer a read, or emit a reply.
+            slot.status = cc_sim::NodeStatus::StorageFault;
+            slot.driver = None;
+            slot.persistence_ready_at = None;
+            self.record(
+                self.now,
+                Some(id),
+                EventKind::IoLost,
+                b"corrupt-wal".to_vec(),
+            );
+            return Ok(());
+        }
         let durable = slot.disk.durable(WAL_FILE).unwrap_or_default().to_vec();
-        let (hard_state, entries, offsets, wal_end) = decode_wal(&durable);
-        slot.entry_offsets = offsets;
-        slot.wal_end = wal_end;
-        slot.node = Some(
-            Node::recover(slot.config, voters, hard_state, entries, now)
-                .map_err(|error| ClusterError::Node { node: id, error })?,
-        );
+        if durable.is_empty() {
+            // A wiped disk starts from a sealed Join-origin Genesis. It does
+            // not receive an out-of-band state copy: ordinary peer traffic
+            // backtracks and replicates the surviving log prefix.
+            let mut genesis = slot.genesis.clone();
+            genesis.origin = cc_log::Origin::Join;
+            let bytes = cc_log::encode_framed_durable_record(&cc_log::DurableRecord::Genesis(
+                Box::new(genesis.clone()),
+            ))
+            .map_err(|_| ClusterError::Node {
+                node: id,
+                error: NodeError::Durability,
+            })?;
+            slot.disk
+                .write(WAL_FILE, 0, &bytes)
+                .and_then(|_| slot.disk.fsync(WAL_FILE))
+                .map_err(|_| ClusterError::Node {
+                    node: id,
+                    error: NodeError::Durability,
+                })?;
+            let bootstrap = genesis.membership.clone();
+            slot.genesis = genesis;
+            slot.wal_end = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let mut driver = Driver::boot_with_wal_offset(
+                slot.config,
+                BootState::Fresh { bootstrap },
+                slot.wal_end,
+            )
+            .map_err(|error| cluster_host_error(id, error))?;
+            driver.node_mut().raft.rearm_election(now);
+            slot.driver = Some(driver);
+            slot.persistence_ready_at = None;
+        } else {
+            let recovered =
+                cc_log::recover_framed_record_stream(&durable).map_err(|_| ClusterError::Node {
+                    node: id,
+                    error: NodeError::Durability,
+                })?;
+            if recovered.torn_tail_truncated {
+                slot.disk
+                    .truncate(WAL_FILE, recovered.bytes_consumed)
+                    .and_then(|_| slot.disk.fsync(WAL_FILE))
+                    .map_err(|_| ClusterError::Node {
+                        node: id,
+                        error: NodeError::Durability,
+                    })?;
+            }
+            let state = recovered.state;
+            slot.wal_end = recovered.bytes_consumed;
+            slot.genesis = state.genesis.clone();
+            let mut driver = Driver::boot_with_wal_offset(
+                slot.config,
+                BootState::Recovered(Box::new(RecoveredNode {
+                    hard_state: state.hard_state,
+                    log_base: (state.base_index, state.base_term),
+                    entries: state.entries,
+                    membership: state.genesis.membership,
+                    cluster_policy: state.genesis.policy,
+                    snapshot: None,
+                    durable_applied: (state.base_index, state.base_term),
+                })),
+                slot.wal_end,
+            )
+            .map_err(|error| cluster_host_error(id, error))?;
+            driver.node_mut().raft.rearm_election(now);
+            slot.driver = Some(driver);
+            slot.persistence_ready_at = None;
+        }
         self.record(
             self.now,
             Some(id),
@@ -1566,8 +2190,9 @@ impl SimCluster {
                 if slot.status != cc_sim::NodeStatus::Up {
                     return None;
                 }
-                let node = slot.node.as_ref()?;
-                (node.role() == Role::Leader).then_some((*id, node.raft.hard_state.term.get()))
+                let driver = slot.driver.as_ref()?;
+                (driver.role() == Role::Leader)
+                    .then_some((*id, driver.node().raft.hard_state.term.get()))
             })
             .max_by_key(|(id, term)| (*term, *id))
             .map(|(id, _)| id)
@@ -1576,7 +2201,7 @@ impl SimCluster {
     fn is_up(&self, id: NodeId) -> bool {
         self.nodes
             .get(&id)
-            .is_some_and(|slot| slot.status == cc_sim::NodeStatus::Up && slot.node.is_some())
+            .is_some_and(|slot| slot.status == cc_sim::NodeStatus::Up && slot.driver.is_some())
     }
 
     fn host_time(&self, id: NodeId) -> Time {
@@ -1706,6 +2331,16 @@ fn link_config(profile: FaultProfile) -> LinkConfig {
     config
 }
 
+fn simulated_cluster_id(seed: Seed) -> [u8; 16] {
+    let mut id = [0_u8; 16];
+    id[..8].copy_from_slice(&seed.0.to_le_bytes());
+    id[8..].copy_from_slice(&(seed.0 ^ 0x4343_4c52_5349_4d31).to_le_bytes());
+    if id.iter().all(|byte| *byte == 0) {
+        id[0] = 1;
+    }
+    id
+}
+
 fn command_for(operation: &WorkloadOperation) -> KvCommand {
     match operation {
         WorkloadOperation::Get { key } => KvCommand::Get { key: key.clone() },
@@ -1745,88 +2380,35 @@ fn reply_to_outcome(kind: &OperationKind, reply: &KvReply) -> Outcome {
         (_, KvReply::Value(value)) => Outcome::Value(value.clone()),
         (_, KvReply::Integer(value)) => Outcome::Integer(*value),
         (_, KvReply::Cas(value)) => Outcome::Cas(*value),
+        (_, KvReply::Conditional(value)) => Outcome::Cas(*value),
         (_, KvReply::Scan(_)) => Outcome::Error,
     }
 }
 
-fn encode_entry(entry: &Entry) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(25 + entry.payload.len());
-    bytes.extend_from_slice(&entry.term.get().to_le_bytes());
-    bytes.extend_from_slice(&entry.index.get().to_le_bytes());
-    bytes.push(entry.kind as u8);
-    bytes.extend_from_slice(&(entry.payload.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(&entry.payload);
+/// Stable trace vocabulary for a peer frame: local fingerprint format,
+/// negotiated semantic version, raw CCRP tag (zero if the CCPF frame is not
+/// decodable), and the final outer-frame CRC. This is trace evidence, not a
+/// second peer codec.
+fn transport_fingerprint_from_frame(
+    frame: &[u8],
+    semantic_hint: u16,
+    payload_hint: &[u8],
+) -> Vec<u8> {
+    let (semantic, tag) = decode_peer_frame(frame).ok().map_or(
+        (semantic_hint, payload_hint.get(32).copied().unwrap_or(0)),
+        |(wire, _)| {
+            (
+                wire.proto_version,
+                wire.payload.get(32).copied().unwrap_or(0),
+            )
+        },
+    );
+    let mut bytes = Vec::with_capacity(9);
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&semantic.to_le_bytes());
+    bytes.push(tag);
+    bytes.extend_from_slice(&cc_core::crc32c(frame).to_le_bytes());
     bytes
-}
-
-/// Decode durable WAL bytes back into hard state and a log prefix.
-///
-/// Decoding stops at the first record that is short or malformed, which is the
-/// prefix-durability rule: a torn tail is simply not part of the recovered log.
-fn decode_wal(durable: &[u8]) -> (cc_raft::HardState, Vec<Entry>, BTreeMap<u64, u64>, u64) {
-    let mut hard = cc_raft::HardState {
-        term: cc_core::Term::new(0),
-        voted_for: None,
-    };
-    let header = WAL_HARD_STATE_LEN as usize;
-    if durable.len() >= header && read_u64(durable, 0) == WAL_HARD_STATE_VERSION {
-        hard.term = cc_core::Term::new(read_u64(durable, 8));
-        let voted = read_u64(durable, 16);
-        hard.voted_for = (voted != 0).then(|| NodeId::new(voted));
-    }
-    let mut entries = Vec::new();
-    let mut offsets = BTreeMap::new();
-    let mut cursor = header.min(durable.len());
-    let mut end = WAL_HARD_STATE_LEN;
-    while cursor + 25 <= durable.len() {
-        let term = read_u64(durable, cursor);
-        let index = read_u64(durable, cursor + 8);
-        let Some(kind) = entry_kind(durable[cursor + 16]) else {
-            break;
-        };
-        let len = read_u64(durable, cursor + 17) as usize;
-        let start = cursor + 25;
-        let Some(payload) = durable.get(start..start.saturating_add(len)) else {
-            break;
-        };
-        offsets.insert(index, cursor as u64);
-        entries.push(Entry {
-            term: cc_core::Term::new(term),
-            index: cc_core::LogIndex::new(index),
-            kind,
-            payload: payload.to_vec(),
-        });
-        cursor = start.saturating_add(len);
-        end = cursor as u64;
-    }
-    (hard, entries, offsets, end)
-}
-
-fn read_u64(bytes: &[u8], at: usize) -> u64 {
-    bytes
-        .get(at..at + 8)
-        .and_then(|slice| <[u8; 8]>::try_from(slice).ok())
-        .map_or(0, u64::from_le_bytes)
-}
-
-const fn entry_kind(tag: u8) -> Option<cc_raft::EntryKind> {
-    match tag {
-        1 => Some(cc_raft::EntryKind::App),
-        2 => Some(cc_raft::EntryKind::Noop),
-        3 => Some(cc_raft::EntryKind::Config),
-        _ => None,
-    }
-}
-
-fn message_fingerprint(message: &cc_raft::Message) -> Vec<u8> {
-    format!(
-        "{}>{}:{}:{:?}",
-        message.from.get(),
-        message.to.get(),
-        message.term.get(),
-        message.kind
-    )
-    .into_bytes()
 }
 
 fn role_name(role: Role) -> &'static str {
@@ -1841,6 +2423,7 @@ fn role_name(role: Role) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cc_sim::SlowDisk;
 
     #[test]
     fn calm_five_node_cluster_elects_and_captures_real_history() {
@@ -1873,6 +2456,571 @@ mod tests {
         assert_eq!(difference.left, "01");
         assert_eq!(difference.right, "02");
         assert!(semantic_trace_diff(&left, &left).is_none());
+    }
+
+    #[test]
+    fn trap_ccpf_and_ccrp_semantic_versions_must_match() {
+        let spec = RunSpec::standard(Seed::new(0x77), FaultProfile::Calm);
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        let message = cc_raft::Message {
+            proto_version: cc_raft::PROTOCOL_VERSION,
+            from: NodeId::new(1),
+            to: NodeId::new(2),
+            term: cc_core::Term::new(1),
+            kind: cc_raft::MessageKind::PreVoteReq {
+                last_index: cc_core::LogIndex::new(0),
+                last_term: cc_core::Term::new(0),
+            },
+        };
+        let frame = encode_peer_frame(&WireMsg::new(
+            cc_raft::PROTOCOL_VERSION.saturating_sub(1),
+            cc_raft::codec::encode(&message).expect("CCRP"),
+        ))
+        .expect("CCPF");
+        assert!(matches!(
+            cluster.handle_message(NodeId::new(1), NodeId::new(2), frame),
+            Err(ClusterError::Network { .. })
+        ));
+    }
+
+    #[test]
+    fn trap_slow_disk_preserves_election_safety() {
+        let mut spec = RunSpec::standard(Seed::new(0x7d), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(250_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.clients = 0;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .handle_fault(FaultAction::SlowDisk {
+                node: NodeId::new(1),
+                slow: SlowDisk {
+                    write_extra: Duration::from_millis(50),
+                    fsync_extra: Duration::from_millis(50),
+                    ..SlowDisk::default()
+                },
+            })
+            .expect("slow disk");
+        let request = cc_raft::Message {
+            proto_version: cc_raft::PROTOCOL_VERSION,
+            from: NodeId::new(2),
+            to: NodeId::new(1),
+            term: cc_core::Term::new(1),
+            kind: cc_raft::MessageKind::VoteReq {
+                last_index: cc_core::LogIndex::new(0),
+                last_term: cc_core::Term::new(0),
+            },
+        };
+        let frame = encode_peer_frame(&WireMsg::new(
+            cc_raft::PROTOCOL_VERSION,
+            cc_raft::codec::encode(&request).expect("CCRP"),
+        ))
+        .expect("CCPF");
+        cluster
+            .handle_message(NodeId::new(2), NodeId::new(1), frame)
+            .expect("vote request");
+
+        cluster
+            .process_until(Time::from_nanos(99_999_999))
+            .expect("delayed write and fsync");
+        assert!(
+            cluster
+                .recorder
+                .trace()
+                .events
+                .iter()
+                .all(|event| !(event.node == Some(NodeId::new(1))
+                    && event.kind == EventKind::IoDone))
+        );
+
+        cluster
+            .process_until(Time::from_nanos(101_000_000))
+            .expect("delayed fsync completion");
+        let trace = cluster.recorder.trace();
+        let fsync_at = trace
+            .events
+            .iter()
+            .find(|event| event.node == Some(NodeId::new(1)) && event.kind == EventKind::IoDone)
+            .map(|event| event.time)
+            .expect("node one fsync completion");
+        assert_eq!(fsync_at, Time::from_nanos(100_000_000));
+        assert!(
+            trace
+                .events
+                .iter()
+                .filter(|event| {
+                    event.node == Some(NodeId::new(1)) && event.kind == EventKind::NetSend
+                })
+                .all(|event| event.time >= fsync_at)
+        );
+        assert_eq!(
+            cluster
+                .snapshot()
+                .nodes
+                .iter()
+                .find(|node| node.id == 1)
+                .expect("node one")
+                .disk_service_delay_ns,
+            Duration::from_millis(50).as_nanos()
+        );
+    }
+
+    #[test]
+    fn trap_crash_discards_a_delayed_durability_continuation() {
+        let mut spec = RunSpec::standard(Seed::new(0x7e), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(250_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.clients = 0;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .handle_fault(FaultAction::SlowDisk {
+                node: NodeId::new(1),
+                slow: SlowDisk {
+                    write_extra: Duration::from_millis(50),
+                    fsync_extra: Duration::from_millis(50),
+                    ..SlowDisk::default()
+                },
+            })
+            .expect("slow disk");
+        let request = cc_raft::Message {
+            proto_version: cc_raft::PROTOCOL_VERSION,
+            from: NodeId::new(2),
+            to: NodeId::new(1),
+            term: cc_core::Term::new(1),
+            kind: cc_raft::MessageKind::VoteReq {
+                last_index: cc_core::LogIndex::new(0),
+                last_term: cc_core::Term::new(0),
+            },
+        };
+        let frame = encode_peer_frame(&WireMsg::new(
+            cc_raft::PROTOCOL_VERSION,
+            cc_raft::codec::encode(&request).expect("CCRP"),
+        ))
+        .expect("CCPF");
+        cluster
+            .handle_message(NodeId::new(2), NodeId::new(1), frame)
+            .expect("vote request");
+        cluster.inject(FaultAction::Crash {
+            node: NodeId::new(1),
+        });
+        cluster
+            .advance(Duration::from_millis(150))
+            .expect("stale completion is ignored after crash");
+        let node = cluster
+            .snapshot()
+            .nodes
+            .into_iter()
+            .find(|node| node.id == 1)
+            .expect("node one");
+        assert_eq!(node.status, cc_sim::NodeStatus::Crashed);
+        assert!(cluster.recorder.trace().events.iter().all(|event| {
+            !(event.node == Some(NodeId::new(1))
+                && matches!(event.kind, EventKind::IoDone | EventKind::Flush))
+        }));
+    }
+
+    #[test]
+    fn trap_enospc_fails_closed_before_a_vote_reply() {
+        let mut spec = RunSpec::standard(Seed::new(0x7f), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(250_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.clients = 0;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .handle_fault(FaultAction::EnospcFrom {
+                node: NodeId::new(1),
+            })
+            .expect("ENOSPC fault");
+        let request = cc_raft::Message {
+            proto_version: cc_raft::PROTOCOL_VERSION,
+            from: NodeId::new(2),
+            to: NodeId::new(1),
+            term: cc_core::Term::new(1),
+            kind: cc_raft::MessageKind::VoteReq {
+                last_index: cc_core::LogIndex::new(0),
+                last_term: cc_core::Term::new(0),
+            },
+        };
+        let frame = encode_peer_frame(&WireMsg::new(
+            cc_raft::PROTOCOL_VERSION,
+            cc_raft::codec::encode(&request).expect("CCRP"),
+        ))
+        .expect("CCPF");
+        cluster
+            .handle_message(NodeId::new(2), NodeId::new(1), frame)
+            .expect("vote request");
+        cluster
+            .advance(Duration::from_nanos(0))
+            .expect("failed durability is contained");
+        assert_eq!(
+            cluster
+                .snapshot()
+                .nodes
+                .into_iter()
+                .find(|node| node.id == 1)
+                .expect("node one")
+                .status,
+            cc_sim::NodeStatus::StorageFault
+        );
+        assert!(cluster.recorder.trace().events.iter().all(|event| {
+            !(event.node == Some(NodeId::new(1)) && event.kind == EventKind::NetSend)
+        }));
+    }
+
+    #[test]
+    fn trap_bitrot_is_detected_not_served() {
+        let mut spec = RunSpec::standard(Seed::new(0x80), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(250_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.clients = 0;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        let node = NodeId::new(1);
+        {
+            let slot = cluster.nodes.get_mut(&node).expect("node one");
+            slot.disk.inject_bitrot(WAL_FILE, 0);
+            slot.disk.fsync(WAL_FILE).expect("inject at-rest bit rot");
+        }
+
+        cluster
+            .handle_fault(FaultAction::Crash { node })
+            .expect("crash");
+        cluster
+            .handle_fault(FaultAction::Restart { node })
+            .expect("recovery contains corruption");
+
+        assert_eq!(
+            cluster
+                .snapshot()
+                .nodes
+                .into_iter()
+                .find(|snapshot| snapshot.id == node.get())
+                .expect("node one")
+                .status,
+            cc_sim::NodeStatus::StorageFault
+        );
+        assert!(cluster.recorder.trace().events.iter().any(|event| {
+            event.node == Some(node)
+                && event.kind == EventKind::IoLost
+                && event.payload == b"corrupt-wal"
+        }));
+    }
+
+    #[test]
+    fn trap_corrupt_frame_never_reaches_raft_decoder() {
+        let spec = RunSpec::standard(Seed::new(0x78), FaultProfile::Calm);
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .handle_fault(FaultAction::CorruptFrame {
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                nth: 1,
+                byte: 14,
+                bit: 0,
+            })
+            .expect("corruption fault");
+        cluster
+            .send_message(cc_raft::Message {
+                proto_version: cc_raft::PROTOCOL_VERSION,
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                term: cc_core::Term::new(1),
+                kind: cc_raft::MessageKind::VoteReq {
+                    last_index: cc_core::LogIndex::new(0),
+                    last_term: cc_core::Term::new(0),
+                },
+            })
+            .expect("send");
+        cluster
+            .process_until(Time::from_nanos(5_000_000))
+            .expect("delivery");
+        let term = cluster
+            .nodes
+            .get(&NodeId::new(2))
+            .and_then(|slot| slot.driver.as_ref())
+            .expect("receiver")
+            .node()
+            .raft
+            .hard_state
+            .term;
+        assert_eq!(term, cc_core::Term::new(0));
+        assert!(cluster.recorder.trace().events.iter().any(|event| {
+            event.kind == EventKind::NetDrop && event.node == Some(NodeId::new(2))
+        }));
+    }
+
+    #[test]
+    fn trap_truncated_frame_is_rejected_before_allocation() {
+        let spec = RunSpec::standard(Seed::new(0x79), FaultProfile::Calm);
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .handle_fault(FaultAction::TruncateFrame {
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                nth: 1,
+                keep: 4,
+            })
+            .expect("truncation fault");
+        cluster
+            .send_message(cc_raft::Message {
+                proto_version: cc_raft::PROTOCOL_VERSION,
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                term: cc_core::Term::new(1),
+                kind: cc_raft::MessageKind::VoteReq {
+                    last_index: cc_core::LogIndex::new(0),
+                    last_term: cc_core::Term::new(0),
+                },
+            })
+            .expect("send");
+        cluster
+            .process_until(Time::from_nanos(5_000_000))
+            .expect("delivery");
+        let term = cluster
+            .nodes
+            .get(&NodeId::new(2))
+            .and_then(|slot| slot.driver.as_ref())
+            .expect("receiver")
+            .node()
+            .raft
+            .hard_state
+            .term;
+        assert_eq!(term, cc_core::Term::new(0));
+        assert!(cluster.recorder.trace().events.iter().any(|event| {
+            event.kind == EventKind::NetDrop && event.node == Some(NodeId::new(2))
+        }));
+    }
+
+    #[test]
+    fn trap_valid_frame_decode_failure_is_an_invariant() {
+        let spec = RunSpec::standard(Seed::new(0x7a1), FaultProfile::Calm);
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        let frame = encode_peer_frame(&WireMsg::new(
+            cc_raft::PROTOCOL_VERSION,
+            b"not-a-ccrp".to_vec(),
+        ))
+        .expect("valid outer frame");
+        assert!(matches!(
+            cluster.handle_message(NodeId::new(1), NodeId::new(2), frame),
+            Err(ClusterError::Host {
+                error: HostError::Node(NodeError::Environment("peer CCRP")),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn trap_rechecksummed_malformed_ccrp_never_reaches_state_machine() {
+        let spec = RunSpec::standard(Seed::new(0x7a), FaultProfile::Calm);
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .handle_fault(FaultAction::MutateRaftAndRechecksum {
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                nth: 1,
+                mutation: CcrpMutation::MessageTag(99),
+            })
+            .expect("mutation fault");
+        cluster
+            .send_message(cc_raft::Message {
+                proto_version: cc_raft::PROTOCOL_VERSION,
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                term: cc_core::Term::new(1),
+                kind: cc_raft::MessageKind::VoteReq {
+                    last_index: cc_core::LogIndex::new(0),
+                    last_term: cc_core::Term::new(0),
+                },
+            })
+            .expect("send");
+        cluster
+            .process_until(Time::from_nanos(5_000_000))
+            .expect("delivery");
+        let term = cluster
+            .nodes
+            .get(&NodeId::new(2))
+            .and_then(|slot| slot.driver.as_ref())
+            .expect("receiver")
+            .node()
+            .raft
+            .hard_state
+            .term;
+        assert_eq!(term, cc_core::Term::new(0));
+        assert!(cluster.recorder.trace().events.iter().any(|event| {
+            event.kind == EventKind::NetDrop && event.node == Some(NodeId::new(2))
+        }));
+    }
+
+    #[test]
+    fn trap_replayed_append_is_idempotent() {
+        let spec = RunSpec::standard(Seed::new(0x7c), FaultProfile::Calm);
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .handle_fault(FaultAction::ReplayFrame {
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                nth: 2,
+                at: Time::from_nanos(3_000_000),
+            })
+            .expect("replay fault");
+        let append = cc_raft::Message {
+            proto_version: cc_raft::PROTOCOL_VERSION,
+            from: NodeId::new(1),
+            to: NodeId::new(2),
+            term: cc_core::Term::new(1),
+            kind: cc_raft::MessageKind::AppendReq(cc_raft::AppendRequest {
+                prev_index: cc_core::LogIndex::new(0),
+                prev_term: cc_core::Term::new(0),
+                entries: vec![cc_raft::Entry {
+                    term: cc_core::Term::new(1),
+                    index: cc_core::LogIndex::new(1),
+                    kind: cc_raft::EntryKind::Noop,
+                    payload: Vec::new(),
+                }],
+                leader_commit: cc_core::LogIndex::new(0),
+                read_round: 0,
+            }),
+        };
+        cluster.send_message(append.clone()).expect("first send");
+        cluster.send_message(append).expect("second send");
+        cluster
+            .process_until(Time::from_nanos(10_000_000))
+            .expect("delivery");
+        let receiver = cluster
+            .nodes
+            .get(&NodeId::new(2))
+            .and_then(|slot| slot.driver.as_ref())
+            .expect("receiver");
+        let receiver = receiver.node();
+        assert_eq!(receiver.raft.log.len(), 1);
+        assert_eq!(receiver.raft.log[0].index, cc_core::LogIndex::new(1));
+    }
+
+    #[test]
+    fn trap_network_byte_charge_releases_for_every_delivery_outcome() {
+        let mut spec = RunSpec::standard(Seed::new(0x82), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(1);
+        spec.end_time = spec.config.end_time;
+        spec.workload.clients = 0;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .send_message(cc_raft::Message {
+                proto_version: cc_raft::PROTOCOL_VERSION,
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                term: cc_core::Term::new(1),
+                kind: cc_raft::MessageKind::VoteReq {
+                    last_index: cc_core::LogIndex::new(0),
+                    last_term: cc_core::Term::new(0),
+                },
+            })
+            .expect("the horizon cancels the modeled delivery");
+        assert_eq!(
+            cluster.network.inflight(NodeId::new(1), NodeId::new(2)),
+            Ok((0, 0)),
+            "an unscheduled beyond-horizon frame must release both reservations"
+        );
+
+        let mut cluster = SimCluster::new(
+            RunSpec::standard(Seed::new(0x83), FaultProfile::Rough),
+            RecorderLevel::Gate,
+        )
+        .expect("cluster");
+        let end = cluster.spec.end_time;
+        cluster.process_until(end).expect("run through horizon");
+        let ids: Vec<_> = cluster.nodes.keys().copied().collect();
+        for from in &ids {
+            for to in &ids {
+                if from != to {
+                    assert_eq!(
+                        cluster.network.inflight(*from, *to),
+                        Ok((0, 0)),
+                        "link {from}->{to} leaked an in-flight reservation"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trap_simulator_has_no_message_side_channel() {
+        let mut spec = RunSpec::standard(Seed::new(0x84), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(10_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.clients = 0;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        let message = cc_raft::Message {
+            proto_version: cc_raft::PROTOCOL_VERSION,
+            from: NodeId::new(1),
+            to: NodeId::new(2),
+            term: cc_core::Term::new(1),
+            kind: cc_raft::MessageKind::VoteReq {
+                last_index: cc_core::LogIndex::new(0),
+                last_term: cc_core::Term::new(0),
+            },
+        };
+        cluster.send_message(message).expect("CCRP through CCPF");
+        let frame = cluster
+            .replay_frames
+            .get(&(NodeId::new(1), NodeId::new(2)))
+            .expect("the transport retains only frame bytes");
+        let (outer, used) = decode_peer_frame(frame).expect("CCPF frame");
+        assert_eq!(used, frame.len());
+        assert!(cc_raft::codec::decode(&outer.payload).is_ok());
+        cluster
+            .process_until(Time::from_nanos(10_000_000))
+            .expect("frame delivery");
+    }
+
+    #[test]
+    fn trap_trace_payloads_do_not_use_debug_format() {
+        let run = run_spec(
+            RunSpec::standard(Seed::new(0x85), FaultProfile::Calm),
+            RecorderLevel::Gate,
+        )
+        .expect("cluster");
+        let frames: Vec<_> = run
+            .trace
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::NetSend | EventKind::NetRecv | EventKind::NetDrop
+                )
+            })
+            .collect();
+        assert!(!frames.is_empty());
+        for event in frames {
+            assert_eq!(event.payload.len(), 9);
+            assert_eq!(&event.payload[..2], &1_u16.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn trap_heal_clears_sustained_link_fault_without_leaking_bytes() {
+        let spec = RunSpec::standard(Seed::new(0x7b), FaultProfile::Calm);
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .handle_fault(FaultAction::DelayLink {
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                extra: Duration::from_millis(20),
+            })
+            .expect("delay fault");
+        cluster
+            .replay_frames
+            .insert((NodeId::new(1), NodeId::new(2)), vec![1, 2]);
+        cluster.handle_fault(FaultAction::Heal).expect("heal fault");
+        assert!(cluster.frame_faults.is_empty());
+        assert!(cluster.replay_faults.is_empty());
+        assert!(cluster.replay_frames.is_empty());
+        let delayed = cluster
+            .network
+            .send(cluster.now, NodeId::new(1), NodeId::new(2), vec![1])
+            .expect("network send");
+        let [NetworkDecision::Delivered(delivery)] = delayed.as_slice() else {
+            panic!("healed link must deliver one datagram");
+        };
+        assert_eq!(delivery.at, cluster.now + Duration::from_millis(1));
     }
 
     #[test]
@@ -1975,14 +3123,11 @@ mod tests {
         assert_eq!(restarted.2, restarted.1);
     }
 
-    /// The wipe wing's actual claim. A wiped node loses every durable byte, so
-    /// there is no log to replay and no prefix for the leader to append onto:
-    /// the only way back is state transfer. Before this was wired the `wipe`
-    /// profile wiped node 1 and never restarted it, so the profile proved the
-    /// cluster survived losing a disk and nothing about the node rejoining —
-    /// and `EventKind::SnapshotInstall` was emitted nowhere in the workspace.
+    /// A wiped node loses every durable byte, then re-enters only through a
+    /// Join-origin durable prefix and ordinary Raft traffic.  The simulator is
+    /// expressly forbidden from copying a leader's state into that node.
     #[test]
-    fn wiped_node_rejoins_by_installing_the_leader_snapshot() {
+    fn trap_wipe_has_no_out_of_band_state_copy() {
         let mut spec = RunSpec::standard(Seed::new(0x9c), FaultProfile::Calm);
         spec.config.end_time = Time::from_nanos(10_000_000_000);
         spec.end_time = spec.config.end_time;
@@ -2019,8 +3164,8 @@ mod tests {
             event.kind == EventKind::SnapshotInstall && event.node == Some(NodeId::new(2))
         });
         assert!(
-            installed,
-            "the rejoining node was caught up by state transfer"
+            !installed,
+            "a wiped node must not receive an out-of-band state copy"
         );
 
         // Catching up means catching up: the rejoined node ends at the same
@@ -2061,18 +3206,9 @@ mod tests {
         assert!(matches!(run.verdict, Verdict::Linearizable { .. }));
     }
 
-    /// The crash/pause distinction, pinned. Under pause semantics the restarted
-    /// node keeps its applied index and this fails.
-    #[test]
-    fn crash_drops_volatile_state_and_restart_recovers_only_durable_state() {
-        let mut spec = RunSpec::standard(Seed::new(0x61), FaultProfile::Calm);
-        spec.config.end_time = Time::from_nanos(10_000_000_000);
-        spec.end_time = spec.config.end_time;
-        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
-        cluster
-            .advance(Duration::from_secs(3))
-            .expect("warmup advances");
-
+    fn isolate_crash_and_restart(
+        cluster: &mut SimCluster,
+    ) -> (ClusterNodeSnapshot, ClusterNodeSnapshot) {
         let before = cluster.snapshot();
         let victim = before
             .nodes
@@ -2120,39 +3256,137 @@ mod tests {
             Role::Follower,
             "restarts come back as followers"
         );
+        (victim.clone(), recovered.clone())
     }
 
-    /// The old `index * 64` slotting silently overlapped entries once a payload
-    /// exceeded 64 bytes; a round-trip over a large payload pins the fix.
+    /// The crash/pause distinction, pinned. Under pause semantics the restarted
+    /// node keeps its applied index and this fails.
     #[test]
-    fn wal_round_trips_entries_larger_than_the_old_fixed_slot() {
-        let entries: Vec<Entry> = (1..=4)
-            .map(|index| Entry {
+    fn trap_crash_discards_volatile_state() {
+        let mut spec = RunSpec::standard(Seed::new(0x61), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(10_000_000_000);
+        spec.end_time = spec.config.end_time;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .advance(Duration::from_secs(3))
+            .expect("warmup advances");
+        let (before, after) = isolate_crash_and_restart(&mut cluster);
+        assert!(before.applied > 0, "test requires live volatile state");
+        assert_eq!(after.applied, 0, "crash drops volatile applied state");
+        assert_eq!(after.commit, 0, "crash drops volatile commit state");
+    }
+
+    #[test]
+    fn trap_restart_recovers_hard_state_log_and_membership_from_disk() {
+        let mut spec = RunSpec::standard(Seed::new(0x62), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(10_000_000_000);
+        spec.end_time = spec.config.end_time;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .advance(Duration::from_secs(3))
+            .expect("warmup advances");
+        let (before, after) = isolate_crash_and_restart(&mut cluster);
+        assert!(after.durable_bytes > 0, "durable prefix survived restart");
+        assert!(
+            !after.log_tail.is_empty(),
+            "recovered Driver exposes log prefix"
+        );
+        assert!(
+            after.term >= before.term,
+            "recovered hard state cannot regress to a fresh term"
+        );
+        assert_eq!(
+            after.voters, before.voters,
+            "membership must come from the durable prefix, not discovery"
+        );
+    }
+
+    /// Simulator durability uses the same CCLR record stream as the shared
+    /// Driver. A long append and torn final record are recovered by `cc-log`,
+    /// not a host-owned slot decoder.
+    #[test]
+    fn trap_simulator_recovers_framed_cc_log_prefix() {
+        let entries: Vec<cc_raft::Entry> = (1..=4)
+            .map(|index| cc_raft::Entry {
                 term: cc_core::Term::new(7),
                 index: cc_core::LogIndex::new(index),
                 kind: cc_raft::EntryKind::App,
                 payload: vec![index as u8; 200],
             })
             .collect();
-        let mut durable = vec![0_u8; WAL_HARD_STATE_LEN as usize];
-        durable[0..8].copy_from_slice(&WAL_HARD_STATE_VERSION.to_le_bytes());
-        durable[8..16].copy_from_slice(&9_u64.to_le_bytes());
-        durable[16..24].copy_from_slice(&3_u64.to_le_bytes());
+        let membership = cc_core::MembershipState::new([NodeId::new(1)].into_iter().collect())
+            .expect("membership");
+        let mut durable = cc_log::encode_framed_durable_record(&cc_log::DurableRecord::Genesis(
+            Box::new(cc_log::Genesis {
+                origin: cc_log::Origin::Bootstrap,
+                cluster_id: [7; 16],
+                policy: ClusterPolicy::default(),
+                membership,
+            }),
+        ))
+        .expect("genesis");
+        durable.extend(
+            cc_log::encode_framed_durable_record(&cc_log::DurableRecord::Hard(
+                cc_raft::HardState {
+                    term: cc_core::Term::new(9),
+                    voted_for: Some(NodeId::new(3)),
+                },
+            ))
+            .expect("hard state"),
+        );
         for entry in &entries {
-            durable.extend_from_slice(&encode_entry(entry));
+            durable.extend(
+                cc_log::encode_framed_durable_record(&cc_log::DurableRecord::Append(entry.clone()))
+                    .expect("append"),
+            );
         }
 
-        let (hard, decoded, offsets, end) = decode_wal(&durable);
-        assert_eq!(hard.term.get(), 9);
-        assert_eq!(hard.voted_for, Some(NodeId::new(3)));
-        assert_eq!(decoded, entries);
-        assert_eq!(offsets.len(), 4);
-        assert_eq!(end, durable.len() as u64);
+        let recovered = cc_log::recover_framed_record_stream(&durable).expect("recover");
+        assert_eq!(recovered.state.hard_state.term.get(), 9);
+        assert_eq!(recovered.state.hard_state.voted_for, Some(NodeId::new(3)));
+        assert_eq!(recovered.state.entries, entries);
+        assert_eq!(recovered.bytes_consumed, durable.len() as u64);
 
         // A torn tail is not part of the recovered log.
         durable.truncate(durable.len() - 40);
-        let (_, torn, _, _) = decode_wal(&durable);
-        assert_eq!(torn.len(), 3, "the partial final record is dropped");
+        let torn = cc_log::recover_framed_record_stream(&durable).expect("torn recovery");
+        assert!(torn.torn_tail_truncated);
+        assert_eq!(
+            torn.state.entries.len(),
+            3,
+            "the partial final record is dropped"
+        );
+    }
+
+    #[test]
+    fn trap_architecture_has_one_host_boundary_and_one_raft_log() {
+        let spec = RunSpec::standard(Seed::new(0x63), FaultProfile::Calm);
+        let cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        for slot in cluster.nodes.values() {
+            assert!(slot.driver.is_some(), "every simulator node owns a Driver");
+            let durable = slot.disk.durable(WAL_FILE).expect("genesis durable prefix");
+            let recovered = cc_log::recover_framed_record_stream(durable).expect("cc-log recovery");
+            assert_eq!(recovered.bytes_consumed as usize, durable.len());
+            assert!(!recovered.torn_tail_truncated);
+            assert_eq!(recovered.state.genesis, slot.genesis);
+        }
+    }
+
+    #[test]
+    fn trap_single_scheduler_enforces_per_instant_limit() {
+        let mut spec = RunSpec::standard(Seed::new(0x1a), FaultProfile::Calm);
+        spec.config.max_events = 100;
+        spec.config.max_events_per_instant = 1;
+        spec.config.end_time = Time::from_nanos(1);
+        spec.end_time = spec.config.end_time;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        assert!(matches!(
+            cluster.advance(Duration::from_nanos(0)),
+            Err(ClusterError::Run(RunError::InstantLimit {
+                at: Time { .. },
+                limit: 1,
+            }))
+        ));
     }
 
     /// The membership profile used to be byte-identical to `rough`. It must now
