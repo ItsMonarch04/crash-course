@@ -6,5 +6,8 @@ theater/node_modules/
 theater/dist/
 theater/public/wasm/
 /artifacts/
+/campaigns/ledger.tsv
+/campaigns/kata-ledger.tsv
+/campaigns/receipts/
 /ccdb-data/
 bench/results/*.json

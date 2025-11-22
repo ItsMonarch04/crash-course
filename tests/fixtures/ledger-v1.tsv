@@ -1,0 +1,3 @@
+# cc-ledger-v1
+build_label	config_hash	profile	seed_hex	verdict	events	checker_states	peak_total_bytes	artifact_hash
+fixture-build	0000000000000011	rough	0x0000000000000022	ok	7	13	29	-

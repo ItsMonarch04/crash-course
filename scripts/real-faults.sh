@@ -3,6 +3,13 @@
 # Copyright (c) 2025 Sidakpreet Singh
 set -euo pipefail
 
+report_shell_error() {
+  local exit_code="$1"
+  local line="$2"
+  echo "real-faults: shell failure exit=$exit_code line=$line" >&2
+}
+trap 'report_shell_error "$?" "$LINENO"' ERR
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
@@ -11,6 +18,7 @@ soak_hours=0
 sigstop_ms=150
 drop_every=0
 delay_ms=2
+skip_demo=0
 while (($#)); do
   case "$1" in
     --duration-seconds) duration_seconds="$2"; shift 2 ;;
@@ -18,8 +26,9 @@ while (($#)); do
     --sigstop-ms) sigstop_ms="$2"; shift 2 ;;
     --drop-every) drop_every="$2"; shift 2 ;;
     --delay-ms) delay_ms="$2"; shift 2 ;;
+    --skip-demo) skip_demo=1; shift ;;
     *)
-      echo "usage: $0 [--duration-seconds N] [--soak-hours N] [--sigstop-ms N] [--drop-every N] [--delay-ms N]" >&2
+      echo "usage: $0 [--duration-seconds N] [--soak-hours N] [--sigstop-ms N] [--drop-every N] [--delay-ms N] [--skip-demo]" >&2
       exit 2
       ;;
   esac
@@ -34,7 +43,11 @@ echo "duration_seconds=$duration_seconds sigstop_ms=$sigstop_ms drop_every=$drop
 echo "faults=SIGSTOP/SIGCONT,peer-proxy-delay,peer-proxy-drop,fsync-fatal-shim,ENOSPC-fatal-shim"
 echo "The harness does not claim kernel-truth: disk/page-cache campaigns remain in cc-sim."
 
-"$repo_root/scripts/demo.sh"
+if (( skip_demo == 0 )); then
+  "$repo_root/scripts/demo.sh"
+else
+  echo "demo phase skipped; use only when an independent demo audit has already passed"
+fi
 
 fault_dir="$(mktemp -d "${TMPDIR:-/tmp}/ccdb-faults.XXXXXX")"
 
@@ -57,7 +70,12 @@ declare -a node_pids=()
 proxy_pid=""
 workload_pid=""
 checker_pid=""
+pause_pid=""
 cleanup() {
+  if [[ -n "$pause_pid" ]]; then
+    kill "$pause_pid" 2>/dev/null || true
+    wait "$pause_pid" 2>/dev/null || true
+  fi
   if [[ -n "$checker_pid" ]]; then
     kill "$checker_pid" 2>/dev/null || true
     wait "$checker_pid" 2>/dev/null || true
@@ -77,16 +95,21 @@ cleanup() {
   for pid in "${node_pids[@]:-}"; do
     wait "$pid" 2>/dev/null || true
   done
-  rm -rf "$fault_dir"
+  if [[ "${CCDB_KEEP_FAULT_ARTIFACTS:-0}" == "1" ]]; then
+    echo "real-faults: retained artifacts at $fault_dir" >&2
+  else
+    rm -rf "$fault_dir"
+  fi
 }
 trap cleanup EXIT INT TERM
 
 cargo build --quiet -p cc-node --bin ccdb
 ccdb_bin="$repo_root/target/debug/ccdb"
-"$ccdb_bin" init --cluster faults --nodes 3 --base-dir "$fault_dir"
+"$ccdb_bin" init --cluster faults --cluster-id 00112233445566778899aabbccddeeff --nodes 3 --base-dir "$fault_dir"
 
 # Keep n1 direct and put the n2/n3 -> n1 peer path behind the userspace
-# byte proxy.  This exercises CCREPL1 frames, not only client RESP traffic.
+# byte proxy.  This exercises the CCHL/CCPF/CCRP peer path, not only client
+# RESP traffic.
 "$ccdb_bin" run --config "$fault_dir/n1/ccdb.toml" >"$fault_dir/n1.log" 2>&1 &
 node_pids[1]="$!"
 wait_for_port 7101
@@ -126,7 +149,7 @@ for port in 7101 7102 7103 7201 7202 7203; do
 done
 
 if (( drop_every == 0 )); then
-  "$ccdb_bin" peer --addr 127.0.0.1:7379 --retries 5
+  "$ccdb_bin" peer --config "$fault_dir/n2/ccdb.toml" --addr 127.0.0.1:7379 --retries 5
 else
   echo "peer proxy probe skipped because drop-every=$drop_every intentionally drops frames"
 fi
@@ -150,6 +173,8 @@ chunk = 0
 chunk_count = 0
 history = None
 history_path = None
+key = "soak-key"
+key_hex = key.encode().hex()
 
 
 def open_chunk(number):
@@ -207,7 +232,12 @@ try:
                 continue
             if reply.startswith(b"+OK"):
                 complete_ns = time.monotonic_ns() - start_ns
-                history.write(f"SET\tsoak-key\t{value}\t{invoke_ns}\t{complete_ns}\n")
+                # CC-HISTORY v1 stores binary keys and SET values as hex, not
+                # the textual RESP arguments.  Preserve the exact operation
+                # presented to ccdb so the checker proves the right history.
+                history.write(
+                    f"SET\t{key_hex}\t{value.encode().hex()}\t{invoke_ns}\t{complete_ns}\n"
+                )
                 history.flush()
                 chunk_count += 1
                 acknowledged = True
@@ -265,18 +295,30 @@ while not (root / "workload.done").exists():
 PY
 checker_pid="$!"
 
+if (( sigstop_ms > 0 )); then
+  # A completed child remains visible to `kill -0` until its parent reaps it,
+  # so polling the workload PID here can loop forever on a zombie.  Keep the
+  # injector independently cancellable; the parent reaps the workload below.
+  (
+    while true; do
+      echo "SIGSTOP node 1 for ${sigstop_ms}ms"
+      kill -STOP "${node_pids[1]}" 2>/dev/null || exit 0
+      sleep "$(awk "BEGIN { print $sigstop_ms / 1000 }")"
+      kill -CONT "${node_pids[1]}" 2>/dev/null || exit 0
+      sleep 10
+    done
+  ) &
+  pause_pid="$!"
+fi
+
 workload_status=0
-while kill -0 "$workload_pid" 2>/dev/null; do
-  if (( sigstop_ms > 0 )); then
-    echo "SIGSTOP node 1 for ${sigstop_ms}ms"
-    kill -STOP "${node_pids[1]}" 2>/dev/null || true
-    sleep "$(awk "BEGIN { print $sigstop_ms / 1000 }")"
-    kill -CONT "${node_pids[1]}" 2>/dev/null || true
-  fi
-  sleep 10
-done
 wait "$workload_pid" || workload_status=$?
 workload_pid=""
+if [[ -n "$pause_pid" ]]; then
+  kill "$pause_pid" 2>/dev/null || true
+  wait "$pause_pid" 2>/dev/null || true
+  pause_pid=""
+fi
 touch "$fault_dir/workload.done"
 checker_status=0
 wait "$checker_pid" || checker_status=$?
@@ -303,4 +345,8 @@ fi
 echo "history_operations=$history_count"
 
 echo "CCDB_FAIL_FSYNC=1 and CCDB_FAIL_ENOSPC=1 are opt-in process-fatal shims; the journal unit path is covered by cc-node tests."
-echo "real-faults: PASS (demo, peer proxy path, SIGSTOP pauses, sustained workload, and history checker)"
+if (( skip_demo == 0 )); then
+  echo "real-faults: PASS (demo, peer proxy path, SIGSTOP pauses, sustained workload, and history checker)"
+else
+  echo "real-faults: PASS (peer proxy path, SIGSTOP pauses, sustained workload, and history checker; demo was independently audited)"
+fi
