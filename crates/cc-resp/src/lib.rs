@@ -238,6 +238,14 @@ pub enum ClientCommand {
         prefix: Option<Vec<u8>>,
         count: usize,
     },
+    /// A caller-owned durable retry identity around exactly one mutating
+    /// command. The adapter keeps the connection route separate from these
+    /// values before constructing the replicated session envelope.
+    Request {
+        client: u64,
+        sequence: u64,
+        command: Box<ClientCommand>,
+    },
     Info,
     Unknown(Vec<u8>),
 }
@@ -256,6 +264,10 @@ pub fn parse_command(value: RespValue) -> Result<ClientCommand, RespError> {
             )),
         })
         .collect::<Result<_, _>>()?;
+    parse_args(args)
+}
+
+fn parse_args(args: Vec<Vec<u8>>) -> Result<ClientCommand, RespError> {
     let command = args.first().map_or(&b""[..], Vec::as_slice);
     let upper = command
         .iter()
@@ -304,6 +316,11 @@ pub fn parse_command(value: RespValue) -> Result<ClientCommand, RespError> {
         b"TTL" if args.len() == 2 => Ok(ClientCommand::Ttl(args[1].clone())),
         b"PERSIST" if args.len() == 2 => Ok(ClientCommand::Persist(args[1].clone())),
         b"SCAN" if args.len() >= 2 => parse_scan(args),
+        b"CC.REQUEST" if args.len() >= 4 => Ok(ClientCommand::Request {
+            client: parse_u64(&args[1])?,
+            sequence: parse_u64(&args[2])?,
+            command: Box::new(parse_args(args[3..].to_vec())?),
+        }),
         b"INFO" if args.len() == 1 => Ok(ClientCommand::Info),
         _ => Ok(ClientCommand::Unknown(
             args.first().cloned().unwrap_or_default(),
@@ -467,6 +484,28 @@ mod tests {
         assert_eq!(
             parse_command(command(&[b"TTL", b"k"])).expect("ttl"),
             ClientCommand::Ttl(b"k".to_vec())
+        );
+    }
+
+    #[test]
+    fn trap_cc_request_keeps_the_caller_identity_outside_the_inner_command() {
+        let parts: &[&[u8]] = &[b"CC.REQUEST", b"77", b"4", b"INCRBY", b"counter", b"2"];
+        let command = RespValue::Array(
+            parts
+                .iter()
+                .map(|part| RespValue::Bulk(Some(part.to_vec())))
+                .collect(),
+        );
+        assert_eq!(
+            parse_command(command).expect("CC.REQUEST"),
+            ClientCommand::Request {
+                client: 77,
+                sequence: 4,
+                command: Box::new(ClientCommand::IncrBy {
+                    key: b"counter".to_vec(),
+                    delta: 2,
+                }),
+            }
         );
     }
 

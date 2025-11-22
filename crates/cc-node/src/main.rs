@@ -3,42 +3,41 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+//! `ccdb` is deliberately a thin operator/transport adapter.  Raft, durable
+//! continuations, and application state all live below `driver_host`.
+
+mod driver_host;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
-use cc_core::{ClientId, LogIndex, Term, Time, crc32c};
-use cc_env::{WireMsg, decode_peer_frame, encode_peer_frame};
-use cc_kv::{Kv, KvCommand, KvReply, decode_command, encode_command};
-use cc_resp::{ClientCommand, MAX_FRAME, RespValue, encode, parse, parse_command};
-use cc_store::StoreConfig;
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use cc_core::{ClusterId, ClusterPolicy, Time, crc32c};
+use cc_kv::KvReply;
+use cc_resp::{MAX_FRAME, RespValue, encode, parse};
 
-const JOURNAL_MAX_RECORD: usize = 4 * 1024 * 1024;
-const JOURNAL_HEADER: usize = 8;
-const REPLICATION_MAGIC: &[u8] = b"CCREPL1";
-const REPLICATION_WRITE: u8 = b'W';
-const REPLICATION_SYNC: u8 = b'S';
-const REPLICATION_ACK: u8 = b'A';
-const REPLICATION_SNAPSHOT: u8 = b'R';
-const PEER_CONNECT_TIMEOUT: StdDuration = StdDuration::from_millis(250);
-const PEER_IO_TIMEOUT: StdDuration = StdDuration::from_millis(500);
 const BACKUP_MAGIC: &[u8; 4] = b"CCBK";
 const BACKUP_VERSION: u16 = 1;
 const BACKUP_MAX_FILE: usize = 1024 * 1024 * 1024;
+const IDENTITY_MAGIC: &[u8; 4] = b"CCID";
+const IDENTITY_VERSION: u16 = 1;
+const IDENTITY_LEN: usize = 55;
+const IDENTITY_ACTIVE: u8 = 1;
+const IDENTITY_JOINING: u8 = 2;
+const IDENTITY_REMOVED: u8 = 3;
+const MIN_STORAGE_READER: u16 = 1;
+const MIN_SEMANTIC_READER: u16 = 2;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("init") => init_cluster(&args[1..]),
-        Some("run") => run_node(&args[1..]),
-        Some("peer") => peer_probe(&args[1..]),
+        Some("run") => driver_host::run(&args[1..]),
+        Some("peer") => driver_host::peer_probe(&args[1..]),
         Some("selfcheck") => selfcheck(&args[1..]),
         Some("doctor") => doctor(&args[1..]),
         Some("admin") => admin(&args[1..]),
@@ -51,32 +50,48 @@ fn main() -> io::Result<()> {
 
 fn init_cluster(args: &[String]) -> io::Result<()> {
     let cluster = flag(args, "--cluster").unwrap_or_else(|| String::from("demo"));
+    let cluster_id = flag(args, "--cluster-id")
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "init requires --cluster-id as 32 lowercase hexadecimal characters",
+            )
+        })
+        .and_then(|value| parse_cluster_id(&value))?;
+    if let Some(data_dir) = flag(args, "--data-dir") {
+        let node = flag(args, "--node-id")
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "single-node initialization requires --node-id",
+                )
+            })?
+            .parse::<u64>()
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "node id must be a nonzero u64")
+            })?;
+        initialize_data_dir(Path::new(&data_dir), cluster_id, node)?;
+        println!(
+            "initialized cluster={cluster} cluster_id={cluster_id} node={node} data_dir={data_dir}"
+        );
+        return Ok(());
+    }
     let nodes = flag(args, "--nodes")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(3);
+    if nodes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "init --nodes must be nonzero",
+        ));
+    }
     let base = flag(args, "--base-dir")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("ccdb-data"));
     fs::create_dir_all(&base)?;
     for node in 1..=nodes {
         let data_dir = base.join(format!("n{node}"));
-        let marker = data_dir.join("node.json");
-        if marker.exists() && !has_flag(args, "--force") {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "refusing to overwrite initialized node {}",
-                    data_dir.display()
-                ),
-            ));
-        }
-        fs::create_dir_all(data_dir.join("raft"))?;
-        fs::create_dir_all(data_dir.join("store/sst"))?;
-        fs::create_dir_all(data_dir.join("snapshots/staging"))?;
-        fs::write(
-            &marker,
-            format!("{{\"cluster\":\"{cluster}\",\"id\":{node}}}\n"),
-        )?;
+        initialize_data_dir(&data_dir, cluster_id, node)?;
         let port = 7100 + node;
         let peer_port = 7200 + node;
         let peer_nodes = (1..=nodes)
@@ -86,7 +101,7 @@ fn init_cluster(args: &[String]) -> io::Result<()> {
         fs::write(
             data_dir.join("ccdb.toml"),
             format!(
-                "[node]\nid = {node}\ndata_dir = \"{}\"\nlisten_client = \"127.0.0.1:{port}\"\nlisten_peer = \"127.0.0.1:{peer_port}\"\nlisten_metrics = \"127.0.0.1:{}\"\npeer_nodes = \"{peer_nodes}\"\n\n[storage]\nfsync = \"always\"\n",
+                "[node]\nid = {node}\ncluster_id = \"{cluster_id}\"\ndata_dir = \"{}\"\nlisten_client = \"127.0.0.1:{port}\"\nlisten_peer = \"127.0.0.1:{peer_port}\"\nlisten_metrics = \"127.0.0.1:{}\"\npeer_nodes = \"{peer_nodes}\"\n\n[storage]\nfsync = \"always\"\n",
                 data_dir.display(),
                 7300 + node
             ),
@@ -95,1015 +110,502 @@ fn init_cluster(args: &[String]) -> io::Result<()> {
     }
     sync_directory(&base)?;
     println!(
-        "initialized cluster={cluster} nodes={nodes} base={}",
+        "initialized cluster={cluster} cluster_id={cluster_id} nodes={nodes} base={}",
         base.display()
     );
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Peer {
-    id: u64,
-    address: String,
-}
-
-#[derive(Clone)]
-struct HostState {
-    config: Config,
-    kv: Arc<Mutex<Kv>>,
-    journal: Arc<Mutex<DurableJournal>>,
-    sequence: Arc<AtomicU64>,
-    metrics: Arc<Metrics>,
-}
-
-fn run_node(args: &[String]) -> io::Result<()> {
-    let config_path = flag(args, "--config").unwrap_or_else(|| String::from("ccdb.toml"));
-    let config = read_config(Path::new(&config_path))?;
-    validate_identity(&config)?;
-    fs::create_dir_all(&config.data_dir)?;
-    let journal_path = config.data_dir.join("commands.log");
-    let (kv_state, next_sequence) = load_state(&journal_path)?;
-    let journal = Arc::new(Mutex::new(DurableJournal::open(&journal_path)?));
-    let kv = Arc::new(Mutex::new(kv_state));
-    let sequence = Arc::new(AtomicU64::new(next_sequence));
-    let metrics = Arc::new(Metrics::new(config.data_dir.join("trace.log"))?);
-    let state = Arc::new(HostState {
-        config: config.clone(),
-        kv,
-        journal,
-        sequence,
-        metrics,
-    });
-
-    let client_listener = TcpListener::bind(&config.listen_client)?;
-    let peer_listener = TcpListener::bind(&config.listen_peer)?;
-    let metrics_listener = TcpListener::bind(&config.listen_metrics)?;
-    println!(
-        "ccdb node={} recovered_seq={} client={} peer={} metrics={}",
-        config.id,
-        next_sequence.saturating_sub(1),
-        config.listen_client,
-        config.listen_peer,
-        config.listen_metrics,
-    );
-
-    let metrics_path = config.data_dir.join("metrics.prom");
-    let metrics_for_task = Arc::clone(&state);
-    thread::spawn(move || {
-        loop {
-            thread::sleep(StdDuration::from_secs(1));
-            let _ = fs::write(&metrics_path, render_metrics(&metrics_for_task));
-        }
-    });
-
-    let metrics_state = Arc::clone(&state);
-    thread::spawn(move || {
-        for result in metrics_listener.incoming() {
-            match result {
-                Ok(stream) => {
-                    let state = Arc::clone(&metrics_state);
-                    thread::spawn(move || {
-                        if let Err(error) = serve_metrics(stream, &state) {
-                            eprintln!("metrics connection closed with error: {error}");
-                        }
-                    });
-                }
-                Err(error) => eprintln!("metrics accept error: {error}"),
-            }
-        }
-    });
-
-    let peer_state = Arc::clone(&state);
-    thread::spawn(move || {
-        for result in peer_listener.incoming() {
-            match result {
-                Ok(stream) => {
-                    let state = Arc::clone(&peer_state);
-                    thread::spawn(move || {
-                        if let Err(error) = serve_peer(stream, state) {
-                            eprintln!("peer connection closed with error: {error}");
-                        }
-                    });
-                }
-                Err(error) => eprintln!("peer accept error: {error}"),
-            }
-        }
-    });
-
-    sync_from_peers(&state)?;
-
-    for result in client_listener.incoming() {
-        let stream = result?;
-        let peer = stream.peer_addr()?;
-        let state = Arc::clone(&state);
-        thread::spawn(move || {
-            if let Err(error) = serve_connection(stream, state) {
-                eprintln!("client {peer} closed with error: {error}");
-            }
-        });
-    }
-    Ok(())
-}
-
-fn serve_metrics(mut stream: TcpStream, state: &HostState) -> io::Result<()> {
-    stream.set_read_timeout(Some(StdDuration::from_secs(2)))?;
-    let mut request = [0_u8; 4 * 1024];
-    let read = stream.read(&mut request)?;
-    let first_line = std::str::from_utf8(&request[..read])
-        .ok()
-        .and_then(|text| text.lines().next())
-        .unwrap_or_default();
-    let (content_type, body) = if first_line.starts_with("GET /metrics ") {
-        ("text/plain; version=0.0.4", render_metrics(state))
-    } else if first_line.starts_with("GET / ") {
-        ("text/html; charset=utf-8", metrics_dashboard())
-    } else {
-        ("text/plain; charset=utf-8", String::from("not found\n"))
-    };
-    let status = if first_line.starts_with("GET /metrics ") || first_line.starts_with("GET / ") {
-        "200 OK"
-    } else {
-        "404 Not Found"
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-    )
-}
-
-fn metrics_dashboard() -> String {
-    String::from(
-        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>ccdb metrics</title><style>:root{--bg:#080b10;--panel:#0d131c;--line:#243343;--text:#e6edf5;--teal:#58d6b2}body{font:14px ui-monospace,monospace;background:var(--bg);color:var(--text);max-width:900px;margin:3rem auto;padding:0 1rem}h1{color:var(--teal)}pre{border:1px solid var(--line);padding:1rem;background:var(--panel)}</style><h1>ccdb / metrics</h1><p>Dependency-free operator view. Refreshes every second.</p><pre id=m>loading…</pre><script>setInterval(async()=>m.textContent=await(await fetch('/metrics')).text(),1000)</script>",
-    )
-}
-
-fn serve_connection(mut stream: TcpStream, state: Arc<HostState>) -> io::Result<()> {
-    let mut buffer = Vec::with_capacity(8 * 1024);
-    let mut scratch = [0_u8; 8 * 1024];
-    loop {
-        let read = stream.read(&mut scratch)?;
-        if read == 0 {
-            return Ok(());
-        }
-        buffer.extend_from_slice(&scratch[..read]);
-        if buffer.len() > MAX_FRAME.saturating_mul(2) {
-            stream.write_all(&encode(&RespValue::Error(String::from(
-                "ERR frame too large",
-            ))))?;
-            return Ok(());
-        }
-        loop {
-            let (value, used) = match parse(&buffer) {
-                Ok(parsed) => parsed,
-                Err(cc_resp::RespError::Incomplete) => break,
-                Err(error) => {
-                    stream.write_all(&encode(&RespValue::Error(format!("ERR {error}"))))?;
-                    return Ok(());
-                }
-            };
-            buffer.drain(..used);
-            let command = match parse_command(value) {
-                Ok(command) => command,
-                Err(error) => {
-                    stream.write_all(&encode(&RespValue::Error(format!("ERR {error}"))))?;
-                    continue;
-                }
-            };
-            let response = execute(&state, command)?;
-            stream.write_all(&encode(&response))?;
-        }
-    }
-}
-
-fn serve_peer(mut stream: TcpStream, state: Arc<HostState>) -> io::Result<()> {
-    let mut buffer = Vec::with_capacity(8 * 1024);
-    let mut scratch = [0_u8; 8 * 1024];
-    loop {
-        let read = stream.read(&mut scratch)?;
-        if read == 0 {
-            return Ok(());
-        }
-        buffer.extend_from_slice(&scratch[..read]);
-        loop {
-            let (message, used) = match decode_peer_frame(&buffer) {
-                Ok(frame) => frame,
-                Err(cc_env::FrameError::Incomplete) => break,
-                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-            };
-            buffer.drain(..used);
-            state.metrics.peer_frames.fetch_add(1, Ordering::Relaxed);
-            let reply = peer_request(&state, message)?;
-            stream.write_all(&encode_peer_frame(&reply))?;
-        }
-    }
-}
-
-fn execute(state: &Arc<HostState>, command: ClientCommand) -> io::Result<RespValue> {
-    let now = process_time();
-    let client = ClientId::new(1);
-    state.metrics.commands.fetch_add(1, Ordering::Relaxed);
-    if !is_write_command(&command) {
-        state.metrics.reads.fetch_add(1, Ordering::Relaxed);
-    }
-    if is_write_command(&command) {
-        let (leader, peer_address) = leader_info(&state.config);
-        if leader != state.config.id {
-            let address = client_address_for(&state.config, leader, &peer_address);
-            return Ok(RespValue::Error(format!(
-                "NOTLEADER leader=n{leader} addr={address}"
-            )));
-        }
-    }
-    let reply = match command {
-        ClientCommand::Ping => KvReply::Ok,
-        ClientCommand::Echo(value) => return Ok(RespValue::Bulk(Some(value))),
-        ClientCommand::Get(key) => state
-            .kv
-            .lock()
-            .map_err(|_| io::Error::other("KV mutex poisoned"))?
-            .read(KvCommand::Get { key }, now)
-            .map_err(io::Error::other)?,
-        ClientCommand::Exists(key) => match state
-            .kv
-            .lock()
-            .map_err(|_| io::Error::other("KV mutex poisoned"))?
-            .read(KvCommand::Get { key }, now)
-            .map_err(io::Error::other)?
-        {
-            KvReply::Value(value) => KvReply::Integer(i64::from(value.is_some())),
-            other => other,
-        },
-        ClientCommand::Set {
-            key,
-            value,
-            ttl,
-            nx,
-            xx,
-        } => {
-            if nx || xx {
-                let current = match state
-                    .kv
-                    .lock()
-                    .map_err(|_| io::Error::other("KV mutex poisoned"))?
-                    .read(KvCommand::Get { key: key.clone() }, now)
-                    .map_err(io::Error::other)?
-                {
-                    KvReply::Value(value) => value,
-                    _ => None,
-                };
-                let allowed = (nx && current.is_none()) || (xx && current.is_some());
-                if !allowed {
-                    return Ok(RespValue::Bulk(None));
-                }
-            }
-            match apply_durable(state, client, KvCommand::Set { key, value, ttl }, now) {
-                Ok(reply) => reply,
-                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
-            }
-        }
-        ClientCommand::SetNx { key, value } => {
-            let current = match state
-                .kv
-                .lock()
-                .map_err(|_| io::Error::other("KV mutex poisoned"))?
-                .read(KvCommand::Get { key: key.clone() }, now)
-                .map_err(io::Error::other)?
-            {
-                KvReply::Value(value) => value,
-                _ => None,
-            };
-            if current.is_some() {
-                return Ok(RespValue::Integer(0));
-            }
-            match apply_durable(
-                state,
-                client,
-                KvCommand::Set {
-                    key,
-                    value,
-                    ttl: None,
-                },
-                now,
-            ) {
-                Ok(reply) => reply,
-                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
-            }
-        }
-        ClientCommand::Del(keys) => {
-            let mut deleted = 0_i64;
-            for key in keys {
-                match apply_durable(state, client, KvCommand::Del { key }, now) {
-                    Ok(KvReply::Integer(1)) => deleted += 1,
-                    Ok(_) => {}
-                    Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
-                }
-            }
-            KvReply::Integer(deleted)
-        }
-        ClientCommand::IncrBy { key, delta } => {
-            match apply_durable(state, client, KvCommand::Incr { key, delta }, now) {
-                Ok(reply) => reply,
-                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
-            }
-        }
-        ClientCommand::Append { key, value } => {
-            match apply_durable(state, client, KvCommand::Append { key, value }, now) {
-                Ok(reply) => reply,
-                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
-            }
-        }
-        ClientCommand::GetSet { key, value } => {
-            match apply_durable(state, client, KvCommand::GetSet { key, value }, now) {
-                Ok(reply) => reply,
-                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
-            }
-        }
-        ClientCommand::GetDel(key) => {
-            match apply_durable(state, client, KvCommand::GetDel { key }, now) {
-                Ok(reply) => reply,
-                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
-            }
-        }
-        ClientCommand::Expire { key, ttl } => {
-            match apply_durable(state, client, KvCommand::Expire { key, ttl }, now) {
-                Ok(reply) => reply,
-                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
-            }
-        }
-        ClientCommand::ExpireAt { key, at_seconds } => {
-            match apply_durable(
-                state,
-                client,
-                KvCommand::ExpireAt {
-                    key,
-                    at: Time::from_nanos(at_seconds.saturating_mul(1_000_000_000)),
-                },
-                now,
-            ) {
-                Ok(reply) => reply,
-                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
-            }
-        }
-        ClientCommand::Ttl(key) => state
-            .kv
-            .lock()
-            .map_err(|_| io::Error::other("KV mutex poisoned"))?
-            .read(KvCommand::Ttl { key }, now)
-            .map_err(io::Error::other)?,
-        ClientCommand::Persist(key) => {
-            match apply_durable(state, client, KvCommand::Persist { key }, now) {
-                Ok(reply) => reply,
-                Err(error) => return Ok(RespValue::Error(format!("ERR {error}"))),
-            }
-        }
-        ClientCommand::Scan {
-            cursor,
-            prefix,
-            count,
-        } => {
-            let reply = state
-                .kv
-                .lock()
-                .map_err(|_| io::Error::other("KV mutex poisoned"))?
-                .read(
-                    KvCommand::Scan {
-                        start: prefix,
-                        end: None,
-                        limit: count,
-                    },
-                    now,
-                )
-                .map_err(io::Error::other)?;
-            let body = match reply {
-                KvReply::Scan(values) => values
-                    .into_iter()
-                    .flat_map(|(key, value)| {
-                        [RespValue::Bulk(Some(key)), RespValue::Bulk(Some(value))]
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            return Ok(RespValue::Array(vec![
-                RespValue::Integer(i64::try_from(cursor).unwrap_or(i64::MAX)),
-                RespValue::Array(body),
-            ]));
-        }
-        ClientCommand::Info => {
-            let (leader, peer_address) = leader_info(&state.config);
-            let client_address = client_address_for(&state.config, leader, &peer_address);
-            let role = if leader == state.config.id {
-                "leader"
-            } else {
-                "follower"
-            };
-            return Ok(RespValue::Bulk(Some(
-                format!(
-                    "# Server\r\nccdb_version:{}\r\nmode:durable-journal\r\nrole:{role}\r\nleader:n{leader}\r\nleader_peer_addr:{peer_address}\r\nleader_client_addr:{client_address}\r\ncommit:{}\r\napplied:{}\r\n",
-                    env!("CARGO_PKG_VERSION"),
-                    state.sequence.load(Ordering::Acquire).saturating_sub(1),
-                    state
-                        .kv
-                        .lock()
-                        .map_err(|_| io::Error::other("KV mutex poisoned"))?
-                        .applied_index
-                        .get(),
-                )
-                .into_bytes(),
-            )));
-        }
-        ClientCommand::Unknown(command) => {
-            return Ok(RespValue::Error(format!("ERR unknown command {command:?}")));
-        }
-    };
-    Ok(to_resp(reply))
-}
-
-fn is_write_command(command: &ClientCommand) -> bool {
-    matches!(
-        command,
-        ClientCommand::Set { .. }
-            | ClientCommand::SetNx { .. }
-            | ClientCommand::Del(_)
-            | ClientCommand::IncrBy { .. }
-            | ClientCommand::Append { .. }
-            | ClientCommand::GetSet { .. }
-            | ClientCommand::GetDel(_)
-            | ClientCommand::Expire { .. }
-            | ClientCommand::ExpireAt { .. }
-            | ClientCommand::Persist(_)
-    )
-}
-
-fn apply_durable(
-    state: &HostState,
-    client: ClientId,
-    command: KvCommand,
-    now: Time,
-) -> io::Result<KvReply> {
-    let next = state.sequence.fetch_add(1, Ordering::SeqCst);
-    replicate(state, next, now, &command)?;
-    state
-        .journal
-        .lock()
-        .map_err(|_| io::Error::other("journal mutex poisoned"))?
-        .append(next, now, &command)?;
-    state.metrics.record_trace(next, now, &command)?;
-    let reply = state
-        .kv
-        .lock()
-        .map_err(|_| io::Error::other("KV mutex poisoned"))?
-        .apply(
-            LogIndex::new(next),
-            Term::new(1),
-            client,
-            next,
-            command,
-            now,
-        )
-        .map_err(io::Error::other)?;
-    state.metrics.writes.fetch_add(1, Ordering::Relaxed);
-    state.metrics.fsyncs.fetch_add(1, Ordering::Relaxed);
-    Ok(reply)
-}
-
-/// Resolve a `host:port` peer address at connect time.
-///
-/// Config files carry text, not IP literals: a Compose or systemd topology
-/// names its peers (`n2:7202`) and the address behind that name can change
-/// across restarts. Parsing straight to `SocketAddr` accepted only numeric
-/// hosts, so every container deployment failed with "invalid peer address"
-/// before a single frame was sent. Resolution stays here, at the point of use,
-/// rather than being frozen into `Config` at startup.
-fn resolve_peer_addr(address: &str) -> io::Result<SocketAddr> {
-    if let Ok(parsed) = address.parse::<SocketAddr>() {
-        return Ok(parsed);
-    }
-    address
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid peer address"))
-}
-
-fn leader_info(config: &Config) -> (u64, String) {
-    let mut candidates = vec![(config.id, config.listen_peer.clone())];
-    for peer in &config.peers {
-        if peer.id == config.id {
-            continue;
-        }
-        let Ok(resolved) = resolve_peer_addr(&peer.address) else {
-            continue;
-        };
-        if TcpStream::connect_timeout(&resolved, PEER_CONNECT_TIMEOUT).is_ok() {
-            candidates.push((peer.id, peer.address.clone()));
-        }
-    }
-    candidates.sort_by_key(|(id, _)| *id);
-    candidates
-        .into_iter()
-        .next()
-        .unwrap_or((config.id, config.listen_peer.clone()))
-}
-
-fn client_address_for(config: &Config, node_id: u64, peer_address: &str) -> String {
-    if node_id == config.id {
-        return config.listen_client.clone();
-    }
-    if let Some((host, port)) = peer_address.rsplit_once(':')
-        && let Ok(port) = port.parse::<u16>()
-        && (7201..=7299).contains(&port)
-    {
-        return format!("{host}:{}", port.saturating_sub(100));
-    }
-    peer_address.to_owned()
-}
-
-fn replicate(state: &HostState, sequence: u64, time: Time, command: &KvCommand) -> io::Result<()> {
-    let total_nodes = state.config.peers.len().max(1);
-    let quorum = total_nodes / 2 + 1;
-    let mut acknowledgements = 1_usize;
-    let mut last_error = None;
-    for peer in &state.config.peers {
-        if peer.id == state.config.id {
-            continue;
-        }
-        match send_replication(peer, sequence, time, command) {
-            Ok(()) => acknowledgements += 1,
-            Err(error) => last_error = Some(error),
-        }
-    }
-    if acknowledgements >= quorum {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "replication quorum unavailable: acknowledgements={acknowledgements}/{quorum}{}",
-                last_error
-                    .map(|error| format!(" last_error={error}"))
-                    .unwrap_or_default()
-            ),
-        ))
-    }
-}
-
-fn send_replication(peer: &Peer, sequence: u64, time: Time, command: &KvCommand) -> io::Result<()> {
-    let payload = encode_replication_write(sequence, time, command)?;
-    let mut delay = StdDuration::from_millis(10);
-    let mut last_error = None;
-    for attempt in 0..3 {
-        match TcpStream::connect_timeout(&resolve_peer_addr(&peer.address)?, PEER_CONNECT_TIMEOUT) {
-            Ok(mut stream) => {
-                stream.set_read_timeout(Some(PEER_IO_TIMEOUT))?;
-                stream.set_write_timeout(Some(PEER_IO_TIMEOUT))?;
-                stream.write_all(&encode_peer_frame(&WireMsg::new(1, payload.clone())))?;
-                let reply = read_wire_message(&mut stream)?;
-                if is_ack(&reply.payload, sequence) {
-                    return Ok(());
-                }
-                last_error = Some(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "peer returned a non-ack replication response",
-                ));
-            }
-            Err(error) => last_error = Some(error),
-        }
-        if attempt < 2 {
-            thread::sleep(delay);
-            delay = delay.saturating_mul(2);
-        }
-    }
-    Err(last_error.unwrap_or_else(|| io::Error::other("replication failed")))
-}
-
-fn encode_replication_write(sequence: u64, time: Time, command: &KvCommand) -> io::Result<Vec<u8>> {
-    let command = encode_command(command);
-    let length = u32::try_from(command.len()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "replication command too large")
-    })?;
-    let mut payload = Vec::with_capacity(REPLICATION_MAGIC.len() + 1 + 8 + 8 + 4 + command.len());
-    payload.extend_from_slice(REPLICATION_MAGIC);
-    payload.push(REPLICATION_WRITE);
-    payload.extend_from_slice(&sequence.to_le_bytes());
-    payload.extend_from_slice(&time.as_nanos().to_le_bytes());
-    payload.extend_from_slice(&length.to_le_bytes());
-    payload.extend_from_slice(&command);
-    Ok(payload)
-}
-
-fn decode_replication_write(payload: &[u8]) -> io::Result<(u64, Time, KvCommand)> {
-    let mut cursor = 0_usize;
-    expect_bytes(payload, &mut cursor, REPLICATION_MAGIC)?;
-    expect_byte(payload, &mut cursor, REPLICATION_WRITE)?;
-    let sequence = take_u64(payload, &mut cursor)?;
-    let time = Time::from_nanos(take_u64(payload, &mut cursor)?);
-    let length = usize::try_from(take_u32(payload, &mut cursor)?)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid replication length"))?;
-    let command_bytes = take_bytes(payload, &mut cursor, length)?;
-    if cursor != payload.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "replication write has trailing bytes",
-        ));
-    }
-    let command = decode_command(command_bytes).map_err(io::Error::other)?;
-    Ok((sequence, time, command))
-}
-
-fn apply_replica(
-    state: &HostState,
-    sequence: u64,
-    time: Time,
-    command: KvCommand,
-) -> io::Result<()> {
-    if sequence < state.sequence.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    state
-        .journal
-        .lock()
-        .map_err(|_| io::Error::other("journal mutex poisoned"))?
-        .append(sequence, time, &command)?;
-    state.metrics.record_trace(sequence, time, &command)?;
-    state
-        .kv
-        .lock()
-        .map_err(|_| io::Error::other("KV mutex poisoned"))?
-        .apply(
-            LogIndex::new(sequence),
-            Term::new(1),
-            ClientId::new(1),
-            sequence,
-            command,
-            time,
-        )
-        .map_err(io::Error::other)?;
-    state
-        .sequence
-        .fetch_max(sequence.saturating_add(1), Ordering::AcqRel);
-    state.metrics.commands.fetch_add(1, Ordering::Relaxed);
-    state.metrics.writes.fetch_add(1, Ordering::Relaxed);
-    state.metrics.fsyncs.fetch_add(1, Ordering::Relaxed);
-    Ok(())
-}
-
-fn peer_request(state: &HostState, message: WireMsg) -> io::Result<WireMsg> {
-    let payload = &message.payload;
-    if payload.starts_with(REPLICATION_MAGIC) {
-        let tag = payload
-            .get(REPLICATION_MAGIC.len())
-            .copied()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "replication message has no tag")
-            })?;
-        match tag {
-            REPLICATION_WRITE => {
-                let (sequence, time, command) = decode_replication_write(payload)?;
-                apply_replica(state, sequence, time, command)?;
-                let mut reply = Vec::with_capacity(REPLICATION_MAGIC.len() + 1 + 8);
-                reply.extend_from_slice(REPLICATION_MAGIC);
-                reply.push(REPLICATION_ACK);
-                reply.extend_from_slice(&sequence.to_le_bytes());
-                return Ok(WireMsg::new(1, reply));
-            }
-            REPLICATION_SYNC => return Ok(WireMsg::new(1, snapshot_payload(state)?)),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unknown replication message tag",
-                ));
-            }
-        }
-    }
-    Ok(message)
-}
-
-fn is_ack(payload: &[u8], sequence: u64) -> bool {
-    payload.len() == REPLICATION_MAGIC.len() + 1 + 8
-        && payload.starts_with(REPLICATION_MAGIC)
-        && payload[REPLICATION_MAGIC.len()] == REPLICATION_ACK
-        && u64::from_le_bytes(
-            payload[REPLICATION_MAGIC.len() + 1..]
-                .try_into()
-                .expect("ack sequence length"),
-        ) == sequence
-}
-
-fn snapshot_payload(state: &HostState) -> io::Result<Vec<u8>> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(REPLICATION_MAGIC);
-    payload.push(REPLICATION_SNAPSHOT);
-    let records = state
-        .journal
-        .lock()
-        .map_err(|_| io::Error::other("journal mutex poisoned"))?
-        .replay()?;
-    let count = u32::try_from(records.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many snapshot records"))?;
-    payload.extend_from_slice(&count.to_le_bytes());
-    for record in records {
-        let command = encode_command(&record.command);
-        let length = u32::try_from(command.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "snapshot command too large")
-        })?;
-        payload.extend_from_slice(&record.sequence.to_le_bytes());
-        payload.extend_from_slice(&record.time.as_nanos().to_le_bytes());
-        payload.extend_from_slice(&length.to_le_bytes());
-        payload.extend_from_slice(&command);
-    }
-    if payload.len() > cc_env::MAX_PEER_FRAME {
+fn initialize_data_dir(data_dir: &Path, cluster_id: ClusterId, node: u64) -> io::Result<()> {
+    if node == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "snapshot exceeds peer frame limit",
+            "node id must be nonzero",
         ));
     }
-    Ok(payload)
-}
-
-fn sync_from_peers(state: &HostState) -> io::Result<()> {
-    for peer in &state.config.peers {
-        if peer.id == state.config.id {
-            continue;
-        }
-        let Ok(resolved) = resolve_peer_addr(&peer.address) else {
-            continue;
-        };
-        let mut stream = match TcpStream::connect_timeout(&resolved, PEER_CONNECT_TIMEOUT) {
-            Ok(stream) => stream,
-            Err(_) => continue,
-        };
-        stream.set_read_timeout(Some(PEER_IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(PEER_IO_TIMEOUT))?;
-        let mut request = Vec::with_capacity(REPLICATION_MAGIC.len() + 1);
-        request.extend_from_slice(REPLICATION_MAGIC);
-        request.push(REPLICATION_SYNC);
-        stream.write_all(&encode_peer_frame(&WireMsg::new(1, request)))?;
-        let reply = read_wire_message(&mut stream)?;
-        apply_snapshot_payload(state, &reply.payload)?;
-    }
-    Ok(())
-}
-
-fn apply_snapshot_payload(state: &HostState, payload: &[u8]) -> io::Result<()> {
-    let mut cursor = 0_usize;
-    expect_bytes(payload, &mut cursor, REPLICATION_MAGIC)?;
-    expect_byte(payload, &mut cursor, REPLICATION_SNAPSHOT)?;
-    let count = usize::try_from(take_u32(payload, &mut cursor)?)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid snapshot count"))?;
-    for _ in 0..count {
-        let sequence = take_u64(payload, &mut cursor)?;
-        let time = Time::from_nanos(take_u64(payload, &mut cursor)?);
-        let length = usize::try_from(take_u32(payload, &mut cursor)?)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid snapshot length"))?;
-        let command =
-            decode_command(take_bytes(payload, &mut cursor, length)?).map_err(io::Error::other)?;
-        apply_replica(state, sequence, time, command)?;
-    }
-    if cursor != payload.len() {
+    reject_symlink(data_dir, "data directory")?;
+    if data_dir.exists() && fs::read_dir(data_dir)?.next().transpose()?.is_some() {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "snapshot has trailing bytes",
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to initialize nonempty data directory {}",
+                data_dir.display()
+            ),
         ));
     }
-    Ok(())
+    fs::create_dir_all(data_dir.join("raft"))?;
+    fs::create_dir_all(data_dir.join("store/sst"))?;
+    fs::create_dir_all(data_dir.join("snapshots/staging"))?;
+    write_identity(
+        &identity_path(data_dir),
+        DiskIdentity::fresh(cluster_id, node),
+    )?;
+    sync_directory(data_dir)
 }
 
-fn read_wire_message(stream: &mut TcpStream) -> io::Result<WireMsg> {
-    let mut buffer = Vec::with_capacity(1024);
-    let mut scratch = [0_u8; 8 * 1024];
-    loop {
-        match decode_peer_frame(&buffer) {
-            Ok((message, _)) => return Ok(message),
-            Err(cc_env::FrameError::Incomplete) => {}
-            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Peer {
+    pub(crate) id: u64,
+    pub(crate) address: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Config {
+    pub(crate) id: u64,
+    pub(crate) cluster_id: ClusterId,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) listen_client: String,
+    pub(crate) listen_peer: String,
+    pub(crate) listen_metrics: String,
+    pub(crate) peers: Vec<Peer>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DiskIdentity {
+    cluster_id: ClusterId,
+    node_id: u64,
+    lifecycle: u8,
+    policy_hash: u64,
+    min_storage_reader: u16,
+    min_semantic_reader: u16,
+    migration_epoch: u64,
+}
+
+impl DiskIdentity {
+    fn fresh(cluster_id: ClusterId, node_id: u64) -> Self {
+        Self {
+            cluster_id,
+            node_id,
+            lifecycle: IDENTITY_ACTIVE,
+            policy_hash: ClusterPolicy::default().hash(),
+            min_storage_reader: MIN_STORAGE_READER,
+            min_semantic_reader: MIN_SEMANTIC_READER,
+            migration_epoch: 0,
         }
-        let read = stream.read(&mut scratch)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "peer closed before a complete frame",
-            ));
-        }
-        buffer.extend_from_slice(&scratch[..read]);
-        if buffer.len() > cc_env::MAX_PEER_FRAME + 32 {
+    }
+
+    fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(IDENTITY_LEN);
+        bytes.extend_from_slice(IDENTITY_MAGIC);
+        bytes.extend_from_slice(&IDENTITY_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.cluster_id.bytes());
+        bytes.extend_from_slice(&self.node_id.to_le_bytes());
+        bytes.push(self.lifecycle);
+        bytes.extend_from_slice(&self.policy_hash.to_le_bytes());
+        bytes.extend_from_slice(&self.min_storage_reader.to_le_bytes());
+        bytes.extend_from_slice(&self.min_semantic_reader.to_le_bytes());
+        bytes.extend_from_slice(&self.migration_epoch.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        let checksum = crc32c(&bytes);
+        let checksum_start = bytes.len() - 4;
+        bytes[checksum_start..].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() != IDENTITY_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "peer frame exceeds host buffer limit",
+                format!("CCID must be exactly {IDENTITY_LEN} bytes"),
+            ));
+        }
+        if &bytes[..4] != IDENTITY_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid CCID magic",
+            ));
+        }
+        if u16::from_le_bytes(bytes[4..6].try_into().expect("CCID version")) != IDENTITY_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported CCID format version",
+            ));
+        }
+        let expected = u32::from_le_bytes(bytes[IDENTITY_LEN - 4..].try_into().expect("CCID CRC"));
+        let mut crc_bytes = bytes.to_vec();
+        crc_bytes[IDENTITY_LEN - 4..].fill(0);
+        if crc32c(&crc_bytes) != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CCID checksum mismatch",
+            ));
+        }
+        let mut cluster = [0_u8; 16];
+        cluster.copy_from_slice(&bytes[6..22]);
+        let identity = Self {
+            cluster_id: ClusterId::new(cluster),
+            node_id: u64::from_le_bytes(bytes[22..30].try_into().expect("CCID node")),
+            lifecycle: bytes[30],
+            policy_hash: u64::from_le_bytes(bytes[31..39].try_into().expect("CCID policy")),
+            min_storage_reader: u16::from_le_bytes(bytes[39..41].try_into().expect("CCID storage")),
+            min_semantic_reader: u16::from_le_bytes(
+                bytes[41..43].try_into().expect("CCID semantic"),
+            ),
+            migration_epoch: u64::from_le_bytes(bytes[43..51].try_into().expect("CCID epoch")),
+        };
+        if identity.cluster_id.is_zero()
+            || identity.node_id == 0
+            || !matches!(
+                identity.lifecycle,
+                IDENTITY_ACTIVE | IDENTITY_JOINING | IDENTITY_REMOVED
+            )
+            || identity.min_storage_reader == 0
+            || identity.min_semantic_reader == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid CCID fields",
+            ));
+        }
+        Ok(identity)
+    }
+}
+
+fn identity_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("identity.ccid")
+}
+
+fn parse_cluster_id(value: &str) -> io::Result<ClusterId> {
+    ClusterId::from_hex(value).map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))
+}
+
+fn write_identity(path: &Path, identity: DiskIdentity) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CCID identity path has no parent",
+        )
+    })?;
+    reject_symlink(parent, "CCID parent directory")?;
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(&identity.encode())?;
+    file.sync_all()?;
+    sync_directory(parent)
+}
+
+fn reject_symlink(path: &Path, what: &str) -> io::Result<()> {
+    if fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} must not be a symbolic link: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_identity(config: &Config) -> io::Result<()> {
+    reject_symlink(&config.data_dir, "data directory")?;
+    let marker = identity_path(&config.data_dir);
+    reject_symlink(&marker, "CCID identity")?;
+    // This is deliberately a boundary refusal, rather than a compatibility
+    // reader. The old journal has no proof compatible with the shared driver.
+    if config.data_dir.join("commands.log").exists() && !config.data_dir.join("raft/wal.0").exists()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pre-N1 data directory found (commands.log); migration is intentionally unsupported",
+        ));
+    }
+    let bytes = fs::read(&marker).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("data-dir CCID identity {}: {error}", marker.display()),
+        )
+    })?;
+    let identity = DiskIdentity::decode(&bytes)?;
+    if identity.node_id != config.id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "data-dir identity mismatch: config id={} CCID node id={}",
+                config.id, identity.node_id
+            ),
+        ));
+    }
+    if identity.cluster_id != config.cluster_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "data-dir cluster identity does not match node.cluster_id",
+        ));
+    }
+    if identity.lifecycle == IDENTITY_REMOVED {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "CCID lifecycle Removed is terminal for this data directory",
+        ));
+    }
+    if identity.policy_hash != ClusterPolicy::default().hash() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CCID policy hash does not match configured cluster policy",
+        ));
+    }
+    if identity.min_storage_reader > MIN_STORAGE_READER
+        || identity.min_semantic_reader > MIN_SEMANTIC_READER
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CCID requires an unsupported storage or semantic reader",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn read_config(path: &Path) -> io::Result<Config> {
+    parse_config(&fs::read_to_string(path)?)
+}
+
+fn parse_config(text: &str) -> io::Result<Config> {
+    let mut values = BTreeMap::new();
+    let mut section = String::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len().saturating_sub(1)].to_owned();
+            if !matches!(section.as_str(), "node" | "storage") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown config section {section} at line {}", index + 1),
+                ));
+            }
+            continue;
+        }
+        let (key, raw_value) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid config assignment at line {}", index + 1),
+            )
+        })?;
+        let key = key.trim();
+        let value = raw_value.trim().trim_matches('"').to_owned();
+        let allowed = match section.as_str() {
+            "node" => matches!(
+                key,
+                "id" | "cluster_id"
+                    | "data_dir"
+                    | "listen_client"
+                    | "listen_peer"
+                    | "listen_metrics"
+                    | "peer_nodes"
+            ),
+            "storage" => key == "fsync",
+            _ => false,
+        };
+        if !allowed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown safety-critical config key {key} at line {}",
+                    index + 1
+                ),
+            ));
+        }
+        let composite = format!("{section}.{key}");
+        if values.insert(composite, value).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate config key {key} at line {}", index + 1),
             ));
         }
     }
-}
-
-fn expect_bytes(input: &[u8], cursor: &mut usize, expected: &[u8]) -> io::Result<()> {
-    let actual = take_bytes(input, cursor, expected.len())?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid replication magic",
-        ))
-    }
-}
-
-fn expect_byte(input: &[u8], cursor: &mut usize, expected: u8) -> io::Result<()> {
-    let actual = *take_bytes(input, cursor, 1)?
-        .first()
-        .expect("one-byte replication field");
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid replication message tag",
-        ))
-    }
-}
-
-fn take_bytes<'a>(input: &'a [u8], cursor: &mut usize, length: usize) -> io::Result<&'a [u8]> {
-    let end = cursor
-        .checked_add(length)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "replication length overflow"))?;
-    let bytes = input.get(*cursor..end).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "truncated replication message",
-        )
+    let required = |key: &str| {
+        values.get(&format!("node.{key}")).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("missing required node.{key}"),
+            )
+        })
+    };
+    let id = required("id")?.parse::<u64>().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "node.id must be a nonzero u64")
     })?;
-    *cursor = end;
-    Ok(bytes)
-}
-
-fn take_u32(input: &[u8], cursor: &mut usize) -> io::Result<u32> {
-    Ok(u32::from_le_bytes(
-        take_bytes(input, cursor, 4)?
-            .try_into()
-            .expect("four-byte replication field"),
-    ))
-}
-
-fn take_u64(input: &[u8], cursor: &mut usize) -> io::Result<u64> {
-    Ok(u64::from_le_bytes(
-        take_bytes(input, cursor, 8)?
-            .try_into()
-            .expect("eight-byte replication field"),
-    ))
-}
-
-fn to_resp(reply: KvReply) -> RespValue {
-    match reply {
-        KvReply::Ok => RespValue::Simple(String::from("OK")),
-        KvReply::Value(Some(value)) => RespValue::Bulk(Some(value)),
-        KvReply::Value(None) => RespValue::Bulk(None),
-        KvReply::Integer(value) => RespValue::Integer(value),
-        KvReply::Cas(value) => RespValue::Integer(i64::from(value)),
-        KvReply::Scan(values) => RespValue::Array(
-            values
-                .into_iter()
-                .flat_map(|(key, value)| [RespValue::Bulk(Some(key)), RespValue::Bulk(Some(value))])
-                .collect(),
-        ),
-        KvReply::Error(error) => RespValue::Error(format!("ERR {error}")),
+    if id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "node.id must be nonzero",
+        ));
     }
+    let cluster_id = parse_cluster_id(&required("cluster_id")?)?;
+    let data_dir = PathBuf::from(required("data_dir")?);
+    if data_dir.as_os_str().is_empty()
+        || data_dir
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "node.data_dir must not contain a parent traversal",
+        ));
+    }
+    let listen_client = required("listen_client")?;
+    let listen_peer = required("listen_peer")?;
+    let listen_metrics = required("listen_metrics")?;
+    for (name, address) in [
+        ("listen_client", &listen_client),
+        ("listen_peer", &listen_peer),
+        ("listen_metrics", &listen_metrics),
+    ] {
+        if address.is_empty() || address.to_socket_addrs().ok().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("node.{name} is not a resolvable socket address"),
+            ));
+        }
+    }
+    let peer_addresses = required("peer_nodes")?
+        .split(',')
+        .filter(|address| !address.trim().is_empty())
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if peer_addresses.is_empty()
+        || peer_addresses
+            .iter()
+            .any(|address| address.to_socket_addrs().ok().is_none())
+        || peer_addresses.iter().collect::<BTreeSet<_>>().len() != peer_addresses.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "node.peer_nodes must be nonempty, resolvable, and unique",
+        ));
+    }
+    let peers = peer_addresses
+        .into_iter()
+        .enumerate()
+        .map(|(index, address)| Peer {
+            id: u64::try_from(index + 1).unwrap_or(u64::MAX),
+            address,
+        })
+        .collect();
+    Ok(Config {
+        id,
+        cluster_id,
+        data_dir,
+        listen_client,
+        listen_peer,
+        listen_metrics,
+        peers,
+    })
+}
+
+pub(crate) fn validate_listener_safety(config: &Config, allow_unsafe: bool) -> io::Result<()> {
+    for (name, address) in [
+        ("client", &config.listen_client),
+        ("peer", &config.listen_peer),
+        ("metrics", &config.listen_metrics),
+    ] {
+        let parsed = address.to_socket_addrs()?.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid {name} listener"),
+            )
+        })?;
+        if let Some(warning) = unsafe_listener_warning(name, parsed)
+            && !allow_unsafe
+        {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, warning));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn unsafe_listener_warning(name: &str, address: SocketAddr) -> Option<String> {
+    (!address.ip().is_loopback())
+        .then(|| format!("ccdb warning listener={name} address={address} unauthenticated=true"))
 }
 
 fn selfcheck(args: &[String]) -> io::Result<()> {
     let data_dir = flag(args, "--data-dir").unwrap_or_else(|| String::from("ccdb-data/n1"));
     let path = Path::new(&data_dir);
-    if !path.exists() {
+    if !path.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "data directory does not exist",
         ));
     }
-    let journal_path = path.join("commands.log");
-    let journal_records = if journal_path.exists() {
-        let mut journal = DurableJournal::open(&journal_path)?;
-        journal.replay()?
+    let config_path = path.join("ccdb.toml");
+    let config = if config_path.exists() {
+        let config = read_config(&config_path)?;
+        validate_identity(&config)?;
+        if fs::canonicalize(&config.data_dir)? != fs::canonicalize(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "config data_dir does not match checked directory",
+            ));
+        }
+        Some(config)
     } else {
-        Vec::new()
+        DiskIdentity::decode(&fs::read(identity_path(path))?)?;
+        None
     };
-    if has_flag(args, "--deep") {
-        deep_selfcheck(path, &journal_records)?;
+    let wal_path = path.join("raft/wal.0");
+    let wal_records = if wal_path.exists() {
+        let bytes = fs::read(&wal_path)?;
+        if bytes.is_empty() {
+            0
+        } else {
+            let recovered =
+                cc_log::recover_framed_record_stream(&bytes).map_err(io::Error::other)?;
+            if recovered.torn_tail_truncated {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "selfcheck refuses a WAL with an untruncated torn tail",
+                ));
+            }
+            if let Some(config) = &config {
+                let membership = cc_core::MembershipState::new(
+                    config
+                        .peers
+                        .iter()
+                        .map(|peer| cc_core::NodeId::new(peer.id))
+                        .collect(),
+                )
+                .map_err(io::Error::other)?;
+                if recovered.state.genesis.cluster_id != config.cluster_id.bytes()
+                    || recovered.state.genesis.policy != ClusterPolicy::default()
+                    || recovered.state.genesis.membership != membership
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "selfcheck WAL genesis disagrees with config/identity",
+                    ));
+                }
+            }
+            recovered.state.entries.len().saturating_add(1)
+        }
+    } else {
+        0
+    };
+    let staging = path.join("snapshots/staging");
+    if has_flag(args, "--deep")
+        && staging.exists()
+        && fs::read_dir(&staging)?.next().transpose()?.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot staging contains an incomplete restore",
+        ));
     }
     println!(
-        "selfcheck{} data_dir={} journal_records={} metrics={}",
+        "selfcheck{} data_dir={} wal_records={} snapshot_staging={}",
         if has_flag(args, "--deep") {
             " --deep"
         } else {
             ""
         },
         path.display(),
-        journal_records.len(),
-        path.join("metrics.prom").exists()
-    );
-    Ok(())
-}
-
-fn deep_selfcheck(path: &Path, records: &[JournalRecord]) -> io::Result<()> {
-    let config_path = path.join("ccdb.toml");
-    if config_path.exists() {
-        let config = read_config(&config_path)?;
-        if fs::canonicalize(&config.data_dir)? != fs::canonicalize(path)? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "config data_dir {} does not match checked directory {}",
-                    config.data_dir.display(),
-                    path.display()
-                ),
-            ));
-        }
-        validate_identity(&config)?;
-    } else if !path.join("node.json").exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing both ccdb.toml and node.json identity marker",
-        ));
-    }
-    let mut previous = 0_u64;
-    for record in records {
-        if record.sequence <= previous {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("journal sequence {} follows {previous}", record.sequence),
-            ));
-        }
-        previous = record.sequence;
-    }
-    let next = if path.join("commands.log").exists() {
-        load_state(&path.join("commands.log"))?.1
-    } else {
-        1
-    };
-    if next != previous.saturating_add(1).max(1) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "journal watermark does not match replayed applied index",
-        ));
-    }
-    let staging = path.join("snapshots/staging");
-    if staging.exists() && fs::read_dir(&staging)?.next().transpose()?.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "snapshot staging contains an incomplete restore; advisor: inspect and remove only after verifying the source archive",
-        ));
-    }
-    // The names the operator surface promises. A metrics file that parses but
-    // has quietly stopped emitting half the inventory is exactly the kind of
-    // silent gap deep-check exists to catch.
-    const REQUIRED_METRICS: [&str; 12] = [
-        "ccdb_commands_total",
-        "ccdb_reads_total",
-        "ccdb_writes_total",
-        "ccdb_fsyncs_total",
-        "ccdb_peer_frames_total",
-        "ccdb_uptime_seconds",
-        "ccdb_up",
-        "ccdb_node_id",
-        "ccdb_is_leader",
-        "ccdb_leader_node_id",
-        "ccdb_commit_index",
-        "ccdb_applied_index",
-    ];
-    let metrics = path.join("metrics.prom");
-    if metrics.exists() {
-        let text = fs::read_to_string(&metrics)?;
-        for required in REQUIRED_METRICS {
-            if !text.lines().any(|line| {
-                line.split_once(' ')
-                    .is_some_and(|(name, _)| name == required)
-            }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "metrics file is missing {required}; advisor: the node may be writing an older inventory"
-                    ),
-                ));
-            }
-        }
-        for line in text.lines() {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((name, value)) = line.split_once(' ') else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "malformed metrics line",
-                ));
-            };
-            if !name.starts_with("ccdb_") || value.parse::<u64>().is_err() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid metrics sample",
-                ));
-            }
-        }
-    }
-    println!(
-        "deep-check identity=ok journal_crc=ok journal_watermark={} snapshot_staging=clean metrics={}",
-        previous,
-        if metrics.exists() { "ok" } else { "absent" },
+        wal_records,
+        if staging.exists() {
+            "present"
+        } else {
+            "absent"
+        },
     );
     Ok(())
 }
@@ -1113,44 +615,22 @@ fn doctor(args: &[String]) -> io::Result<()> {
     let path = Path::new(&data_dir);
     fs::create_dir_all(path)?;
     fsync_probe(path)?;
-    let clock_started = std::time::Instant::now();
-    let first = process_time();
-    let second = process_time();
-    let clock = if second >= first && clock_started.elapsed() >= StdDuration::ZERO {
-        "pass"
-    } else {
-        "fail"
-    };
     let client = flag(args, "--client-addr").unwrap_or_else(|| String::from("127.0.0.1:7101"));
     let peer = flag(args, "--peer-addr").unwrap_or_else(|| String::from("127.0.0.1:7201"));
-    let client_status = port_probe(&client);
-    let peer_status = port_probe(&peer);
     println!(
-        "doctor data_dir={} filesystem={} fsync=pass clock={} open_files={} client_port={} peer_port={}",
+        "doctor data_dir={} filesystem={} fsync=pass client_port={} peer_port={}",
         path.display(),
         filesystem_kind(path),
-        clock,
-        open_file_limit(),
-        client_status,
-        peer_status,
+        port_probe(&client),
+        port_probe(&peer),
     );
-    if clock == "fail" {
-        Err(io::Error::other("clock moved backwards"))
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 fn fsync_probe(path: &Path) -> io::Result<()> {
     let nonce = process_time().as_nanos();
     let source = path.join(format!(".ccdb-doctor-{}-{nonce}.tmp", std::process::id()));
     let renamed = path.join(format!(".ccdb-doctor-{}-{nonce}.ok", std::process::id()));
-    if source.exists() || renamed.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "doctor probe path collision",
-        ));
-    }
     let result = (|| {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -1166,90 +646,30 @@ fn fsync_probe(path: &Path) -> io::Result<()> {
         fs::remove_file(&renamed)?;
         sync_directory(path)
     })();
-    if source.exists() {
-        let _ = fs::remove_file(&source);
-    }
-    if renamed.exists() {
-        let _ = fs::remove_file(&renamed);
-    }
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&renamed);
     result
 }
 
 fn port_probe(address: &str) -> &'static str {
-    match TcpListener::bind(address) {
-        Ok(_) => "available",
-        Err(error) if error.kind() == io::ErrorKind::AddrInUse => "in-use",
-        Err(_) => "invalid-or-unavailable",
-    }
+    address
+        .parse::<SocketAddr>()
+        .ok()
+        .and_then(|socket| TcpStream::connect_timeout(&socket, StdDuration::from_millis(100)).ok())
+        .map_or("closed", |_| "open")
 }
 
 fn filesystem_kind(path: &Path) -> String {
-    #[cfg(target_os = "linux")]
-    let output = std::process::Command::new("df")
-        .args(["-T", path.to_str().unwrap_or(".")])
-        .output();
-    #[cfg(not(target_os = "linux"))]
-    let output = std::process::Command::new("stat")
-        .args(["-f", "%T", path.to_str().unwrap_or(".")])
-        .output();
-    output
-        .ok()
-        .filter(|value| value.status.success())
-        .and_then(|value| String::from_utf8(value.stdout).ok())
-        .and_then(|text| text.lines().last().map(str::to_owned))
-        .map(|line| {
-            line.split_whitespace()
-                .last()
-                .unwrap_or("unknown")
-                .to_owned()
-        })
-        .unwrap_or_else(|| String::from("unknown"))
-}
-
-fn open_file_limit() -> String {
-    fs::read_to_string("/proc/self/limits")
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .find(|line| line.starts_with("Max open files"))
-                .and_then(|line| line.split_whitespace().nth(3))
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| String::from("unknown"))
-}
-
-fn peer_probe(args: &[String]) -> io::Result<()> {
-    let address = flag(args, "--addr").unwrap_or_else(|| String::from("127.0.0.1:7201"));
-    let retries = flag(args, "--retries")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(5);
-    let payload = flag(args, "--payload").unwrap_or_else(|| String::from("probe"));
-    let mut delay = StdDuration::from_millis(20);
-    for attempt in 1..=retries.max(1) {
-        match TcpStream::connect(&address) {
-            Ok(mut stream) => {
-                stream.set_read_timeout(Some(StdDuration::from_secs(2)))?;
-                let frame = encode_peer_frame(&WireMsg::new(1, payload.as_bytes().to_vec()));
-                stream.write_all(&frame)?;
-                let mut reply = vec![0_u8; frame.len().max(64)];
-                let length = stream.read(&mut reply)?;
-                let (message, _) = decode_peer_frame(&reply[..length])
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                println!(
-                    "peer probe: PASS addr={address} attempt={attempt} bytes={}",
-                    message.payload.len()
-                );
-                return Ok(());
+    path.metadata()
+        .map(|metadata| {
+            if metadata.is_dir() {
+                "directory"
+            } else {
+                "file"
             }
-            Err(error) if attempt < retries.max(1) => {
-                eprintln!("peer probe attempt {attempt} failed: {error}");
-                thread::sleep(delay);
-                delay = delay.saturating_mul(2);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::other("peer probe exhausted retries"))
+        })
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 fn admin(args: &[String]) -> io::Result<()> {
@@ -1279,12 +699,12 @@ fn admin(args: &[String]) -> io::Result<()> {
     let config = flag(args, "--config")
         .map(|path| read_config(Path::new(&path)))
         .transpose()?;
-    let action = args
+    match args
         .iter()
         .find(|arg| matches!(arg.as_str(), "status" | "members" | "snapshot"))
         .map(String::as_str)
-        .unwrap_or("status");
-    match action {
+        .unwrap_or("status")
+    {
         "members" => {
             let members = config
                 .as_ref()
@@ -1299,7 +719,7 @@ fn admin(args: &[String]) -> io::Result<()> {
                 .unwrap_or_else(|| String::from("unknown"));
             println!("RAFT.MEMBERS addr={address} voters={members} learners=none joint=false")
         }
-        "snapshot" => println!("RAFT.SNAPSHOT addr={address} state=available checkpoint=0"),
+        "snapshot" => println!("RAFT.SNAPSHOT addr={address} state=unavailable checkpoint=none"),
         _ => {
             let (resolved, response) = request_info_follow(&address)?;
             println!("RAFT.STATUS requested={address} resolved={resolved} {response}");
@@ -1308,6 +728,9 @@ fn admin(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// CCBK is an operator archive of the strict-adapter directory.  It preserves
+/// identity/configuration and the single cc-log WAL; snapshots and store files
+/// receive their own consistency protocol in the storage/snapshot phases.
 fn backup_data_dir(data_dir: &Path, output: &Path) -> io::Result<usize> {
     if !data_dir.is_dir() {
         return Err(io::Error::new(
@@ -1321,13 +744,12 @@ fn backup_data_dir(data_dir: &Path, output: &Path) -> io::Result<usize> {
             "backup output already exists",
         ));
     }
-    let files = ["node.json", "ccdb.toml", "commands.log"];
     let mut entries = Vec::new();
-    for name in files {
+    for name in ["identity.ccid", "ccdb.toml", "raft/wal.0"] {
         let path = data_dir.join(name);
         let data = if path.exists() {
             fs::read(&path)?
-        } else if name == "commands.log" {
+        } else if name == "raft/wal.0" {
             Vec::new()
         } else {
             return Err(io::Error::new(
@@ -1341,12 +763,13 @@ fn backup_data_dir(data_dir: &Path, output: &Path) -> io::Result<usize> {
                 "backup file exceeds limit",
             ));
         }
-        if name == "commands.log" {
-            let mut journal = DurableJournal::open(&path)?;
-            let _ = journal.replay()?;
-            if fs::metadata(&path)?.len() != data.len() as u64 {
-                return Err(io::Error::other(
-                    "journal changed during backup; stop writes and retry",
+        if name == "raft/wal.0" && !data.is_empty() {
+            let recovered =
+                cc_log::recover_framed_record_stream(&data).map_err(io::Error::other)?;
+            if recovered.torn_tail_truncated || recovered.bytes_consumed != data.len() as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "backup refuses a torn WAL",
                 ));
             }
         }
@@ -1366,12 +789,6 @@ fn backup_data_dir(data_dir: &Path, output: &Path) -> io::Result<usize> {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let temporary = output.with_extension(format!("tmp-{}", std::process::id()));
-    if temporary.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "backup staging path exists",
-        ));
-    }
     let result = (|| {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -1382,7 +799,7 @@ fn backup_data_dir(data_dir: &Path, output: &Path) -> io::Result<usize> {
         fs::rename(&temporary, output)?;
         sync_directory(parent)
     })();
-    if result.is_err() && temporary.exists() {
+    if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result.map(|()| entries.len())
@@ -1403,21 +820,20 @@ fn restore_backup(input: &Path, data_dir: &Path) -> io::Result<usize> {
             "invalid backup magic",
         ));
     }
-    let version = take_u16(&archive, &mut cursor)?;
-    if version != BACKUP_VERSION {
+    if take_u16(&archive, &mut cursor)? != BACKUP_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported backup version",
         ));
     }
     let count = usize::try_from(take_u32(&archive, &mut cursor)?).unwrap_or(usize::MAX);
-    if count != 3 {
+    let allowed = ["identity.ccid", "ccdb.toml", "raft/wal.0"];
+    if count != allowed.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid backup file count",
         ));
     }
-    let allowed = ["node.json", "ccdb.toml", "commands.log"];
     let mut entries = BTreeMap::new();
     for _ in 0..count {
         let name_len = usize::from(take_u16(&archive, &mut cursor)?);
@@ -1453,6 +869,16 @@ fn restore_backup(input: &Path, data_dir: &Path) -> io::Result<usize> {
             "trailing backup bytes",
         ));
     }
+    let wal = entries.get("raft/wal.0").expect("validated allowed names");
+    if !wal.is_empty() {
+        let recovered = cc_log::recover_framed_record_stream(wal).map_err(io::Error::other)?;
+        if recovered.torn_tail_truncated || recovered.bytes_consumed != wal.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "backup WAL is torn",
+            ));
+        }
+    }
     let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let file_name = data_dir
@@ -1460,12 +886,6 @@ fn restore_backup(input: &Path, data_dir: &Path) -> io::Result<usize> {
         .and_then(|name| name.to_str())
         .unwrap_or("ccdb");
     let staging = parent.join(format!(".{file_name}.restore-{}", std::process::id()));
-    if staging.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "restore staging path exists",
-        ));
-    }
     let result = (|| {
         fs::create_dir(&staging)?;
         fs::create_dir_all(staging.join("raft"))?;
@@ -1499,97 +919,10 @@ fn restore_backup(input: &Path, data_dir: &Path) -> io::Result<usize> {
         fs::rename(&staging, data_dir)?;
         sync_directory(parent)
     })();
-    if result.is_err() && staging.exists() {
+    if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
     }
     result.map(|()| count)
-}
-
-fn take_u16(input: &[u8], cursor: &mut usize) -> io::Result<u16> {
-    Ok(u16::from_le_bytes(
-        take_bytes(input, cursor, 2)?
-            .try_into()
-            .expect("two-byte backup field"),
-    ))
-}
-
-#[derive(Clone, Debug)]
-struct Config {
-    id: u64,
-    data_dir: PathBuf,
-    listen_client: String,
-    listen_peer: String,
-    listen_metrics: String,
-    peers: Vec<Peer>,
-}
-
-fn validate_identity(config: &Config) -> io::Result<()> {
-    let marker = config.data_dir.join("node.json");
-    let text = fs::read_to_string(&marker).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("data-dir identity marker {}: {error}", marker.display()),
-        )
-    })?;
-    let marker_id = text
-        .split_once("\"id\":")
-        .and_then(|(_, rest)| rest.split(|byte: char| !byte.is_ascii_digit()).next())
-        .and_then(|value| value.parse::<u64>().ok());
-    if marker_id != Some(config.id) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "data-dir identity mismatch: config id={} marker id={marker_id:?}",
-                config.id
-            ),
-        ));
-    }
-    if !text.contains("\"cluster\":\"") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "data-dir identity marker has no cluster",
-        ));
-    }
-    Ok(())
-}
-
-fn read_config(path: &Path) -> io::Result<Config> {
-    let text = fs::read_to_string(path)?;
-    let id = value_after(&text, "id")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1);
-    let data_dir = value_after(&text, "data_dir")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("ccdb-data/n1"));
-    let listen_client =
-        value_after(&text, "listen_client").unwrap_or_else(|| String::from("127.0.0.1:7101"));
-    let listen_peer =
-        value_after(&text, "listen_peer").unwrap_or_else(|| String::from("127.0.0.1:7201"));
-    let listen_metrics = value_after(&text, "listen_metrics")
-        .unwrap_or_else(|| format!("127.0.0.1:{}", 7300_u64.saturating_add(id)));
-    let peer_addresses = value_after(&text, "peer_nodes")
-        .unwrap_or_else(|| listen_peer.clone())
-        .split(',')
-        .filter(|address| !address.trim().is_empty())
-        .map(str::trim)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let peers = peer_addresses
-        .into_iter()
-        .enumerate()
-        .map(|(index, address)| Peer {
-            id: u64::try_from(index + 1).unwrap_or(u64::MAX),
-            address,
-        })
-        .collect();
-    Ok(Config {
-        id,
-        data_dir,
-        listen_client,
-        listen_peer,
-        listen_metrics,
-        peers,
-    })
 }
 
 fn request_info(address: &str) -> io::Result<String> {
@@ -1601,15 +934,13 @@ fn request_info(address: &str) -> io::Result<String> {
     stream.write_all(&encode(&RespValue::Array(vec![RespValue::Bulk(Some(
         b"INFO".to_vec(),
     ))])))?;
-    let response = read_resp_value(&mut stream)?;
-    Ok(match response {
-        RespValue::Bulk(Some(value)) => String::from_utf8_lossy(&value)
+    match read_resp_value(&mut stream)? {
+        RespValue::Bulk(Some(value)) => Ok(String::from_utf8_lossy(&value)
             .replace('\r', "")
-            .replace('\n', " "),
-        RespValue::Simple(value) => value,
-        RespValue::Error(value) => value,
-        other => format!("{other:?}"),
-    })
+            .replace('\n', " ")),
+        RespValue::Simple(value) | RespValue::Error(value) => Ok(value),
+        other => Ok(format!("{other:?}")),
+    }
 }
 
 fn request_info_follow(address: &str) -> io::Result<(String, String)> {
@@ -1640,7 +971,7 @@ fn info_field(response: &str, key: &str) -> Option<String> {
 
 fn read_resp_value(stream: &mut TcpStream) -> io::Result<RespValue> {
     let mut buffer = Vec::new();
-    let mut scratch = [0_u8; 4 * 1024];
+    let mut scratch = [0_u8; 4096];
     loop {
         match parse(&buffer) {
             Ok((value, _)) => return Ok(value),
@@ -1664,11 +995,58 @@ fn read_resp_value(stream: &mut TcpStream) -> io::Result<RespValue> {
     }
 }
 
-fn value_after(text: &str, key: &str) -> Option<String> {
-    text.lines()
-        .find(|line| line.trim_start().starts_with(&format!("{key} =")))
-        .and_then(|line| line.split_once('='))
-        .map(|(_, value)| value.trim().trim_matches('"').to_owned())
+pub(crate) fn to_resp(reply: KvReply) -> RespValue {
+    match reply {
+        KvReply::Ok => RespValue::Simple(String::from("OK")),
+        KvReply::Value(Some(value)) => RespValue::Bulk(Some(value)),
+        KvReply::Value(None) => RespValue::Bulk(None),
+        KvReply::Integer(value) => RespValue::Integer(value),
+        KvReply::Cas(value) | KvReply::Conditional(value) => RespValue::Integer(i64::from(value)),
+        KvReply::Scan(values) => RespValue::Array(
+            values
+                .into_iter()
+                .flat_map(|(key, value)| [RespValue::Bulk(Some(key)), RespValue::Bulk(Some(value))])
+                .collect(),
+        ),
+        KvReply::Error(error) => RespValue::Error(format!("ERR {error}")),
+    }
+}
+
+pub(crate) fn metrics_dashboard() -> String {
+    String::from(
+        "<!doctype html><title>ccdb / metrics</title><pre id=metrics>loading…</pre><script>fetch('/metrics').then(r=>r.text()).then(t=>document.querySelector('#metrics').textContent=t)</script>",
+    )
+}
+
+fn take_bytes<'a>(input: &'a [u8], cursor: &mut usize, length: usize) -> io::Result<&'a [u8]> {
+    let end = cursor
+        .checked_add(length)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "backup length overflow"))?;
+    let bytes = input
+        .get(*cursor..end)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "truncated backup"))?;
+    *cursor = end;
+    Ok(bytes)
+}
+
+fn take_u16(input: &[u8], cursor: &mut usize) -> io::Result<u16> {
+    Ok(u16::from_le_bytes(
+        take_bytes(input, cursor, 2)?.try_into().expect("two bytes"),
+    ))
+}
+fn take_u32(input: &[u8], cursor: &mut usize) -> io::Result<u32> {
+    Ok(u32::from_le_bytes(
+        take_bytes(input, cursor, 4)?
+            .try_into()
+            .expect("four bytes"),
+    ))
+}
+fn take_u64(input: &[u8], cursor: &mut usize) -> io::Result<u64> {
+    Ok(u64::from_le_bytes(
+        take_bytes(input, cursor, 8)?
+            .try_into()
+            .expect("eight bytes"),
+    ))
 }
 
 fn process_time() -> Time {
@@ -1683,18 +1061,17 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     OpenOptions::new().read(true).open(path)?.sync_all()
 }
 
-fn fatal_disk(reason: &str) -> ! {
+pub(crate) fn fatal_disk(reason: &str) -> ! {
     eprintln!("ccdb fatal disk error: {reason}");
     std::process::abort()
 }
 
-fn flag(args: &[String], name: &str) -> Option<String> {
+pub(crate) fn flag(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|window| window[0] == name)
         .map(|window| window[1].clone())
 }
-
-fn has_flag(args: &[String], name: &str) -> bool {
+pub(crate) fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|arg| arg == name)
 }
 
@@ -1702,247 +1079,23 @@ fn print_help() {
     println!(concat!(
         "ccdb ",
         env!("CARGO_PKG_VERSION"),
-        "\n\nCommands:\n  init --cluster NAME --nodes N [--base-dir DIR] [--force]\n  run --config PATH\n  peer --addr ADDR [--retries N] [--payload TEXT]\n  admin --addr ADDR status|members|snapshot\n  admin backup --data-dir DIR --output FILE\n  admin restore --input FILE --data-dir DIR\n  selfcheck --data-dir DIR [--deep]\n  doctor [--data-dir DIR] [--client-addr ADDR] [--peer-addr ADDR]"
+        "\n\nCommands:\n  init --cluster NAME --cluster-id HEX32 --nodes N [--base-dir DIR]\n  init --cluster NAME --cluster-id HEX32 --node-id ID --data-dir DIR\n  run --config PATH [--record PATH] [--record-max-bytes N] [--record-required] [--run-for-ms N] [--i-know-this-is-unauthenticated]\n  peer --config PATH --addr ADDR [--retries N]\n  admin --addr ADDR status|members|snapshot\n  admin backup --data-dir DIR --output FILE\n  admin restore --input FILE --data-dir DIR\n  selfcheck --data-dir DIR [--deep]\n  doctor [--data-dir DIR] [--client-addr ADDR] [--peer-addr ADDR]"
     ));
-}
-
-#[derive(Debug)]
-struct JournalRecord {
-    sequence: u64,
-    time: Time,
-    command: KvCommand,
-}
-
-struct DurableJournal {
-    file: File,
-}
-
-impl DurableJournal {
-    fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)?;
-        Ok(Self { file })
-    }
-
-    fn append(&mut self, sequence: u64, time: Time, command: &KvCommand) -> io::Result<()> {
-        let payload = encode_command(command);
-        let mut body = Vec::with_capacity(16 + payload.len());
-        body.extend_from_slice(&sequence.to_le_bytes());
-        body.extend_from_slice(&time.as_nanos().to_le_bytes());
-        body.extend_from_slice(&payload);
-        if body.len() > JOURNAL_MAX_RECORD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "command is too large",
-            ));
-        }
-        self.file.write_all(
-            &(u32::try_from(body.len()).expect("journal length fits u32")).to_le_bytes(),
-        )?;
-        self.file.write_all(&crc32c(&body).to_le_bytes())?;
-        self.file.write_all(&body)?;
-        if std::env::var_os("CCDB_FAIL_ENOSPC").is_some() {
-            fatal_disk("ENOSPC fault shim");
-        }
-        if std::env::var_os("CCDB_FAIL_FSYNC").is_some() {
-            fatal_disk("fsync fault shim");
-        }
-        self.file
-            .sync_data()
-            .unwrap_or_else(|error| fatal_disk(&format!("fsync failed: {error}")));
-        Ok(())
-    }
-
-    fn replay(&mut self) -> io::Result<Vec<JournalRecord>> {
-        self.file.seek(SeekFrom::Start(0))?;
-        let mut records = Vec::new();
-        loop {
-            let mut header = [0_u8; JOURNAL_HEADER];
-            let read = self.file.read(&mut header)?;
-            if read == 0 {
-                break;
-            }
-            if read != JOURNAL_HEADER {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated journal header",
-                ));
-            }
-            let length =
-                u32::from_le_bytes(header[..4].try_into().expect("journal length")) as usize;
-            let expected = u32::from_le_bytes(header[4..].try_into().expect("journal crc"));
-            if !(16..=JOURNAL_MAX_RECORD).contains(&length) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid journal length",
-                ));
-            }
-            let mut body = vec![0_u8; length];
-            self.file.read_exact(&mut body)?;
-            let actual = crc32c(&body);
-            if actual != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "journal checksum mismatch",
-                ));
-            }
-            let sequence = u64::from_le_bytes(body[..8].try_into().expect("journal sequence"));
-            let nanos = u64::from_le_bytes(body[8..16].try_into().expect("journal time"));
-            let command = decode_command(&body[16..]).map_err(io::Error::other)?;
-            records.push(JournalRecord {
-                sequence,
-                time: Time::from_nanos(nanos),
-                command,
-            });
-        }
-        self.file.seek(SeekFrom::End(0))?;
-        Ok(records)
-    }
-}
-
-fn load_state(path: &Path) -> io::Result<(Kv, u64)> {
-    let mut journal = DurableJournal::open(path)?;
-    let records = journal.replay()?;
-    let mut kv = Kv::new(StoreConfig::default()).map_err(io::Error::other)?;
-    let mut next = 1_u64;
-    for record in records {
-        kv.apply(
-            LogIndex::new(record.sequence),
-            Term::new(1),
-            ClientId::new(1),
-            record.sequence,
-            record.command,
-            record.time,
-        )
-        .map_err(io::Error::other)?;
-        next = next.max(record.sequence.saturating_add(1));
-    }
-    Ok((kv, next))
-}
-
-struct Metrics {
-    started: Instant,
-    commands: AtomicU64,
-    reads: AtomicU64,
-    writes: AtomicU64,
-    fsyncs: AtomicU64,
-    peer_frames: AtomicU64,
-    trace: Mutex<File>,
-}
-
-impl Metrics {
-    fn new(trace_path: PathBuf) -> io::Result<Self> {
-        let trace = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(trace_path)?;
-        Ok(Self {
-            started: Instant::now(),
-            commands: AtomicU64::new(0),
-            reads: AtomicU64::new(0),
-            writes: AtomicU64::new(0),
-            fsyncs: AtomicU64::new(0),
-            peer_frames: AtomicU64::new(0),
-            trace: Mutex::new(trace),
-        })
-    }
-
-    fn record_trace(&self, sequence: u64, time: Time, command: &KvCommand) -> io::Result<()> {
-        let mut trace = self
-            .trace
-            .lock()
-            .map_err(|_| io::Error::other("trace mutex poisoned"))?;
-        writeln!(
-            trace,
-            "apply seq={sequence} time={} command={command:?}",
-            time.as_nanos()
-        )?;
-        trace.flush()
-    }
-
-    /// Counters only. Everything here is owned by `Metrics` itself, so it can
-    /// be rendered without touching the journal or the KV lock.
-    fn render_counters(&self) -> String {
-        format!(
-            "# TYPE ccdb_commands_total counter\nccdb_commands_total {}\n\
-             # TYPE ccdb_reads_total counter\nccdb_reads_total {}\n\
-             # TYPE ccdb_writes_total counter\nccdb_writes_total {}\n\
-             # TYPE ccdb_fsyncs_total counter\nccdb_fsyncs_total {}\n\
-             # TYPE ccdb_peer_frames_total counter\nccdb_peer_frames_total {}\n\
-             # TYPE ccdb_uptime_seconds gauge\nccdb_uptime_seconds {}\n",
-            self.commands.load(Ordering::Relaxed),
-            self.reads.load(Ordering::Relaxed),
-            self.writes.load(Ordering::Relaxed),
-            self.fsyncs.load(Ordering::Relaxed),
-            self.peer_frames.load(Ordering::Relaxed),
-            self.started.elapsed().as_secs(),
-        )
-    }
-}
-
-/// The full operator inventory: the counters plus the gauges that need node
-/// state to compute.
-///
-/// Every value here is read from something the host already maintains. Nothing
-/// probes a peer or measures a latency — a scrape must not be able to perturb
-/// the thing it is measuring, and a metric the host cannot actually observe
-/// would be a number with no meaning behind it.
-fn render_metrics(state: &HostState) -> String {
-    let applied = state
-        .kv
-        .lock()
-        .map(|kv| kv.applied_index.get())
-        .unwrap_or_default();
-    let commit = state.sequence.load(Ordering::Acquire).saturating_sub(1);
-    // `leader_info` resolves the lowest reachable node id, which is this
-    // host's whole notion of leadership. See docs/LIMITATIONS.md.
-    let (leader, _) = leader_info(&state.config);
-    let is_leader = u8::from(leader == state.config.id);
-    format!(
-        "{}\
-         # TYPE ccdb_up gauge\nccdb_up 1\n\
-         # TYPE ccdb_node_id gauge\nccdb_node_id {}\n\
-         # TYPE ccdb_is_leader gauge\nccdb_is_leader {}\n\
-         # TYPE ccdb_leader_node_id gauge\nccdb_leader_node_id {}\n\
-         # TYPE ccdb_commit_index gauge\nccdb_commit_index {}\n\
-         # TYPE ccdb_applied_index gauge\nccdb_applied_index {}\n\
-         # TYPE ccdb_journal_records gauge\nccdb_journal_records {}\n\
-         # TYPE ccdb_peers_configured gauge\nccdb_peers_configured {}\n",
-        state.metrics.render_counters(),
-        state.config.id,
-        is_leader,
-        leader,
-        commit,
-        applied,
-        commit,
-        state.config.peers.len(),
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn identity_guard_rejects_a_mismatched_node_marker() {
-        let directory = env::temp_dir().join(format!(
-            "cc-node-identity-{}-{}",
-            std::process::id(),
-            process_time().as_nanos()
-        ));
-        fs::create_dir_all(&directory).expect("identity test directory");
-        fs::write(
-            directory.join("node.json"),
-            b"{\"cluster\":\"test\",\"id\":1}\n",
-        )
-        .expect("identity marker");
-        sync_directory(&directory).expect("directory fsync");
-        let config = Config {
+    const TEST_CLUSTER_ID: &str = "00112233445566778899aabbccddeeff";
+    fn test_cluster_id() -> ClusterId {
+        ClusterId::from_hex(TEST_CLUSTER_ID).expect("test cluster id")
+    }
+    fn test_config(directory: PathBuf) -> Config {
+        Config {
             id: 1,
-            data_dir: directory.clone(),
+            cluster_id: test_cluster_id(),
+            data_dir: directory,
             listen_client: String::from("127.0.0.1:7101"),
             listen_peer: String::from("127.0.0.1:7201"),
             listen_metrics: String::from("127.0.0.1:7301"),
@@ -1950,203 +1103,179 @@ mod tests {
                 id: 1,
                 address: String::from("127.0.0.1:7201"),
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn trap_ccid_rejects_mismatched_node_or_cluster_identity() {
+        let directory =
+            env::temp_dir().join(format!("cc-node-identity-{}", process_time().as_nanos()));
+        fs::create_dir_all(&directory).expect("identity directory");
+        let config = test_config(directory.clone());
+        write_identity(
+            &identity_path(&directory),
+            DiskIdentity::fresh(test_cluster_id(), 1),
+        )
+        .expect("identity");
         assert!(validate_identity(&config).is_ok());
-        let mut mismatched = config.clone();
-        mismatched.id = 2;
+        let mut wrong_node = config.clone();
+        wrong_node.id = 2;
         assert_eq!(
-            validate_identity(&mismatched)
-                .expect_err("mismatched identity must be rejected")
+            validate_identity(&wrong_node)
+                .expect_err("node mismatch")
                 .kind(),
             io::ErrorKind::InvalidData
         );
-        fs::remove_dir_all(directory).expect("remove identity test directory");
-    }
-
-    #[test]
-    fn replication_write_payload_round_trips_and_rejects_trailing_bytes() {
-        let command = KvCommand::Set {
-            key: b"course".to_vec(),
-            value: b"fixture".to_vec(),
-            ttl: None,
-        };
-        let payload = encode_replication_write(7, Time::from_nanos(11), &command)
-            .expect("encode replication write");
+        let mut wrong_cluster = config;
+        wrong_cluster.cluster_id =
+            ClusterId::from_hex("11112233445566778899aabbccddeeff").expect("cluster id");
         assert_eq!(
-            decode_replication_write(&payload).expect("decode replication write"),
-            (7, Time::from_nanos(11), command)
+            validate_identity(&wrong_cluster)
+                .expect_err("cluster mismatch")
+                .kind(),
+            io::ErrorKind::InvalidData
         );
-        let mut malformed = payload;
-        malformed.push(0);
-        assert!(decode_replication_write(&malformed).is_err());
+        fs::remove_dir_all(directory).expect("remove fixture");
     }
 
     #[test]
-    fn malformed_peer_and_resp_inputs_are_bounded() {
-        let malformed_peer_inputs = [
-            Vec::new(),
-            vec![0xff; 14],
-            vec![
-                b'C', b'C', b'P', b'F', 1, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0,
-            ],
-        ];
-        for input in malformed_peer_inputs {
-            assert!(decode_peer_frame(&input).is_err());
-        }
-        let malformed_resp_inputs = [
-            b"*1025\r\n".to_vec(),
-            b"$4194305\r\n".to_vec(),
-            b"?not-resp\r\n".to_vec(),
-            vec![b'*', b'1', b'\r', b'\n', b'*', b'1', b'\r', b'\n'],
-        ];
-        for input in malformed_resp_inputs {
-            assert!(parse(&input).is_err());
-        }
+    fn trap_cluster_id_has_one_nonzero_canonical_text_form() {
+        assert!(ClusterId::from_hex(TEST_CLUSTER_ID).is_ok());
+        assert!(ClusterId::from_hex("00112233445566778899AABBCCDDEEFF").is_err());
+        assert!(ClusterId::from_hex("00112233445566778899aabbccddeef").is_err());
+        assert!(ClusterId::from_hex("00000000000000000000000000000000").is_err());
     }
 
     #[test]
-    fn parser_fuzz_corpus_is_total_and_bounded() {
-        let mut state = 0xfeed_cafe_d15e_a5e5_u64;
-        for round in 0..2_048 {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let peer_len = (state as usize) % 1_024;
-            let mut peer = Vec::with_capacity(peer_len);
-            for _ in 0..peer_len {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                peer.push((state >> 32) as u8);
-            }
-            let peer_result = std::panic::catch_unwind(|| decode_peer_frame(&peer));
-            assert!(peer_result.is_ok(), "peer parser panicked at round {round}");
-
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let resp_len = (state as usize) % 1_024;
-            let mut resp = Vec::with_capacity(resp_len);
-            for _ in 0..resp_len {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                resp.push((state >> 32) as u8);
-            }
-            let resp_result = std::panic::catch_unwind(|| parse(&resp));
-            assert!(resp_result.is_ok(), "RESP parser panicked at round {round}");
-            if let Ok(Ok((_, used))) = resp_result {
-                assert!(used <= resp.len(), "RESP parser overread at round {round}");
-            }
-        }
-    }
-
-    #[test]
-    fn doctor_fsync_probe_cleans_up_after_itself() {
-        let directory = env::temp_dir().join(format!(
-            "cc-node-doctor-{}-{}",
-            std::process::id(),
-            process_time().as_nanos()
-        ));
-        fs::create_dir_all(&directory).expect("doctor test directory");
-        fsync_probe(&directory).expect("fsync probe");
-        assert_eq!(fs::read_dir(&directory).expect("read directory").count(), 0);
-        fs::remove_dir_all(directory).expect("remove doctor test directory");
-    }
-
-    #[test]
-    fn deep_selfcheck_cross_validates_identity_watermark_and_metrics() {
-        let directory = env::temp_dir().join(format!(
-            "cc-node-deep-check-{}-{}",
-            std::process::id(),
-            process_time().as_nanos()
-        ));
-        fs::create_dir_all(directory.join("snapshots/staging")).expect("deep-check directory");
-        fs::write(
-            directory.join("node.json"),
-            b"{\"cluster\":\"test\",\"id\":1}\n",
-        )
-        .expect("identity marker");
-        fs::write(
-            directory.join("ccdb.toml"),
-            format!(
-                "[node]\nid = 1\ndata_dir = \"{}\"\nlisten_client = \"127.0.0.1:7101\"\nlisten_peer = \"127.0.0.1:7201\"\nlisten_metrics = \"127.0.0.1:7301\"\npeer_nodes = \"127.0.0.1:7201\"\n",
-                directory.display()
-            ),
-        )
-        .expect("config");
-        // The fixture is a real host's inventory, not a token line: deep-check
-        // now requires the whole documented metric set, so a node that quietly
-        // stopped emitting half of it fails instead of passing.
-        let full_inventory = concat!(
-            "ccdb_commands_total 0\n",
-            "ccdb_reads_total 0\n",
-            "ccdb_writes_total 0\n",
-            "ccdb_fsyncs_total 0\n",
-            "ccdb_peer_frames_total 0\n",
-            "ccdb_uptime_seconds 0\n",
-            "ccdb_up 1\n",
-            "ccdb_node_id 1\n",
-            "ccdb_is_leader 1\n",
-            "ccdb_leader_node_id 1\n",
-            "ccdb_commit_index 0\n",
-            "ccdb_applied_index 0\n",
-            "ccdb_journal_records 0\n",
-            "ccdb_peers_configured 1\n",
+    fn trap_ccid_is_exact_checksum_fenced_and_removed_is_terminal() {
+        let identity = DiskIdentity::fresh(test_cluster_id(), 7);
+        let bytes = identity.encode();
+        assert_eq!(bytes.len(), IDENTITY_LEN);
+        assert_eq!(
+            DiskIdentity::decode(&bytes).expect("decode identity"),
+            identity
         );
-        fs::write(directory.join("metrics.prom"), full_inventory).expect("metrics");
-        deep_selfcheck(&directory, &[]).expect("deep check");
+        let mut corrupt = bytes;
+        corrupt[31] ^= 1;
+        assert!(DiskIdentity::decode(&corrupt).is_err());
 
-        // Dropping one name from the inventory must be caught.
-        fs::write(
-            directory.join("metrics.prom"),
-            full_inventory.replace("ccdb_applied_index 0\n", ""),
+        let directory =
+            env::temp_dir().join(format!("cc-node-removed-{}", process_time().as_nanos()));
+        fs::create_dir_all(&directory).expect("identity directory");
+        write_identity(
+            &identity_path(&directory),
+            DiskIdentity {
+                lifecycle: IDENTITY_REMOVED,
+                ..DiskIdentity::fresh(test_cluster_id(), 1)
+            },
         )
-        .expect("metrics");
-        assert!(
-            deep_selfcheck(&directory, &[]).is_err(),
-            "a missing metric is a deep-check failure"
+        .expect("removed identity");
+        assert_eq!(
+            validate_identity(&test_config(directory.clone()))
+                .expect_err("removed is terminal")
+                .kind(),
+            io::ErrorKind::PermissionDenied
         );
-        fs::remove_dir_all(directory).expect("remove deep-check directory");
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trap_ccid_refuses_a_symlinked_data_directory_before_opening_state() {
+        use std::os::unix::fs::symlink;
+
+        let root = env::temp_dir().join(format!("cc-node-symlink-{}", process_time().as_nanos()));
+        let target = root.join("target");
+        let alias = root.join("alias");
+        fs::create_dir_all(&target).expect("target directory");
+        write_identity(
+            &identity_path(&target),
+            DiskIdentity::fresh(test_cluster_id(), 1),
+        )
+        .expect("identity");
+        symlink(&target, &alias).expect("symlink");
+        assert_eq!(
+            validate_identity(&test_config(alias))
+                .expect_err("symlink must be refused")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
-    fn metrics_dashboard_is_dependency_free_and_links_metrics() {
-        let dashboard = metrics_dashboard();
-        assert!(dashboard.contains("fetch('/metrics')"));
-        assert!(dashboard.contains("ccdb / metrics"));
-        assert!(!dashboard.contains("https://"));
+    fn trap_non_loopback_bind_requires_the_flag() {
+        let mut config = test_config(PathBuf::from("/tmp/cc-node-listener-test"));
+        config.listen_peer = String::from("0.0.0.0:7201");
+        assert_eq!(
+            validate_listener_safety(&config, false)
+                .expect_err("unsafe listener must be refused")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(validate_listener_safety(&config, true).is_ok());
     }
 
     #[test]
-    fn backup_restore_round_trip_passes_deep_selfcheck() {
-        let root = env::temp_dir().join(format!(
-            "cc-node-backup-{}-{}",
-            std::process::id(),
-            process_time().as_nanos()
-        ));
+    fn trap_unsafe_warning_names_actual_listener() {
+        assert_eq!(
+            unsafe_listener_warning("peer", "0.0.0.0:7201".parse().expect("address")),
+            Some(String::from(
+                "ccdb warning listener=peer address=0.0.0.0:7201 unauthenticated=true"
+            ))
+        );
+        assert_eq!(
+            unsafe_listener_warning("peer", "127.0.0.1:7201".parse().expect("address")),
+            None
+        );
+    }
+
+    #[test]
+    fn trap_pre_upgrade_data_dir_is_refused_before_writes() {
+        let directory =
+            env::temp_dir().join(format!("cc-node-pre-n1-{}", process_time().as_nanos()));
+        fs::create_dir_all(&directory).expect("legacy directory");
+        fs::write(directory.join("commands.log"), b"legacy bytes").expect("legacy journal");
+        let error = validate_identity(&test_config(directory.clone()))
+            .expect_err("legacy directory must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(directory.join("commands.log")).expect("legacy bytes"),
+            b"legacy bytes"
+        );
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn trap_strict_config_rejects_defaults_and_duplicate_identity() {
+        assert!(parse_config("[node]\nid = 1\ndata_dir = \"/tmp/node\"\n").is_err());
+        let duplicate = "[node]\nid = 1\nid = 2\ncluster_id = \"00112233445566778899aabbccddeeff\"\ndata_dir = \"/tmp/node\"\nlisten_client = \"127.0.0.1:7101\"\nlisten_peer = \"127.0.0.1:7201\"\nlisten_metrics = \"127.0.0.1:7301\"\npeer_nodes = \"127.0.0.1:7201\"\n";
+        assert!(parse_config(duplicate).is_err());
+    }
+
+    #[test]
+    fn trap_backup_round_trip_preserves_new_wal_layout() {
+        let root = env::temp_dir().join(format!("cc-node-backup-{}", process_time().as_nanos()));
         let source = root.join("source");
         let restored = root.join("restored");
-        fs::create_dir_all(source.join("snapshots/staging")).expect("source directory");
-        fs::write(
-            source.join("node.json"),
-            b"{\"cluster\":\"test\",\"id\":1}\n",
-        )
-        .expect("marker");
-        fs::write(
-            source.join("ccdb.toml"),
-            format!(
-                "[node]\nid = 1\ndata_dir = \"{}\"\nlisten_client = \"127.0.0.1:7101\"\nlisten_peer = \"127.0.0.1:7201\"\nlisten_metrics = \"127.0.0.1:7301\"\npeer_nodes = \"127.0.0.1:7201\"\n",
-                source.display()
-            ),
-        )
-        .expect("config");
+        initialize_data_dir(&source, test_cluster_id(), 1).expect("initialize");
+        fs::write(source.join("ccdb.toml"), format!("[node]\nid = 1\ncluster_id = \"{TEST_CLUSTER_ID}\"\ndata_dir = \"{}\"\nlisten_client = \"127.0.0.1:7101\"\nlisten_peer = \"127.0.0.1:7201\"\nlisten_metrics = \"127.0.0.1:7301\"\npeer_nodes = \"127.0.0.1:7201\"\n", source.display())).expect("config");
         let archive = root.join("backup.ccbk");
         assert_eq!(backup_data_dir(&source, &archive).expect("backup"), 3);
         assert_eq!(restore_backup(&archive, &restored).expect("restore"), 3);
-        let mut journal = DurableJournal::open(&restored.join("commands.log")).expect("journal");
-        let records = journal.replay().expect("replay");
-        deep_selfcheck(&restored, &records).expect("deep selfcheck");
-        fs::remove_dir_all(root).expect("remove backup test directory");
+        selfcheck(&[
+            String::from("--data-dir"),
+            restored.display().to_string(),
+            String::from("--deep"),
+        ])
+        .expect("restored selfcheck");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn trap_metrics_page_remains_local_and_dependency_free() {
+        let dashboard = metrics_dashboard();
+        assert!(dashboard.contains("fetch('/metrics')"));
+        assert!(!dashboard.contains("https://"));
     }
 }

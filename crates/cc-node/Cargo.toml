@@ -2,15 +2,18 @@
 name = "cc-node"
 version.workspace = true
 edition.workspace = true
-description = "The ccdb lab host: RESP listener, CRC-checked journal, and TCP replication."
+description = "The ccdb lab host: strict shared-driver RESP and TCP adapter."
 license.workspace = true
 authors.workspace = true
 publish = false
 
 [dependencies]
 cc-core = { path = "../cc-core" }
+cc-cluster = { path = "../cc-cluster" }
 cc-env = { path = "../cc-env" }
+cc-host = { path = "../cc-host" }
 cc-kv = { path = "../cc-kv" }
+cc-log = { path = "../cc-log" }
 cc-resp = { path = "../cc-resp" }
 cc-store = { path = "../cc-store" }
 
