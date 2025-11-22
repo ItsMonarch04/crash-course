@@ -6,9 +6,9 @@
 ## Decision
 
 `ccdb admin backup` emits a bounded `CCBK` version-1 archive containing the
-node identity, configuration, and CRC-validated command journal. The command
-replays the journal and rejects a length change during capture, so operators
-must stop writes and retry rather than accept a fuzzy backup.
+node identity, configuration, and CRC-validated framed Raft WAL. The command
+rejects a torn WAL during capture, so operators must stop writes and retry
+rather than accept a fuzzy backup.
 
 Restore accepts only the three known relative paths, verifies every checksum
 before writing, stages files under a sibling directory, fsyncs files and the
@@ -18,6 +18,5 @@ report-only; restore never merges with existing data.
 
 ## Consequences
 
-This archive follows the real host's current durable-journal truth. It is not
-an SSTable checkpoint and must evolve when the real host adopts the simulator
-store's file set.
+This archive follows the real host's current `cc-log` durable truth. It is not
+an SSTable checkpoint and must evolve when the storage/snapshot file set lands.
