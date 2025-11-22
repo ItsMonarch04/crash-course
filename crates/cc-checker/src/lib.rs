@@ -7,9 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use cc_core::{Time, Trace};
+use cc_core::{Dec, DecodeError, Enc, Time, Trace};
 
 pub const CHECKER_VERSION: u16 = 1;
+pub const HISTORY_MAGIC: u32 = u32::from_le_bytes(*b"CCHY");
+pub const HISTORY_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationKind {
@@ -117,6 +119,355 @@ impl History {
     }
 }
 
+/// The binary-safe CC-HISTORY v2 container used by real-run export, checking,
+/// and external adapters. It retains open operations instead of turning a
+/// timeout into an accidental absence from the proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryDocument {
+    pub build_label: String,
+    pub config_hash: u64,
+    pub initial: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub retain_open: bool,
+    pub history: History,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoryCodecError {
+    Decode(DecodeError),
+    Invalid(&'static str),
+    DuplicateId(u64),
+}
+impl std::fmt::Display for HistoryCodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode(error) => write!(f, "decode: {error}"),
+            Self::Invalid(reason) => write!(f, "invalid history: {reason}"),
+            Self::DuplicateId(id) => write!(f, "duplicate operation id {id}"),
+        }
+    }
+}
+impl std::error::Error for HistoryCodecError {}
+impl From<DecodeError> for HistoryCodecError {
+    fn from(value: DecodeError) -> Self {
+        Self::Decode(value)
+    }
+}
+
+impl HistoryDocument {
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut enc = Enc::new();
+        enc.header(HISTORY_MAGIC, HISTORY_VERSION);
+        enc.string(&self.build_label);
+        enc.u64(self.config_hash);
+        enc.u8(u8::from(self.retain_open));
+        enc.u32(u32::try_from(self.initial.len()).expect("initial count fits"));
+        for (key, value) in &self.initial {
+            enc.bytes(key);
+            enc.bytes(value);
+        }
+        enc.u32(u32::try_from(self.history.operations.len()).expect("operation count fits"));
+        for operation in &self.history.operations {
+            encode_operation(&mut enc, operation);
+        }
+        enc.finish()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, HistoryCodecError> {
+        let mut dec = Dec::new(bytes);
+        dec.header(HISTORY_MAGIC, HISTORY_VERSION)?;
+        let build_label = dec.string()?;
+        let config_hash = dec.u64()?;
+        let retain_open = match dec.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(HistoryCodecError::Invalid("open flag")),
+        };
+        let initial_count = bounded_count(&mut dec, bytes.len(), 1_000_000)?;
+        let mut initial = BTreeMap::new();
+        for _ in 0..initial_count {
+            let key = dec.bytes()?;
+            let value = dec.bytes()?;
+            if initial.insert(key, value).is_some() {
+                return Err(HistoryCodecError::Invalid("duplicate initial key"));
+            }
+        }
+        let count = bounded_count(&mut dec, bytes.len(), 1_000_000)?;
+        let mut history = History::default();
+        let mut ids = BTreeSet::new();
+        for _ in 0..count {
+            let operation = decode_operation(&mut dec)?;
+            if !ids.insert(operation.id) {
+                return Err(HistoryCodecError::DuplicateId(operation.id));
+            }
+            if operation.complete.is_none() && !retain_open {
+                return Err(HistoryCodecError::Invalid("open operation not retained"));
+            }
+            history.push(operation);
+        }
+        dec.finish()?;
+        Ok(Self {
+            build_label,
+            config_hash,
+            initial,
+            retain_open,
+            history,
+        })
+    }
+}
+
+/// Decode the captured tab-separated CC-HISTORY v1 receipt format.  The
+/// legacy writer rendered binary arguments as hexadecimal; decoding those
+/// fields as their ASCII text would silently prove a different history.  New
+/// receipts use [`HistoryDocument`], but this reader keeps old artifacts
+/// checkable with their original byte meaning.
+pub fn decode_history_v1_tsv(text: &str) -> Result<History, HistoryCodecError> {
+    let mut history = History::default();
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 5 {
+            return Err(HistoryCodecError::Invalid("v1 field count"));
+        }
+        let invoke = fields[3]
+            .parse::<u64>()
+            .map_err(|_| HistoryCodecError::Invalid("v1 invoke"))?;
+        let complete = fields[4]
+            .parse::<u64>()
+            .map_err(|_| HistoryCodecError::Invalid("v1 completion"))?;
+        let key = decode_history_v1_hex(fields[1])?;
+        let kind = match fields[0] {
+            "SET" => OperationKind::Set {
+                key,
+                value: decode_history_v1_hex(fields[2])?,
+            },
+            "GET" => OperationKind::Get { key },
+            "DEL" => OperationKind::Del { key },
+            "INCR" => OperationKind::Incr { key },
+            "CAS" => OperationKind::Cas {
+                key,
+                expected: if fields[2] == "-" {
+                    None
+                } else {
+                    Some(decode_history_v1_hex(fields[2])?)
+                },
+                value: b"cas".to_vec(),
+            },
+            _ => return Err(HistoryCodecError::Invalid("v1 operation")),
+        };
+        let outcome = match fields[0] {
+            "SET" | "DEL" => Outcome::Ok,
+            "GET" => Outcome::Value(if fields[2] == "-" {
+                None
+            } else {
+                Some(decode_history_v1_hex(fields[2])?)
+            }),
+            "INCR" => Outcome::Integer(
+                fields[2]
+                    .parse()
+                    .map_err(|_| HistoryCodecError::Invalid("v1 increment"))?,
+            ),
+            "CAS" => Outcome::Cas(fields[2] != "-"),
+            _ => return Err(HistoryCodecError::Invalid("v1 operation")),
+        };
+        history.push(Operation::completed(
+            complete,
+            kind,
+            Time::from_nanos(invoke),
+            Time::from_nanos(complete),
+            outcome,
+        ));
+    }
+    Ok(history)
+}
+
+fn decode_history_v1_hex(text: &str) -> Result<Vec<u8>, HistoryCodecError> {
+    if !text.len().is_multiple_of(2) {
+        return Err(HistoryCodecError::Invalid("v1 odd hex"));
+    }
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks_exact(2) {
+        let high = digit(pair[0]).ok_or(HistoryCodecError::Invalid("v1 hex"))?;
+        let low = digit(pair[1]).ok_or(HistoryCodecError::Invalid("v1 hex"))?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn bounded_count(dec: &mut Dec<'_>, total: usize, max: u32) -> Result<u32, HistoryCodecError> {
+    let count = dec.u32()?;
+    if count > max
+        || usize::try_from(count).unwrap_or(usize::MAX) > total.saturating_sub(dec.position())
+    {
+        Err(HistoryCodecError::Invalid("count"))
+    } else {
+        Ok(count)
+    }
+}
+fn encode_operation(enc: &mut Enc, operation: &Operation) {
+    enc.u64(operation.id);
+    enc.u64(operation.client);
+    enc.u64(operation.sequence);
+    enc.u64(operation.invoke.as_nanos());
+    match operation.complete {
+        Some(time) => {
+            enc.u8(1);
+            enc.u64(time.as_nanos());
+        }
+        None => enc.u8(0),
+    }
+    match &operation.kind {
+        OperationKind::Set { key, value } => {
+            enc.u8(1);
+            enc.bytes(key);
+            enc.bytes(value);
+        }
+        OperationKind::Get { key } => {
+            enc.u8(2);
+            enc.bytes(key);
+        }
+        OperationKind::Del { key } => {
+            enc.u8(3);
+            enc.bytes(key);
+        }
+        OperationKind::Incr { key } => {
+            enc.u8(4);
+            enc.bytes(key);
+        }
+        OperationKind::Cas {
+            key,
+            expected,
+            value,
+        } => {
+            enc.u8(5);
+            enc.bytes(key);
+            opt_bytes(enc, expected);
+            enc.bytes(value);
+        }
+        OperationKind::Scan { prefix, limit } => {
+            enc.u8(6);
+            opt_bytes(enc, prefix);
+            enc.u32(u32::try_from(*limit).unwrap_or(u32::MAX));
+        }
+    }
+    encode_outcome(enc, &operation.outcome);
+}
+fn decode_operation(dec: &mut Dec<'_>) -> Result<Operation, HistoryCodecError> {
+    let id = dec.u64()?;
+    let client = dec.u64()?;
+    let sequence = dec.u64()?;
+    let invoke = Time::from_nanos(dec.u64()?);
+    let complete = match dec.u8()? {
+        0 => None,
+        1 => Some(Time::from_nanos(dec.u64()?)),
+        _ => return Err(HistoryCodecError::Invalid("completion flag")),
+    };
+    let kind = match dec.u8()? {
+        1 => OperationKind::Set {
+            key: dec.bytes()?,
+            value: dec.bytes()?,
+        },
+        2 => OperationKind::Get { key: dec.bytes()? },
+        3 => OperationKind::Del { key: dec.bytes()? },
+        4 => OperationKind::Incr { key: dec.bytes()? },
+        5 => OperationKind::Cas {
+            key: dec.bytes()?,
+            expected: decode_opt_bytes(dec)?,
+            value: dec.bytes()?,
+        },
+        6 => OperationKind::Scan {
+            prefix: decode_opt_bytes(dec)?,
+            limit: usize::try_from(dec.u32()?)
+                .map_err(|_| HistoryCodecError::Invalid("scan limit"))?,
+        },
+        _ => return Err(HistoryCodecError::Invalid("operation tag")),
+    };
+    let outcome = decode_outcome(dec)?;
+    Ok(Operation {
+        id,
+        client,
+        sequence,
+        invoke,
+        complete,
+        kind,
+        outcome,
+    })
+}
+fn opt_bytes(enc: &mut Enc, value: &Option<Vec<u8>>) {
+    match value {
+        Some(value) => {
+            enc.u8(1);
+            enc.bytes(value);
+        }
+        None => enc.u8(0),
+    }
+}
+fn decode_opt_bytes(dec: &mut Dec<'_>) -> Result<Option<Vec<u8>>, HistoryCodecError> {
+    match dec.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(dec.bytes()?)),
+        _ => Err(HistoryCodecError::Invalid("option flag")),
+    }
+}
+fn encode_outcome(enc: &mut Enc, outcome: &Outcome) {
+    match outcome {
+        Outcome::Ok => enc.u8(1),
+        Outcome::Value(value) => {
+            enc.u8(2);
+            opt_bytes(enc, value);
+        }
+        Outcome::Integer(value) => {
+            enc.u8(3);
+            enc.u64(*value as u64);
+        }
+        Outcome::Cas(value) => {
+            enc.u8(4);
+            enc.u8(u8::from(*value));
+        }
+        Outcome::Scan(values) => {
+            enc.u8(5);
+            enc.u32(u32::try_from(values.len()).unwrap_or(u32::MAX));
+            for (key, value) in values {
+                enc.bytes(key);
+                enc.bytes(value);
+            }
+        }
+        Outcome::Error => enc.u8(6),
+        Outcome::Timeout => enc.u8(7),
+    }
+}
+fn decode_outcome(dec: &mut Dec<'_>) -> Result<Outcome, HistoryCodecError> {
+    Ok(match dec.u8()? {
+        1 => Outcome::Ok,
+        2 => Outcome::Value(decode_opt_bytes(dec)?),
+        3 => Outcome::Integer(dec.u64()? as i64),
+        4 => Outcome::Cas(match dec.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(HistoryCodecError::Invalid("boolean")),
+        }),
+        5 => {
+            let count = bounded_count(dec, cc_core::MAX_CODEC_BYTES, 4096)?;
+            let mut values = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                values.push((dec.bytes()?, dec.bytes()?));
+            }
+            Outcome::Scan(values)
+        }
+        6 => Outcome::Error,
+        7 => Outcome::Timeout,
+        _ => return Err(HistoryCodecError::Invalid("outcome tag")),
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckerConfig {
     pub max_states: u64,
@@ -144,6 +495,148 @@ pub enum Verdict {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Witness {
+    pub operation_ids: Vec<u64>,
+    pub oracle_calls: u32,
+    pub budget_exhausted: bool,
+    pub one_minimal: bool,
+}
+
+/// Produce a bounded one-deletion-minimal witness for a completed failing
+/// history. A timeout/undecided oracle is never accepted as evidence.
+#[must_use]
+pub fn minimize_witness(history: &History, config: CheckerConfig, budget: u32) -> Option<Witness> {
+    minimize_witness_with_initial(history, BTreeMap::new(), config, budget)
+}
+
+/// Minimize a failed v2 receipt while retaining the exact initial state image
+/// that made the history meaningful.  This is the window-safe counterpart to
+/// [`minimize_witness`].
+#[must_use]
+pub fn minimize_document_witness(
+    document: &HistoryDocument,
+    config: CheckerConfig,
+    budget: u32,
+) -> Option<Witness> {
+    minimize_witness_with_initial(&document.history, document.initial.clone(), config, budget)
+}
+
+fn minimize_witness_with_initial(
+    history: &History,
+    initial: Model,
+    config: CheckerConfig,
+    budget: u32,
+) -> Option<Witness> {
+    let mut cache = BTreeMap::new();
+    let mut calls = 0_u32;
+    if !witness_oracle(
+        &history.operations,
+        &initial,
+        config,
+        budget,
+        &mut calls,
+        &mut cache,
+    )? {
+        return None;
+    }
+    let mut candidate = history.operations.clone();
+    let mut granularity = 2_usize;
+    while candidate.len() >= 2 && calls < budget {
+        let chunk = candidate.len().div_ceil(granularity);
+        let mut removed = false;
+        for start in (0..candidate.len()).step_by(chunk.max(1)) {
+            if calls >= budget {
+                break;
+            }
+            let end = (start + chunk).min(candidate.len());
+            let reduced = candidate
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index < start || *index >= end)
+                .map(|(_, operation)| operation.clone())
+                .collect::<Vec<_>>();
+            if reduced.is_empty() {
+                continue;
+            }
+            if witness_oracle(&reduced, &initial, config, budget, &mut calls, &mut cache)
+                == Some(true)
+            {
+                candidate = reduced;
+                granularity = 2;
+                removed = true;
+                break;
+            }
+        }
+        if !removed {
+            if granularity >= candidate.len() {
+                break;
+            }
+            granularity = (granularity.saturating_mul(2)).min(candidate.len());
+        }
+    }
+    let one_minimal = 'deletion: loop {
+        for index in (0..candidate.len()).rev() {
+            if calls >= budget {
+                break 'deletion false;
+            }
+            let reduced = candidate
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, operation)| operation.clone())
+                .collect::<Vec<_>>();
+            if witness_oracle(&reduced, &initial, config, budget, &mut calls, &mut cache)
+                == Some(true)
+            {
+                candidate = reduced;
+                continue 'deletion;
+            }
+        }
+        break true;
+    };
+    Some(Witness {
+        operation_ids: candidate.iter().map(|operation| operation.id).collect(),
+        oracle_calls: calls,
+        budget_exhausted: calls >= budget,
+        one_minimal,
+    })
+}
+
+fn witness_oracle(
+    operations: &[Operation],
+    initial: &Model,
+    config: CheckerConfig,
+    budget: u32,
+    calls: &mut u32,
+    cache: &mut BTreeMap<Vec<u64>, bool>,
+) -> Option<bool> {
+    let mut ids = operations
+        .iter()
+        .map(|operation| operation.id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    if let Some(result) = cache.get(&ids) {
+        return Some(*result);
+    }
+    if *calls >= budget {
+        return None;
+    }
+    *calls = calls.saturating_add(1);
+    let result = matches!(
+        check_with_initial(
+            &History {
+                operations: operations.to_vec(),
+            },
+            initial.clone(),
+            config
+        ),
+        Verdict::NotLinearizable { .. }
+    );
+    cache.insert(ids, result);
+    Some(result)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct MemoKey {
     remaining: Vec<usize>,
@@ -161,12 +654,36 @@ enum SearchResult {
 /// Check a per-key register history with an open-operation branch.
 #[must_use]
 pub fn check(history: &History, config: CheckerConfig) -> Verdict {
+    check_with_initial(history, BTreeMap::new(), config)
+}
+
+/// Check a complete v2 receipt using the explicit state image carried in its
+/// header.  A caller cannot accidentally treat a bounded trace window as if
+/// it began from an empty database.
+#[must_use]
+pub fn check_document(document: &HistoryDocument, config: CheckerConfig) -> Verdict {
+    check_with_initial(&document.history, document.initial.clone(), config)
+}
+
+/// Window checking is deliberately opt-in and requires a supplied initial
+/// state receipt. `Some(empty)` is a valid assertion that the window began
+/// empty; `None` is rejected rather than silently assuming it.
+pub fn check_window(
+    history: &History,
+    initial: Option<BTreeMap<Vec<u8>, Vec<u8>>>,
+    config: CheckerConfig,
+) -> Result<Verdict, HistoryCodecError> {
+    let initial = initial.ok_or(HistoryCodecError::Invalid("window initial receipt"))?;
+    Ok(check_with_initial(history, initial, config))
+}
+
+fn check_with_initial(history: &History, initial: Model, config: CheckerConfig) -> Verdict {
     if history
         .operations
         .iter()
         .any(|operation| matches!(operation.kind, OperationKind::Scan { .. }))
     {
-        return check_single(history, config);
+        return check_single(history, initial, config);
     }
     let mut per_key = BTreeMap::<Vec<u8>, History>::new();
     for operation in &history.operations {
@@ -178,8 +695,12 @@ pub fn check(history: &History, config: CheckerConfig) -> Verdict {
     if per_key.len() > 1 {
         let mut visited = 0_u64;
         let mut undecided = false;
-        for key_history in per_key.values() {
-            match check_single(key_history, config) {
+        for (key, key_history) in &per_key {
+            let key_initial = initial
+                .get(key)
+                .map(|value| [(key.clone(), value.clone())].into_iter().collect())
+                .unwrap_or_default();
+            match check_single(key_history, key_initial, config) {
                 Verdict::Linearizable { visited: count } => visited = visited.saturating_add(count),
                 Verdict::Undecided { visited: count } => {
                     visited = visited.saturating_add(count);
@@ -202,10 +723,10 @@ pub fn check(history: &History, config: CheckerConfig) -> Verdict {
             Verdict::Linearizable { visited }
         };
     }
-    check_single(history, config)
+    check_single(history, initial, config)
 }
 
-fn check_single(history: &History, config: CheckerConfig) -> Verdict {
+fn check_single(history: &History, initial: Model, config: CheckerConfig) -> Verdict {
     if history.operations.is_empty() {
         return Verdict::Linearizable { visited: 0 };
     }
@@ -216,7 +737,7 @@ fn check_single(history: &History, config: CheckerConfig) -> Verdict {
     let result = search(
         history,
         remaining,
-        BTreeMap::new(),
+        initial,
         config,
         &mut visited,
         &mut memo,
@@ -470,7 +991,7 @@ pub fn check_no_resurrection(history: &History) -> InvariantReport {
             }
             OperationKind::Get { key }
                 if deleted.contains(key)
-                    && operation.outcome == Outcome::Value(Some(Vec::new())) =>
+                    && matches!(operation.outcome, Outcome::Value(Some(_))) =>
             {
                 report.violations.push(InvariantViolation {
                     name: "no_resurrection",
@@ -481,6 +1002,169 @@ pub fn check_no_resurrection(history: &History) -> InvariantReport {
         }
     }
     report
+}
+
+/// Conservative, evidence-based labels for an already captured history.
+/// These labels are diagnostic only: they do not weaken or replace the
+/// linearizability verdict, and overlapping operations never manufacture an
+/// order that the history did not observe.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AnomalyClass {
+    DirtyRead,
+    StaleRead,
+    Resurrection,
+    Unclassified,
+}
+
+impl AnomalyClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirtyRead => "dirty-read",
+            Self::StaleRead => "stale-read",
+            Self::Resurrection => "resurrection",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Anomaly {
+    pub class: AnomalyClass,
+    pub operation_ids: Vec<u64>,
+    pub predicate: &'static str,
+}
+
+/// Classify only facts that are certain from real-time intervals.  The
+/// current history format has no TTL/deadline evidence, so this deliberately
+/// does not label persistence anomalies when an expiry could explain them.
+#[must_use]
+pub fn classify_anomalies(history: &History, initial: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<Anomaly> {
+    let mut anomalies = Vec::new();
+    for read in &history.operations {
+        let (OperationKind::Get { key }, Outcome::Value(value)) = (&read.kind, &read.outcome)
+        else {
+            continue;
+        };
+        let Some(read_complete) = read.complete else {
+            continue;
+        };
+
+        for deleted in &history.operations {
+            if !matches!(&deleted.kind, OperationKind::Del { key: deleted_key } if deleted_key == key)
+                || deleted.outcome != Outcome::Ok
+                || !happens_before(deleted, read)
+                || has_intervening_mutation(
+                    history,
+                    key,
+                    deleted.complete,
+                    read_complete,
+                    deleted.id,
+                )
+                || value.is_none()
+            {
+                continue;
+            }
+            anomalies.push(Anomaly {
+                class: AnomalyClass::Resurrection,
+                operation_ids: vec![deleted.id, read.id],
+                predicate: "acknowledged delete precedes nonnil read without an intervening mutation",
+            });
+        }
+
+        if let Some(observed) = value {
+            for written in &history.operations {
+                let Some(expected) = successful_write_value(written) else {
+                    continue;
+                };
+                if written.kind.key() != key
+                    || !happens_before(written, read)
+                    || expected == observed
+                    || has_intervening_mutation(
+                        history,
+                        key,
+                        written.complete,
+                        read_complete,
+                        written.id,
+                    )
+                {
+                    continue;
+                }
+                anomalies.push(Anomaly {
+                    class: AnomalyClass::StaleRead,
+                    operation_ids: vec![written.id, read.id],
+                    predicate: "acknowledged write precedes a different read value without an intervening mutation",
+                });
+            }
+
+            let known_prior_value = initial.get(key) == Some(observed)
+                || history.operations.iter().any(|operation| {
+                    successful_write_value(operation).is_some_and(|written| {
+                        operation.kind.key() == key
+                            && written == observed
+                            && happens_before(operation, read)
+                    })
+                });
+            if !known_prior_value {
+                anomalies.push(Anomaly {
+                    class: AnomalyClass::DirtyRead,
+                    operation_ids: vec![read.id],
+                    predicate: "read value is absent from initial state and all certainly preceding writes",
+                });
+            }
+        }
+    }
+    if anomalies.is_empty() {
+        anomalies.push(Anomaly {
+            class: AnomalyClass::Unclassified,
+            operation_ids: Vec::new(),
+            predicate: "no conservative anomaly predicate matched",
+        });
+    }
+    anomalies
+}
+
+fn happens_before(left: &Operation, right: &Operation) -> bool {
+    left.complete
+        .is_some_and(|complete| complete < right.invoke)
+}
+
+fn has_intervening_mutation(
+    history: &History,
+    key: &[u8],
+    after: Option<Time>,
+    read_complete: Time,
+    excluded_id: u64,
+) -> bool {
+    let Some(after) = after else {
+        return false;
+    };
+    history.operations.iter().any(|operation| {
+        operation.id != excluded_id
+            && operation.kind.key() == key
+            && is_successful_mutation(operation)
+            && operation.invoke < read_complete
+            && operation.complete.is_some_and(|complete| complete > after)
+    })
+}
+
+fn is_successful_mutation(operation: &Operation) -> bool {
+    matches!(
+        (&operation.kind, &operation.outcome),
+        (
+            OperationKind::Set { .. } | OperationKind::Del { .. },
+            Outcome::Ok
+        ) | (OperationKind::Cas { .. }, Outcome::Cas(true))
+            | (OperationKind::Incr { .. }, Outcome::Integer(_))
+    )
+}
+
+fn successful_write_value(operation: &Operation) -> Option<&[u8]> {
+    match (&operation.kind, &operation.outcome) {
+        (OperationKind::Set { value, .. }, Outcome::Ok) => Some(value),
+        (OperationKind::Cas { value, .. }, Outcome::Cas(true)) => Some(value),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -743,6 +1427,417 @@ mod tests {
             check(&history, CheckerConfig::default()),
             Verdict::Linearizable { .. }
         ));
+    }
+
+    #[test]
+    fn trap_history_v2_round_trips_binary_keys_and_values() {
+        let mut history = History::default();
+        history.push(Operation::completed(
+            1,
+            OperationKind::Set {
+                key: vec![0, 0xff],
+                value: vec![0, 9],
+            },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Ok,
+        ));
+        let document = HistoryDocument {
+            build_label: String::from("test"),
+            config_hash: 7,
+            initial: BTreeMap::new(),
+            retain_open: true,
+            history,
+        };
+        assert_eq!(HistoryDocument::decode(&document.encode()), Ok(document));
+    }
+
+    #[test]
+    fn trap_history_v2_preserves_open_operations() {
+        let document = HistoryDocument {
+            build_label: String::from("test"),
+            config_hash: 7,
+            initial: BTreeMap::new(),
+            retain_open: true,
+            history: History {
+                operations: vec![Operation::open(
+                    3,
+                    OperationKind::Get { key: vec![1] },
+                    Time::from_nanos(1),
+                )],
+            },
+        };
+        assert!(
+            HistoryDocument::decode(&document.encode())
+                .expect("decode")
+                .history
+                .operations[0]
+                .complete
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn trap_history_rejects_invalid_hex_and_duplicate_ids() {
+        assert!(matches!(
+            decode_history_v1_tsv("SET\t0g\t00\t1\t2\n"),
+            Err(HistoryCodecError::Invalid("v1 hex"))
+        ));
+        let document = HistoryDocument {
+            build_label: String::from("duplicate"),
+            config_hash: 0,
+            initial: BTreeMap::new(),
+            retain_open: true,
+            history: History {
+                operations: vec![
+                    Operation::completed(
+                        7,
+                        OperationKind::Get { key: b"k".to_vec() },
+                        Time::from_nanos(1),
+                        Time::from_nanos(2),
+                        Outcome::Value(None),
+                    ),
+                    Operation::completed(
+                        7,
+                        OperationKind::Get { key: b"k".to_vec() },
+                        Time::from_nanos(3),
+                        Time::from_nanos(4),
+                        Outcome::Value(None),
+                    ),
+                ],
+            },
+        };
+        assert_eq!(
+            HistoryDocument::decode(&document.encode()),
+            Err(HistoryCodecError::DuplicateId(7))
+        );
+    }
+
+    #[test]
+    fn trap_chunk_cannot_claim_an_empty_initial_state() {
+        let history = History {
+            operations: vec![Operation::completed(
+                1,
+                OperationKind::Get {
+                    key: b"before-window".to_vec(),
+                },
+                Time::from_nanos(1),
+                Time::from_nanos(2),
+                Outcome::Value(Some(b"present".to_vec())),
+            )],
+        };
+        assert_eq!(
+            check_window(&history, None, CheckerConfig::default()),
+            Err(HistoryCodecError::Invalid("window initial receipt"))
+        );
+        let initial = [(b"before-window".to_vec(), b"present".to_vec())]
+            .into_iter()
+            .collect();
+        assert!(matches!(
+            check_window(&history, Some(initial), CheckerConfig::default()),
+            Ok(Verdict::Linearizable { .. })
+        ));
+    }
+
+    #[test]
+    fn trap_real_history_detects_planted_lost_ack() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Set {
+                        key: b"acknowledged".to_vec(),
+                        value: b"write".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                // Harness-only fault: the write reply was observed, but the
+                // final state receipt reports that its mutation vanished.
+                Operation::completed(
+                    2,
+                    OperationKind::Get {
+                        key: b"acknowledged".to_vec(),
+                    },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(None),
+                ),
+            ],
+        };
+        assert!(matches!(
+            check(&history, CheckerConfig::default()),
+            Verdict::NotLinearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn trap_witness_is_smaller_than_the_history_and_still_fails() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Set {
+                        key: b"k".to_vec(),
+                        value: b"written".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: b"k".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(None),
+                ),
+                Operation::completed(
+                    3,
+                    OperationKind::Set {
+                        key: b"irrelevant".to_vec(),
+                        value: b"value".to_vec(),
+                    },
+                    Time::from_nanos(5),
+                    Time::from_nanos(6),
+                    Outcome::Ok,
+                ),
+            ],
+        };
+        let witness = minimize_witness(&history, CheckerConfig::default(), 50).expect("witness");
+        assert!(witness.operation_ids.len() < history.operations.len());
+        let reduced = History {
+            operations: history
+                .operations
+                .iter()
+                .filter(|operation| witness.operation_ids.contains(&operation.id))
+                .cloned()
+                .collect(),
+        };
+        assert!(matches!(
+            check(&reduced, CheckerConfig::default()),
+            Verdict::NotLinearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn trap_witness_preserves_initial_state() {
+        let document = HistoryDocument {
+            build_label: String::from("window"),
+            config_hash: 0,
+            initial: [(b"k".to_vec(), b"present".to_vec())].into_iter().collect(),
+            retain_open: true,
+            history: History {
+                operations: vec![Operation::completed(
+                    1,
+                    OperationKind::Get { key: b"k".to_vec() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Value(None),
+                )],
+            },
+        };
+        assert!(matches!(
+            check_document(&document, CheckerConfig::default()),
+            Verdict::NotLinearizable { .. }
+        ));
+        assert_eq!(
+            minimize_document_witness(&document, CheckerConfig::default(), 10)
+                .expect("initial-state witness")
+                .operation_ids,
+            vec![1]
+        );
+        assert!(
+            minimize_witness(&document.history, CheckerConfig::default(), 10).is_none(),
+            "an empty initial model would incorrectly accept this window"
+        );
+    }
+
+    #[test]
+    fn trap_witness_budget_never_returns_a_passing_subset() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Set {
+                        key: b"k".to_vec(),
+                        value: b"written".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: b"k".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(None),
+                ),
+            ],
+        };
+        let witness = minimize_witness(&history, CheckerConfig::default(), 1).expect("witness");
+        assert!(witness.budget_exhausted);
+        let reduced = History {
+            operations: history
+                .operations
+                .iter()
+                .filter(|operation| witness.operation_ids.contains(&operation.id))
+                .cloned()
+                .collect(),
+        };
+        assert!(matches!(
+            check(&reduced, CheckerConfig::default()),
+            Verdict::NotLinearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn trap_minimal_witness_is_deterministic() {
+        let history = History {
+            operations: (1..=2)
+                .map(|id| {
+                    Operation::completed(
+                        id,
+                        OperationKind::Incr {
+                            key: b"counter".to_vec(),
+                        },
+                        Time::from_nanos(1),
+                        Time::from_nanos(2),
+                        Outcome::Integer(1),
+                    )
+                })
+                .collect(),
+        };
+        let first = minimize_witness(&history, CheckerConfig::default(), 20).expect("witness");
+        let second = minimize_witness(&history, CheckerConfig::default(), 20).expect("witness");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn history_document_initial_state_is_checked() {
+        let document = HistoryDocument {
+            build_label: String::from("window"),
+            config_hash: 0,
+            initial: [(b"k".to_vec(), b"before".to_vec())].into_iter().collect(),
+            retain_open: true,
+            history: History {
+                operations: vec![Operation::completed(
+                    1,
+                    OperationKind::Get { key: b"k".to_vec() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Value(Some(b"before".to_vec())),
+                )],
+            },
+        };
+        assert!(matches!(
+            check_document(&document, CheckerConfig::default()),
+            Verdict::Linearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn trap_resurrection_checker_flags_any_value_not_only_empty_bytes() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Del { key: b"k".to_vec() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: b"k".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(Some(b"resurrected".to_vec())),
+                ),
+            ],
+        };
+        assert!(!check_no_resurrection(&history).is_ok());
+    }
+
+    #[test]
+    fn trap_anomaly_classifier_uses_only_certain_real_time_order() {
+        let resurrection = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Del { key: b"k".to_vec() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: b"k".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(Some(b"returned".to_vec())),
+                ),
+            ],
+        };
+        assert!(
+            classify_anomalies(&resurrection, &BTreeMap::new())
+                .iter()
+                .any(|anomaly| anomaly.class == AnomalyClass::Resurrection)
+        );
+
+        let concurrent_write = History {
+            operations: vec![
+                resurrection.operations[0].clone(),
+                Operation::completed(
+                    3,
+                    OperationKind::Set {
+                        key: b"k".to_vec(),
+                        value: b"new".to_vec(),
+                    },
+                    Time::from_nanos(3),
+                    Time::from_nanos(6),
+                    Outcome::Ok,
+                ),
+                resurrection.operations[1].clone(),
+            ],
+        };
+        assert!(
+            !classify_anomalies(&concurrent_write, &BTreeMap::new())
+                .iter()
+                .any(|anomaly| anomaly.class == AnomalyClass::Resurrection)
+        );
+    }
+
+    #[test]
+    fn trap_anomaly_classifier_labels_stale_read_without_intervening_write() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Set {
+                        key: b"k".to_vec(),
+                        value: b"new".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: b"k".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(Some(b"old".to_vec())),
+                ),
+            ],
+        };
+        assert!(
+            classify_anomalies(&history, &BTreeMap::new())
+                .iter()
+                .any(|anomaly| anomaly.class == AnomalyClass::StaleRead)
+        );
     }
 
     #[test]

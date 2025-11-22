@@ -12,11 +12,21 @@ the quorum. An acknowledgement already in flight when the read arrived proves
 nothing about current leadership and is ignored. Followers return an explicit
 not-leader result rather than pretending to provide a local read.
 
-Client retries carry `(ClientId, RequestSeq)`. The replicated session table
-caches the last reply, so a duplicate sequence returns the original reply and
-an older sequence is rejected. The exactly-once window ends when the replicated
-session expires after log-time inactivity; clients must use a fresh identity
-after that point.
+Explicit replicated retries carry a `(namespace, ClientId, RequestSeq)`.
+`cc-cluster::SessionTable` caches both canonical CCKV command bytes and the
+canonical CCKR reply, so a duplicate is replayed without reapplying its
+mutation; a same sequence with different bytes is rejected and cannot become a
+cached success. The exactly-once window ends after policy-defined log-time
+inactivity; clients must use a fresh identity after that point. Ordinary host
+RESP commands are still adapter-local and must not be described as
+reconnect-stable exactly-once requests.
+
+The real-host spelling is `CC.REQUEST <client-u64> <sequence-u64> <write-command>
+[args...]`. Both identity numbers must be nonzero. It accepts exactly one
+state-changing command; reads and a multi-key `DEL` are rejected rather than
+being split into several hidden requests. A reconnect may use another socket,
+but the durable identity remains the caller's values, never the host's
+connection route counter.
 
 TTL deadlines are derived from the leader timestamp in the replicated entry.
 Replica wall clocks and clock skew do not affect visibility. Scan results are
@@ -37,7 +47,7 @@ liveness, so a checker `undecided` result is never silently reported as safe.
 | One leader per term and committed-prefix safety | [`cc-raft` invariant evaluators and `message_soup_campaign_100k_schedules`](../crates/cc-raft/src/lib.rs) |
 | ReadIndex requires a fresh quorum round and current-term no-op | [`trap_readindex_noop` and stale-round tests](../crates/cc-raft/src/lib.rs) |
 | Followers reject writes instead of serving them locally | [`node_starts_as_follower_and_rejects_writes_until_leader`](../crates/cc-cluster/src/lib.rs) |
-| Duplicate requests return the cached result | [`trap_sessions_in_snapshot` and session tests](../crates/cc-kv/src/lib.rs) |
+| Duplicate explicit requests return the cached result | [`SessionTable` and cluster receipts](../crates/cc-cluster/src/lib.rs) |
 | Applied index changes atomically with state | [`trap_applied_index_atomicity`](../crates/cc-kv/src/lib.rs) |
 | Replica clocks do not change TTL visibility | [`trap_ttl_replica_clock_uses_leader_time_only`](../crates/cc-kv/src/lib.rs) |
 | Scans are checked as snapshot-legal within the call window | [`scan_is_checked_as_a_snapshot_legal_operation`](../crates/cc-checker/src/lib.rs) |

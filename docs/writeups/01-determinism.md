@@ -2,8 +2,9 @@
 
 The core does not read a wall clock, spawn a task, or pull ambient randomness.
 Hosts translate those effects into `Input` values and preserve the resulting
-`Effect` values. `cc-swarm` now composes real `cc-cluster::Node` instances in
-that boundary: the seed, materialized fault plan, workload replies, and trace
+`Effect` values. `cc-swarm` now drives real `cc-cluster::Node` instances
+through the shared host driver at that boundary: the seed, materialized fault
+plan, workload replies, and trace
 bytes are enough to replay a cluster run.
 
 The practical consequence is slightly unusual: APIs are designed around what
