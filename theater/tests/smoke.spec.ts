@@ -2,6 +2,52 @@
 // Copyright (c) 2025 Sidakpreet Singh
 import { expect, test } from "@playwright/test";
 
+const CONTROL_IDS = new Set([
+  "play", "motion-preference", "seed", "profile", "lesson", "cluster-size", "speed", "heal-all",
+  "determinism-proof", "kill-leader", "crash-selected", "partition-selected", "heal-palette",
+  "packet-loss", "clock-skew", "disk-latency", "take-controls", "selected-node", "previous-event",
+  "timeline-play", "next-event", "timeline", "timeline-marker", "checkpoint", "museum-category",
+  "museum-exhibit", "share",
+]);
+
+test("every_control_changes_observable_state", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM", { timeout: 15_000 });
+
+  // The contract is intentionally checked against the rendered DOM. A new
+  // visible control has to declare its engine/host action and observable
+  // result before it can ship.
+  const rendered = await page.locator("[data-control]").evaluateAll((elements) =>
+    elements.map((element) => element.getAttribute("data-control")),
+  );
+  for (const control of rendered) expect(CONTROL_IDS.has(control ?? "")).toBeTruthy();
+
+  await page.getByLabel("Speed").selectOption("4×");
+  await page.getByRole("button", { name: "PLAY", exact: true }).click();
+  await expect.poll(async () => page.getByTestId("virtual-time").textContent(), { timeout: 15_000 })
+    .not.toBe("0s / 60s");
+
+  const timeline = page.getByLabel("Timeline");
+  await timeline.focus();
+  await timeline.press("End");
+  await expect(timeline).toHaveAttribute("aria-valuetext", "60 virtual seconds");
+
+  await page.getByLabel("Disk latency").fill("64");
+  await expect(page.getByTestId("disk-latency-value")).toHaveText("64 ms");
+});
+
+test("timeline markers render without duplicate React keys", async ({ page }) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM", { timeout: 15_000 });
+  await page.getByTestId("determinism-proof").click();
+  await expect(page.getByTestId("determinism-proof")).toContainText("MATCH", { timeout: 30_000 });
+  expect(consoleErrors).toEqual([]);
+});
+
 test("hero scenario elects, survives a leader kill, and shares its run", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByText("CRASH COURSE")).toBeVisible();
@@ -12,7 +58,7 @@ test("hero scenario elects, survives a leader kill, and shares its run", async (
 
   // Run until a leader exists, rather than asserting a role string that any
   // node satisfies at any time.
-  await page.getByRole("button", { name: "PLAY" }).click();
+  await page.getByRole("button", { name: "PLAY", exact: true }).click();
   await expect(page.getByTestId("leader-id")).not.toHaveText("none", { timeout: 15_000 });
   const firstLeader = await page.getByTestId("leader-id").textContent();
   await expect(page.getByTestId("virtual-time")).not.toHaveText("0s / 60s");
@@ -72,11 +118,13 @@ test("cluster size, node selection, stepping, and fault readouts are live", asyn
   // The readout must equal what the slider injected, not a constant.
   await page.getByLabel("Clock skew").fill("37");
   await expect(page.getByTestId("clock-skew-value")).toHaveText("37 ms");
+  await page.getByLabel("Packet loss").fill("37");
+  await expect(page.getByTestId("packet-loss-value")).toHaveText("37%");
   await page.getByLabel("Disk latency").fill("64");
   await expect(page.getByTestId("disk-latency-value")).toHaveText("64 ms");
 
   // Stepping moves the playhead rather than only pausing.
-  await page.getByRole("button", { name: "PLAY" }).click();
+  await page.getByRole("button", { name: "PLAY", exact: true }).click();
   await expect.poll(async () => page.getByTestId("virtual-time").textContent(), { timeout: 15_000 })
     .not.toBe("0s / 60s");
   const before = await page.getByTestId("virtual-time").textContent();

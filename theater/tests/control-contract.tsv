@@ -1,0 +1,28 @@
+control	wasm input or host action	expected observable state	Playwright coverage
+play	step(handle, speed quantum)	virtual-time increases and play button toggles	cluster size, node selection, stepping, and fault readouts are live
+motion-preference	localStorage crash-course-motion	motion mode label and reduced-motion class update	reduced motion disables autoplay
+seed	init({seed})	engine restarts with the requested deterministic seed	hero scenario elects, survives a leader kill, and shares its run
+profile	init({profile})	engine restarts with the requested fault profile	every control changes observable state
+lesson	inject(lesson action)	lesson overlay and matching fault trace update	guided lesson hands control back and embed mode is chromeless
+cluster-size	init({nodes})	engine restarts at the selected node count	cluster size, node selection, stepping, and fault readouts are live
+speed	step(handle, selected quantum)	virtual time advances by the selected speed quantum	every control changes observable state
+heal-all	Heal	partition status becomes HEALTHY and a Heal fault enters the trace	hero scenario elects, survives a leader kill, and shares its run
+determinism-proof	run two identical handles	determinism proof changes to MATCH or DIVERGED	hero scenario elects, survives a leader kill, and shares its run
+kill-leader	Crash { leader }	leader id changes after a bounded virtual run	hero scenario elects, survives a leader kill, and shares its run
+crash-selected	Crash { selected node }	fault trace records Crash	every control changes observable state
+partition-selected	Partition { selected node }	partition status becomes PARTITIONED	every control changes observable state
+heal-palette	Heal	partition status becomes HEALTHY	every control changes observable state
+packet-loss	LinkDegrade { from, to, drop }	effective P16-derived percentage updates	cluster size, node selection, stepping, and fault readouts are live
+clock-skew	ClockSkew { node, offset }	clock-skew readout updates	cluster size, node selection, stepping, and fault readouts are live
+disk-latency	SlowDisk { node, read/write/fsync/rename/dirsync extra }	effective persistent service delay updates; zero clears it	cluster size, node selection, stepping, and fault readouts are live
+take-controls	setLesson(free)	lesson overlay closes	guided lesson hands control back and embed mode is chromeless
+selected-node	setSelected(node)	node inspector and targeted controls name the selected node	cluster size, node selection, stepping, and fault readouts are live
+previous-event	scrubTo(previous marker)	virtual-time moves to the previous marker	cluster size, node selection, stepping, and fault readouts are live
+timeline-play	step(handle, speed quantum)	timeline play state changes	every control changes observable state
+next-event	scrubTo(next marker)	virtual-time moves to the next marker	cluster size, node selection, stepping, and fault readouts are live
+timeline	scrubTo(selected virtual second)	aria-valuetext and virtual-time agree	every control changes observable state
+timeline-marker	scrubTo(marker)	virtual-time moves to that marker	every control changes observable state
+checkpoint	scrubTo(checkpoint)	virtual-time moves to the checkpoint	every control changes observable state
+museum-category	setMuseumFilter(category)	loaded exhibit list is filtered	every control changes observable state
+museum-exhibit	setSeed(exhibit seed)	engine restarts with exhibit seed	every control changes observable state
+share	URL hash run_spec	reloadable URL includes every injected fault	hero scenario elects, survives a leader kill, and shares its run

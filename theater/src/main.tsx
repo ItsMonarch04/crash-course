@@ -8,13 +8,13 @@ import wasmInit, { init as wasmCreate, inject as wasmInject, state as wasmStateJ
 
 type Role = "follower" | "candidate" | "leader";
 type NodeState = { id: number; role: Role; term: number; commit: number; applied: number; durable: number };
-type EventMarker = { t: number; kind: string; note: string };
+type EventMarker = { seq: number; t: number; kind: string; note: string };
 
 type TraceEvent = { seq: number; time_ns: number; node: number | null; kind: string; payload_hex: string };
 type TraceFixture = { trace_version: number; seed: string; events: TraceEvent[] };
-type WasmNode = { id: number; status: string; role: Role; term: number; commit: number; applied: number; durable_bytes: number; log_tail: number[] };
-type WasmState = { virtual_time_ns: number; history_len: number; completed_operations: number; had_leader: boolean; nodes: WasmNode[]; trace: TraceFixture };
-type FaultSpec = { action: string; node?: number; offset_ms?: number; latency_ms?: number };
+type WasmNode = { id: number; status: string; role: Role; term: number; commit: number; applied: number; durable_bytes: number; disk_service_delay_ms: number; log_tail: number[] };
+type WasmState = { virtual_time_ns: number; history_len: number; completed_operations: number; had_leader: boolean; link_drop_percent: number; nodes: WasmNode[]; trace: TraceFixture };
+type FaultSpec = { action: string; node?: number; to?: number; offset_ms?: number; latency_ms?: number; drop_percent?: number };
 type LessonName = "free" | "figure8" | "asymmetric" | "herd" | "snapshot";
 type WasmModule = {
   default: (moduleOrPath?: string) => Promise<unknown>;
@@ -23,9 +23,30 @@ type WasmModule = {
   step: (handle: SimHandle, virtualNs: bigint) => string;
   inject: (handle: SimHandle, action: string) => void;
 };
+type MotionPreference = "system" | "on" | "off";
 
 const CLUSTER_SIZES = [3, 5, 7] as const;
 const DEFAULT_CLUSTER_SIZE = 5;
+const SPEED_STEP_NS: Record<string, number> = {
+  "¼×": 125_000_000,
+  "1×": 500_000_000,
+  "4×": 2_000_000_000,
+  "16×": 8_000_000_000,
+  "64×": 32_000_000_000,
+};
+
+function storedMotionPreference(): MotionPreference {
+  try {
+    const stored = window.localStorage.getItem("crash-course-motion");
+    return stored === "on" || stored === "off" ? stored : "system";
+  } catch {
+    return "system";
+  }
+}
+
+function nextMotionPreference(value: MotionPreference): MotionPreference {
+  return value === "system" ? "on" : value === "on" ? "off" : "system";
+}
 
 function emptyNodes(size: number): NodeState[] {
   return Array.from({ length: size }, (_, index) => ({ id: index + 1, role: "follower" as Role, term: 0, commit: 0, applied: 0, durable: 0 }));
@@ -80,6 +101,7 @@ function deriveMarkers(trace: TraceFixture | null): EventMarker[] {
   return trace.events
     .filter((event) => ["RoleChange", "Commit", "Fault", "SnapshotInstall"].includes(event.kind))
     .map((event) => ({
+      seq: event.seq,
       t: event.time_ns / end,
       kind: event.kind.toLowerCase(),
       note: `${event.kind}${event.node === null ? "" : ` · n${event.node}`}`,
@@ -120,7 +142,7 @@ const LESSONS: Record<Exclude<LessonName, "free">, { title: string; chapter: str
   figure8: { title: "Figure-8 reconstruction", chapter: "Isolate one voter, let the majority advance, then heal. Watch the old prefix yield to the committed one.", action: { action: "partition", node: 1 } },
   asymmetric: { title: "Asymmetric election", chapter: "Cut one voter from the majority. Terms can advance on the minority while commits remain quorum-bound.", action: { action: "partition", node: 2 } },
   herd: { title: "Thundering herd", chapter: "Crash the current leader. Randomized deterministic timers prevent every survivor from winning at once.", action: { action: "crash", node: 1 } },
-  snapshot: { title: "Snapshot catch-up", chapter: "Degrade a follower disk while the log advances, then restore it and observe state transfer.", action: { action: "disk-degrade", node: 3, latency_ms: 80 } },
+  snapshot: { title: "Snapshot catch-up", chapter: "Slow a follower disk while the log advances, then restore it and observe state transfer.", action: { action: "slow-disk", node: 3, latency_ms: 80 } },
 };
 
 const NODE_RADIUS = 25;
@@ -223,15 +245,22 @@ function App() {
   const [lesson, setLesson] = useState<LessonName>("free");
   const [embedded, setEmbedded] = useState(embeddedFromUrl);
   const [clockSkewMs, setClockSkewMs] = useState(0);
-  const [diskLatencyMs, setDiskLatencyMs] = useState(1);
   const [museumFilter, setMuseumFilter] = useState("all");
   const [museum, setMuseum] = useState<MuseumManifest>({ schema_version: 1, build: "loading", exhibits: [] });
+  const [motionPreference, setMotionPreference] = useState<MotionPreference>(storedMotionPreference);
+  const [systemReducedMotion, setSystemReducedMotion] = useState(() => window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  const [roleAnnouncement, setRoleAnnouncement] = useState("");
+  const roleFingerprint = nodes.map((node) => `${node.id}:${node.role}`).join(",");
+  const previousRoleFingerprint = useRef<string | null>(null);
+  const reducedMotion = motionPreference === "on" || (motionPreference === "system" && systemReducedMotion);
   const markers = useMemo(() => deriveMarkers(trace), [trace]);
   const memoryCheckpoints = useMemo(() => wasmState ? Array.from({ length: 13 }, (_, index) => index / 12) : markers.filter((marker) => marker.kind === "snapshot").map((marker) => marker.t), [markers, wasmState]);
   const recentEvents = useMemo(() => trace?.events.filter((event) => event.node === selected).slice(-3).reverse() ?? [], [trace, selected]);
   const ackedWrites = trace?.events.filter((event) => event.kind === "ClientOk").length ?? 0;
   const lostWrites = trace?.events.filter((event) => event.kind === "ClientTimeout").length ?? 0;
   const selectedNode = nodes.find((node) => node.id === selected) ?? nodes[0] ?? emptyNodes(clusterSize)[0];
+  const packetLossPercent = wasmState?.link_drop_percent ?? 0;
+  const diskLatencyMs = wasmState?.nodes.find((node) => node.id === selectedNode.id)?.disk_service_delay_ms ?? 0;
   const visibleExhibits = museum.exhibits.filter((exhibit) => museumFilter === "all" || exhibit.kind === museumFilter);
 
   useEffect(() => {
@@ -239,6 +268,30 @@ function App() {
     window.addEventListener("hashchange", update);
     return () => window.removeEventListener("hashchange", update);
   }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setSystemReducedMotion(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("crash-course-motion", motionPreference);
+    } catch {
+      // Storage can be unavailable in private or embedded contexts. The live
+      // preference still applies for this page lifetime.
+    }
+  }, [motionPreference]);
+
+  useEffect(() => {
+    if (previousRoleFingerprint.current && previousRoleFingerprint.current !== roleFingerprint) {
+      const leader = nodes.find((node) => node.role === "leader");
+      setRoleAnnouncement(leader ? `Role change: node ${leader.id} is leader.` : "Role change: no leader is currently elected.");
+    }
+    previousRoleFingerprint.current = roleFingerprint;
+  }, [nodes, roleFingerprint]);
 
   useEffect(() => {
     let cancelled = false;
@@ -308,11 +361,12 @@ function App() {
 
   useEffect(() => {
     if (!playing) return;
+    const stepNs = SPEED_STEP_NS[speed] ?? SPEED_STEP_NS["1×"];
     const timer = window.setInterval(() => {
       const runtime = wasmRuntime.current;
       if (runtime) {
         try {
-          const state = JSON.parse(runtime.module.step(runtime.handle, 500_000_000n)) as WasmState;
+          const state = JSON.parse(runtime.module.step(runtime.handle, BigInt(stepNs))) as WasmState;
           setWasmState(state);
           setTrace(state.trace);
           setVirtualTime(Math.min(1, state.virtual_time_ns / 60_000_000_000));
@@ -325,10 +379,12 @@ function App() {
       }
     }, 500);
     return () => window.clearInterval(timer);
-  }, [playing]);
+  }, [playing, speed]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLSelectElement || target instanceof HTMLTextAreaElement) return;
       if (event.key.toLowerCase() === "k") killLeader();
       if (event.key === " ") {
         event.preventDefault();
@@ -440,45 +496,46 @@ function App() {
   }
 
   return (
-    <main className={`shell${embedded ? " embed" : ""}`}>
+    <main className={`shell${embedded ? " embed" : ""}${reducedMotion ? " reduce-motion" : ""}`}>
       <header className="topbar">
         <div className="brand"><span className="brand-mark">CC</span><div><strong>CRASH COURSE</strong><small>DETERMINISTIC FLIGHT RECORDER</small></div></div>
         <div className="verdict"><span className={`led ${partitioned || lostWrites > 0 ? "danger-led" : ""}`} /> {partitioned ? "OPEN" : "SAFE"} <b>{ackedWrites} acked · {lostWrites} lost</b></div>
         <span className="engine-state" data-testid="engine-state">{wasmState ? "LIVE SIM" : engineFailed ? "ENGINE UNAVAILABLE — RECORDED TRACE" : "STARTING"}</span>
         <span className="engine-state" data-testid="leader-id">{nodes.find((node) => node.role === "leader")?.id ?? "none"}</span>
-        <button className="quiet-button" onClick={() => setPlaying((value) => !value)}>{playing ? "PAUSE" : "PLAY"}</button>
+        <button className="quiet-button" data-control="play" onClick={() => setPlaying((value) => !value)}>{playing ? "PAUSE" : "PLAY"}</button>
+        <button className="quiet-button" data-control="motion-preference" aria-label="Motion preference" onClick={() => setMotionPreference(nextMotionPreference(motionPreference))}>MOTION {motionPreference.toUpperCase()}</button>
       </header>
       <section className="control-strip">
-        <label>SEED<input value={seed} onChange={(event) => setSeed(event.target.value)} aria-label="Seed" /></label>
-        <label>PROFILE<select value={profile} onChange={(event) => setProfile(event.target.value)}><option>calm</option><option>gentle</option><option>rough</option><option>brutal</option><option>membership</option></select></label>
-        <label>LESSON<select aria-label="Lesson" value={lesson} onChange={(event) => chooseLesson(event.target.value as LessonName)}><option value="free">free explore</option><option value="figure8">figure-8</option><option value="asymmetric">asymmetric</option><option value="herd">thundering herd</option><option value="snapshot">snapshot catch-up</option></select></label>
-        <label>CLUSTER<select aria-label="Cluster size" value={String(clusterSize)} onChange={(event) => setClusterSize(Number(event.target.value))}>{CLUSTER_SIZES.map((size) => <option key={size} value={size}>{size} nodes</option>)}</select></label>
-        <label>SPEED<select value={speed} onChange={(event) => setSpeed(event.target.value)}><option>¼×</option><option>1×</option><option>4×</option><option>16×</option><option>64×</option></select></label>
+        <label>SEED<input data-control="seed" value={seed} onChange={(event) => setSeed(event.target.value)} aria-label="Seed" /></label>
+        <label>PROFILE<select data-control="profile" aria-label="Profile" value={profile} onChange={(event) => setProfile(event.target.value)}><option>calm</option><option>gentle</option><option>rough</option><option>brutal</option><option>membership</option></select></label>
+        <label>LESSON<select data-control="lesson" aria-label="Lesson" value={lesson} onChange={(event) => chooseLesson(event.target.value as LessonName)}><option value="free">free explore</option><option value="figure8">figure-8</option><option value="asymmetric">asymmetric</option><option value="herd">thundering herd</option><option value="snapshot">snapshot catch-up</option></select></label>
+        <label>CLUSTER<select data-control="cluster-size" aria-label="Cluster size" value={String(clusterSize)} onChange={(event) => setClusterSize(Number(event.target.value))}>{CLUSTER_SIZES.map((size) => <option key={size} value={size}>{size} nodes</option>)}</select></label>
+        <label>SPEED<select data-control="speed" aria-label="Speed" value={speed} onChange={(event) => setSpeed(event.target.value)}><option>¼×</option><option>1×</option><option>4×</option><option>16×</option><option>64×</option></select></label>
         <span className="spacer" />
-        <button className="outline-button" onClick={() => { setPartitioned(false); inject({ action: "heal" }); }}>HEAL ALL</button>
-        <button className="outline-button" onClick={() => void proveDeterminism()} data-testid="determinism-proof">
+        <button className="outline-button" data-control="heal-all" onClick={() => { setPartitioned(false); inject({ action: "heal" }); }}>HEAL ALL</button>
+        <button className="outline-button" data-control="determinism-proof" onClick={() => void proveDeterminism()} data-testid="determinism-proof">
           {determinism === "idle" ? "RUN TWICE" : determinism === "running" ? "CHECKING…" : determinism === "match" ? `MATCH ${traceHash}` : "DIVERGED"}
         </button>
-        <button className="accent-button" onClick={killLeader}>KILL LEADER <span>k</span></button>
+        <button className="accent-button" data-control="kill-leader" onClick={killLeader}>KILL LEADER <span>k</span></button>
       </section>
       <section className="workspace">
         <aside className="chaos-panel panel">
           <div className="panel-kicker">CHAOS PALETTE</div>
-          <button onClick={killLeader}><span className="icon danger">✕</span><span><b>Crash node</b><small>choose a voter</small></span></button>
-          <button onClick={() => { setPartitioned(true); inject({ action: "partition", node: selectedNode.id }); }}><span className="icon warning">╱</span><span><b>Partition</b><small>drag nodes apart</small></span></button>
-          <button onClick={() => { setPartitioned(false); inject({ action: "heal" }); }}><span className="icon calm">⌁</span><span><b>Heal all</b><small>restore every link</small></span></button>
+          <button data-control="crash-selected" onClick={killLeader}><span className="icon danger">✕</span><span><b>Crash node</b><small>choose a voter</small></span></button>
+          <button data-control="partition-selected" onClick={() => { setPartitioned(true); inject({ action: "partition", node: selectedNode.id }); }}><span className="icon warning">╱</span><span><b>Partition</b><small>drag nodes apart</small></span></button>
+          <button data-control="heal-palette" onClick={() => { setPartitioned(false); inject({ action: "heal" }); }}><span className="icon calm">⌁</span><span><b>Heal all</b><small>restore every link</small></span></button>
           <div className="palette-divider" />
-          <div className="slider-label"><span>PACKET LOSS</span><b>{partitioned ? "18%" : "0%"}</b></div><input type="range" min="0" max="100" value={partitioned ? 18 : 0} readOnly />
-          <div className="slider-label"><span>CLOCK SKEW · n{selectedNode.id}</span><b data-testid="clock-skew-value">{clockSkewMs} ms</b></div><input type="range" min="0" max="100" aria-label="Clock skew" value={clockSkewMs} onChange={(event) => { const offset = Number(event.target.value); setClockSkewMs(offset); inject({ action: "clock-skew", node: selectedNode.id, offset_ms: offset }); }} />
-          <div className="slider-label"><span>DISK LATENCY · n{selectedNode.id}</span><b data-testid="disk-latency-value">{diskLatencyMs} ms</b></div><input type="range" min="0" max="100" aria-label="Disk latency" value={diskLatencyMs} onChange={(event) => { const latency = Number(event.target.value); setDiskLatencyMs(latency); inject({ action: "disk-degrade", node: selectedNode.id, latency_ms: latency }); }} />
+          <div className="slider-label"><span>PACKET LOSS · n{selectedNode.id} → n{selectedNode.id === clusterSize ? 1 : selectedNode.id + 1}</span><b data-testid="packet-loss-value">{packetLossPercent}%</b></div><input data-control="packet-loss" type="range" min="0" max="100" aria-label="Packet loss" value={packetLossPercent} onChange={(event) => { const dropPercent = Number(event.target.value); const to = selectedNode.id === clusterSize ? 1 : selectedNode.id + 1; inject({ action: "link-degrade", node: selectedNode.id, to, drop_percent: dropPercent }); }} />
+          <div className="slider-label"><span>CLOCK SKEW · n{selectedNode.id}</span><b data-testid="clock-skew-value">{clockSkewMs} ms</b></div><input data-control="clock-skew" type="range" min="0" max="100" aria-label="Clock skew" value={clockSkewMs} onChange={(event) => { const offset = Number(event.target.value); setClockSkewMs(offset); inject({ action: "clock-skew", node: selectedNode.id, offset_ms: offset }); }} />
+          <div className="slider-label"><span>DISK LATENCY · n{selectedNode.id}</span><b data-testid="disk-latency-value">{diskLatencyMs} ms</b></div><input data-control="disk-latency" type="range" min="0" max="5000" aria-label="Disk latency" value={diskLatencyMs} onChange={(event) => inject({ action: "slow-disk", node: selectedNode.id, latency_ms: Number(event.target.value) })} />
           <div className="panel-footnote">Every control appends data to the run spec. Share it, replay it, shrink it.</div>
         </aside>
-        <section className="topology-panel panel"><div className="panel-heading"><span><span className="panel-kicker">TOPOLOGY / LIVE</span><small>virtual {Math.round(virtualTime * 60).toString().padStart(2, "0")}s · {speed}</small></span><span className="status-chip">{partitioned ? "PARTITIONED" : "HEALTHY"}</span></div>{lesson !== "free" && <div className="lesson-overlay"><b>{LESSONS[lesson].title}</b><span>{LESSONS[lesson].chapter}</span><button onClick={() => setLesson("free")}>TAKE THE CONTROLS</button></div>}<canvas ref={canvas} onClick={(event) => { const hit = canvas.current && nodeAtPoint(canvas.current, nodes, event.clientX, event.clientY); if (hit) setSelected(hit); }} aria-label="Cluster topology" /></section>
-        <aside className="inspector panel"><div className="panel-kicker">NODE INSPECTOR</div><div className="node-title"><span className={`role-dot ${selectedNode.role}`} /> n{selectedNode.id}<span className="subtle" data-testid="selected-role">{selectedNode.role}</span></div><div className="metric-grid"><Metric label="TERM" value={`t${selectedNode.term}`} /><Metric label="COMMIT" value={`i${selectedNode.commit}`} /><Metric label="APPLIED" value={`i${selectedNode.applied}`} /><Metric label="DURABLE" value={`${selectedNode.durable} rec`} /></div><div className="inspector-section"><div className="section-title">LOG TAIL <span>captured</span></div><div className="log-tail">{Array.from({ length: Math.max(8, selectedNode.durable) }, (_, index) => <i key={index} className={index < selectedNode.applied ? "committed" : "pending"} style={{ opacity: 0.35 + (index % 5) / 8 }} />)}</div></div><div className="inspector-section"><div className="section-title">EVENT STREAM <span>n{selectedNode.id}</span></div>{recentEvents.length === 0 ? <p className="event-line"><b>—</b> no events captured</p> : recentEvents.map((event) => <p className="event-line" key={event.seq}><b>{(event.time_ns / 1e9).toFixed(3)}</b> {event.kind} <em>seq={event.seq}</em></p>)}</div></aside>
+        <section className="topology-panel panel"><div className="panel-heading"><span><span className="panel-kicker">TOPOLOGY / LIVE</span><small>virtual {Math.round(virtualTime * 60).toString().padStart(2, "0")}s · {speed}</small></span><span className="status-chip">{partitioned ? "PARTITIONED" : "HEALTHY"}</span></div>{lesson !== "free" && <div className="lesson-overlay"><b>{LESSONS[lesson].title}</b><span>{LESSONS[lesson].chapter}</span><button data-control="take-controls" onClick={() => setLesson("free")}>TAKE THE CONTROLS</button></div>}<canvas ref={canvas} onClick={(event) => { const hit = canvas.current && nodeAtPoint(canvas.current, nodes, event.clientX, event.clientY); if (hit) setSelected(hit); }} aria-label="Cluster topology" aria-describedby="topology-description topology-mirror" /><p id="topology-description" className="visually-hidden">Live canvas topology. Use the selected node control for keyboard node selection; the live node table contains the same state.</p><div id="topology-mirror" className="topology-mirror"><table><caption>Live node state</caption><thead><tr><th>Node</th><th>Role</th><th>Term</th><th>Commit</th><th>Applied</th><th>Durable</th></tr></thead><tbody>{nodes.map((node) => <tr key={node.id}><th scope="row">n{node.id}</th><td>{node.role}</td><td>{node.term}</td><td>{node.commit}</td><td>{node.applied}</td><td>{node.durable}</td></tr>)}</tbody></table></div><p className="visually-hidden" role="status" aria-live="polite">{roleAnnouncement}</p></section>
+        <aside className="inspector panel"><div className="panel-kicker">NODE INSPECTOR</div><label className="node-select">SELECTED NODE<select data-control="selected-node" aria-label="Selected node" value={selectedNode.id} onChange={(event) => setSelected(Number(event.target.value))}>{nodes.map((node) => <option key={node.id} value={node.id}>node {node.id}</option>)}</select></label><div className="node-title"><span className={`role-dot ${selectedNode.role}`} /> n{selectedNode.id}<span className="subtle" data-testid="selected-role">{selectedNode.role}</span></div><div className="metric-grid"><Metric label="TERM" value={`t${selectedNode.term}`} /><Metric label="COMMIT" value={`i${selectedNode.commit}`} /><Metric label="APPLIED" value={`i${selectedNode.applied}`} /><Metric label="DURABLE" value={`${selectedNode.durable} rec`} /></div><div className="inspector-section"><div className="section-title">LOG TAIL <span>captured</span></div><div className="log-tail">{Array.from({ length: Math.max(8, selectedNode.durable) }, (_, index) => <i key={index} className={index < selectedNode.applied ? "committed" : "pending"} style={{ opacity: 0.35 + (index % 5) / 8 }} />)}</div></div><div className="inspector-section"><div className="section-title">EVENT STREAM <span>n{selectedNode.id}</span></div>{recentEvents.length === 0 ? <p className="event-line"><b>—</b> no events captured</p> : recentEvents.map((event) => <p className="event-line" key={event.seq}><b>{(event.time_ns / 1e9).toFixed(3)}</b> {event.kind} <em>seq={event.seq}</em></p>)}</div></aside>
       </section>
-      <section className="timeline panel"><div className="timeline-head"><span className="panel-kicker">TIMELINE / RE-EXECUTION</span><span className="timeline-actions"><button aria-label="Previous event" title="Previous event" onClick={() => stepToMarker(-1)}>◀</button><button onClick={() => setPlaying((value) => !value)}>{playing ? "Ⅱ" : "▶"}</button><button aria-label="Next event" title="Next event" onClick={() => stepToMarker(1)}>▶</button><span data-testid="virtual-time">{Math.round(virtualTime * 60)}s / 60s</span></span></div><div className="timeline-track">{markers.map((marker) => <button key={`${marker.t}-${marker.kind}`} className={`marker ${marker.kind}`} style={{ left: `${marker.t * 100}%` }} title={marker.note} onClick={() => scrubTo(marker.t)} />)}<div className="playhead" style={{ left: `${(playing ? virtualTime : checkpoint) * 100}%` }} /></div><div className="timeline-labels"><span>00:00</span><span>captured events</span><span>60:00</span></div><div className="checkpoint-row">MEMORY CHECKPOINTS {memoryCheckpoints.length === 0 ? <span className="subtle">none captured</span> : memoryCheckpoints.map((value) => <button key={value} onClick={() => scrubTo(value)} className={checkpoint === value ? "selected-checkpoint" : ""}>{Math.round(value * 60)}s</button>)}</div></section>
-      <section className="museum panel"><div className="timeline-head"><span><span className="panel-kicker">MUSEUM / VERIFIED EXHIBITS</span><small>manifest build {museum.build}</small></span><span className="museum-tools"><select aria-label="Museum category" value={museumFilter} onChange={(event) => setMuseumFilter(event.target.value)}><option value="all">all</option><option value="raft">raft</option><option value="wal">wal</option><option value="store">store</option><option value="membership">membership</option><option value="checker">checker</option></select><span className="status-chip">{visibleExhibits.length} LOADED</span></span></div>{museum.exhibits.length === 0 ? <p className="museum-empty">No verified failure exhibits are published yet. The wing stays empty until a real shrunk trace earns a pinned build.</p> : visibleExhibits.length === 0 ? <p className="museum-empty">No exhibits match this category.</p> : <div className="exhibit-grid">{visibleExhibits.map((exhibit) => <button key={exhibit.id} className="exhibit-card" onClick={() => setSeed(exhibit.seed)}><b>{exhibit.title}</b><small>{exhibit.kind} · {exhibit.verdict} · {exhibit.chapters.length} chapters</small></button>)}</div>}</section>
-      <footer><span>THEATER ABI 1 · TRACE v1 · BUILD fixture</span><span>Reduced motion: <span className="footer-note">honoured from system preference</span> · <button className="link-button" onClick={shareScenario}>{shared ? "URL copied ✓" : "Share this scenario ↗"}</button></span></footer>
+        <section className="timeline panel"><div className="timeline-head"><span className="panel-kicker">TIMELINE / RE-EXECUTION</span><span className="timeline-actions"><button data-control="previous-event" aria-label="Previous event" title="Previous event" onClick={() => stepToMarker(-1)}>◀</button><button data-control="timeline-play" aria-label={playing ? "Pause timeline" : "Play timeline"} onClick={() => setPlaying((value) => !value)}>{playing ? "Ⅱ" : "▶"}</button><button data-control="next-event" aria-label="Next event" title="Next event" onClick={() => stepToMarker(1)}>▶</button><span data-testid="virtual-time">{Math.round(virtualTime * 60)}s / 60s</span></span></div><div className="timeline-track"><input data-control="timeline" className="timeline-range" type="range" min="0" max="60" step="1" aria-label="Timeline" aria-valuetext={`${Math.round((playing ? virtualTime : checkpoint) * 60)} virtual seconds`} value={Math.round((playing ? virtualTime : checkpoint) * 60)} onChange={(event) => scrubTo(Number(event.target.value) / 60)} />{markers.map((marker) => <button data-control="timeline-marker" key={marker.seq} className={`marker ${marker.kind}`} style={{ left: `${marker.t * 100}%` }} aria-label={marker.note} title={marker.note} onClick={() => scrubTo(marker.t)} />)}<div className="playhead" style={{ left: `${(playing ? virtualTime : checkpoint) * 100}%` }} /></div><div className="timeline-labels"><span>00:00</span><span>captured events</span><span>60:00</span></div><div className="checkpoint-row">MEMORY CHECKPOINTS {memoryCheckpoints.length === 0 ? <span className="subtle">none captured</span> : memoryCheckpoints.map((value) => <button data-control="checkpoint" key={value} onClick={() => scrubTo(value)} className={checkpoint === value ? "selected-checkpoint" : ""}>{Math.round(value * 60)}s</button>)}</div></section>
+      <section className="museum panel"><div className="timeline-head"><span><span className="panel-kicker">MUSEUM / VERIFIED EXHIBITS</span><small>manifest build {museum.build}</small></span><span className="museum-tools"><select data-control="museum-category" aria-label="Museum category" value={museumFilter} onChange={(event) => setMuseumFilter(event.target.value)}><option value="all">all</option><option value="raft">raft</option><option value="wal">wal</option><option value="store">store</option><option value="membership">membership</option><option value="checker">checker</option></select><span className="status-chip">{visibleExhibits.length} LOADED</span></span></div>{museum.exhibits.length === 0 ? <p className="museum-empty">No verified failure exhibits are published yet. The wing stays empty until a real shrunk trace earns a pinned build.</p> : visibleExhibits.length === 0 ? <p className="museum-empty">No exhibits match this category.</p> : <div className="exhibit-grid">{visibleExhibits.map((exhibit) => <button data-control="museum-exhibit" key={exhibit.id} className="exhibit-card" onClick={() => setSeed(exhibit.seed)}><b>{exhibit.title}</b><small>{exhibit.kind} · {exhibit.verdict} · {exhibit.chapters.length} chapters</small></button>)}</div>}</section>
+      <footer><span>THEATER ABI 1 · TRACE v1 · BUILD fixture</span><span>Keyboard: <kbd>Tab</kbd> controls · <kbd>Space</kbd> play/pause · <kbd>K</kbd> kill leader · motion {motionPreference} · <button data-control="share" className="link-button" onClick={shareScenario}>{shared ? "URL copied ✓" : "Share this scenario ↗"}</button></span></footer>
     </main>
   );
 }
