@@ -14,12 +14,16 @@ peer ports stay on the Compose network, and peers are addressed by Compose
 service name — `ccdb` resolves `host:port` at connect time, so a container that
 comes back on a new address is still reachable.
 
+The Compose file supplies one explicit non-secret `CCDB_CLUSTER_ID` for all
+three nodes. The entrypoint creates a checksummed `identity.ccid` only for an
+empty volume and then refuses any cluster-id/config mismatch. Its all-network
+listeners require the visible unsafe-listener opt-in in the Compose command;
+the lab protocols remain unauthenticated.
+
 This is a local teaching topology: it does not add TLS, authentication,
-orchestration, or production hardening, and `ccdb` replicates over a static
-primary/backup path rather than running the consensus core — see
-[limitations](../docs/LIMITATIONS.md). Stopping the lowest-numbered node hands
-the client path to the next one, which is failover by configuration, not an
-election.
+orchestration, or production hardening. `ccdb` runs the shared Raft driver;
+leader election and client redirects are real process behavior, but the lab is
+still not a production deployment — see [limitations](../docs/LIMITATIONS.md).
 
 `ccdb@.service` is a systemd template for hosts where the binary and initialized
 data directories are provisioned separately. Review its paths and user before
