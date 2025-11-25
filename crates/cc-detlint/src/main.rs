@@ -24,6 +24,11 @@ const FORBIDDEN: [(&str, &str); 12] = [
     ("f64", "floating-point behavior"),
 ];
 
+const IMPORTED_CLOCKS: [(&str, &str); 2] = [
+    ("SystemTime::now()", "imported wall clock"),
+    ("Instant::now()", "imported host monotonic clock"),
+];
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -54,9 +59,26 @@ fn check(args: &[String]) -> io::Result<()> {
     let mut violations = Vec::new();
     for path in &files {
         let text = fs::read_to_string(path)?;
+        let imports_system_time = text.contains("use std::time::SystemTime")
+            || text.contains("use std::time::{SystemTime")
+            || text.contains(", SystemTime");
+        let imports_instant = text.contains("use std::time::Instant")
+            || text.contains("use std::time::{Instant")
+            || text.contains(", Instant");
         for (line_index, line) in text.lines().enumerate() {
             for (needle, reason) in FORBIDDEN {
                 if line.contains(needle) {
+                    violations.push(format!(
+                        "{}:{}: {needle} ({reason})",
+                        path.display(),
+                        line_index + 1,
+                    ));
+                }
+            }
+            for (needle, reason) in IMPORTED_CLOCKS {
+                let imported = (needle.starts_with("SystemTime") && imports_system_time)
+                    || (needle.starts_with("Instant") && imports_instant);
+                if imported && line.contains(needle) {
                     violations.push(format!(
                         "{}:{}: {needle} ({reason})",
                         path.display(),
@@ -155,6 +177,20 @@ mod tests {
         let mut files = Vec::new();
         collect_rust_files(&directory, &mut files).expect("collect");
         assert_eq!(files, vec![file]);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn trap_imported_clock_is_detected() {
+        let directory = env::temp_dir().join(format!("cc-detlint-clock-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("test directory");
+        let file = directory.join("lib.rs");
+        fs::write(
+            &file,
+            "use std::time::{SystemTime};\nfn now() { let _ = SystemTime::now(); }\n",
+        )
+        .expect("test input");
+        assert!(check(&[directory.display().to_string()]).is_err());
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 }

@@ -1,0 +1,158 @@
+id	status	requirement	test
+N0.2.1	implemented	Imported ambient clocks are rejected in deterministic crates	trap_imported_clock_is_detected
+N0.3.1	implemented	Unknown vote responses never form quorum	trap_unknown_vote_response_cannot_form_quorum
+N0.3.2	implemented	Learner responses never commit an entry	trap_learner_append_response_cannot_commit
+N0.3.3	implemented	Joint elections require both majorities	trap_joint_election_requires_both_majorities
+N0.3.4	implemented	Configuration takes effect on follower append	trap_config_on_append_changes_joint_quorum_before_commit
+N0.3.5	implemented	Membership recovers from log and snapshot	trap_membership_recovers_from_log_and_snapshot
+N0.3.6	implemented	Learners receive entries but never vote	trap_learners_receive_entries_but_never_vote
+N0.3.7	implemented	An isolated leader steps down after CheckQuorum	trap_checkquorum_steps_down_isolated_leader
+N0.3.8	implemented	Only one configuration change is in flight	trap_leave_joint_waits_for_committed_enter_joint
+N0.3.9	implemented	Leadership transfer waits for durable intent and a caught-up target	trap_leadership_transfer_waits_for_committed_intent_and_caught_up_target
+N0.3.10	implemented	TimeoutNow follows normal durable election flow	trap_timeout_now_uses_normal_term_and_vote_fsync
+N0.3.11	implemented	Transfer workflow survives crash and recovery	trap_leadership_transfer_recovers_or_finishes_after_crash
+N0.3.12	implemented	Wrong transfer target or stale intent cannot finish	trap_wrong_target_or_stale_transfer_cannot_complete
+N0.3.13	implemented	Rejected config does not mutate membership	trap_rejected_config_proposal_does_not_mutate_membership
+N0.3.14	implemented	Truncating config restores prior membership	trap_truncated_uncommitted_config_restores_prior_membership
+N0.3.15	implemented	Cluster policy has a canonical v1 encoding	golden_cluster_policy_v1
+N0.3.16	implemented	Cluster policy codec is bounded and canonical	trap_cluster_policy_codec_is_bounded_and_canonical
+N0.3.17	implemented	A policy hash cannot substitute for exact policy bytes	trap_forged_matching_policy_hash_cannot_bypass_exact_bytes
+N0.3.18	implemented	Configuration and admin replies encode canonically	golden_cccf_v1_and_ccar_v1
+N0.3.19	implemented	Absent admin identity is canonical	trap_config_envelope_admin_absence_is_canonical
+N0.3.20	implemented	Peer addresses reject noncanonical forms	trap_membership_address_codec_is_canonical
+N0.3.21	implemented	Unknown config tags fail closed	trap_unknown_config_tag_fails_closed
+N0.4.1	implemented	Every committed entry advances both apply cursors	trap_every_committed_entry_advances_both_applied_indices
+N0.4.2	implemented	Duplicate commands advance the log cursor without reapply	trap_duplicate_advances_index_without_reapplying
+N0.4.3	implemented	Deterministic command errors are cached and applied	trap_command_error_is_cached_and_applied
+N0.4.4	implemented	A successful CAS writes exactly once	trap_cas_writes_once
+N0.4.5	implemented	Committed apply never returns Busy	trap_committed_apply_never_returns_busy
+N0.4.6	implemented	Malformed committed proposals fail closed	trap_malformed_committed_proposal_fails_closed
+N0.4.7	implemented	Expired session retries cannot mutate	trap_expired_session_retry_does_not_apply
+N0.4.8	implemented	Same sequence and different bytes never mutate	trap_same_sequence_different_command_never_mutates
+N0.4.9	implemented	User and admin session namespaces are distinct	trap_user_and_admin_session_namespaces_cannot_alias
+N0.4.10	implemented	User and admin entries share one atomic session table	trap_user_and_admin_entries_share_one_atomic_session_table
+N0.4.11	implemented	Leader logical time survives snapshot restore	trap_last_leader_time_survives_snapshot_and_restore
+N0.4.12	implemented	Conditional SET is one replicated apply	trap_conditional_set_is_one_replicated_apply
+N0.4.13	implemented	Failed conditional SET preserves value and TTL	trap_failed_conditional_set_preserves_value_and_ttl
+N0.4.14	implemented	Expired keys count as absent for conditional SET	trap_conditional_set_treats_expired_key_as_absent
+N0.5.1	implemented	Snapshot base is the log origin	trap_snapshot_base_is_the_log_origin
+N0.5.2	implemented	Append matches the snapshot base	trap_append_matches_snapshot_base
+N0.5.3	implemented	Same index with a different snapshot term is rejected	trap_same_index_different_term_snapshot_is_rejected
+N0.5.4	implemented	Equal snapshot pins are reference counted	trap_equal_watermark_snapshot_pins_are_reference_counted
+N0.6.1	implemented	History v2 preserves binary keys and values	trap_history_v2_round_trips_binary_keys_and_values
+N0.6.2	implemented	History v2 preserves open operations	trap_history_v2_preserves_open_operations
+N0.6.3	implemented	History rejects malformed hex and duplicate operation ids	trap_history_rejects_invalid_hex_and_duplicate_ids
+N0.6.4	implemented	A chunk cannot claim an empty initial state	trap_chunk_cannot_claim_an_empty_initial_state
+N0.6.5	implemented	Planted lost acknowledgements are rejected	trap_real_history_detects_planted_lost_ack
+N0.6.6	implemented	Resurrection reports every nonnil post-delete value	trap_resurrection_checker_flags_any_value_not_only_empty_bytes
+N1.1.1	implemented	Recovery does not claim an unproven applied watermark	trap_restore_refuses_unproven_applied_watermark
+N1.2.1	implemented	Application envelopes are canonical	proposal_envelope_round_trips_through_public_builder
+N1.2.2	implemented	KV replies are canonical	golden_cckr_v1_round_trips_and_rejects_corruption
+N1.2.3	implemented	CCKR scan count is bounded by remaining bytes	trap_cckr_scan_count_is_bounded_by_remaining_bytes
+N1.2.4	implemented	CCAP absent session fields are canonical	trap_ccap_session_absence_is_canonical
+N1.2.5	implemented	Volatile route ids never enter Raft payload	trap_plain_route_ids_never_enter_raft_payload
+N1.2.6	implemented	Follower apply emits no client-route reply	trap_follower_apply_emits_no_client_route_reply
+N1.2.7	implemented	Leadership loss and truncation drop client routes	trap_route_is_dropped_on_leadership_loss_or_truncation
+N1.3.1	implemented	Vote replies wait for successful hard-state persistence	trap_vote_reply_waits_for_successful_hard_state_fsync
+N1.3.2	implemented	Append replies wait for successful log persistence	trap_append_reply_waits_for_successful_log_fsync
+N1.3.3	implemented	Failed fsync suppresses pending continuation	trap_failed_fsync_suppresses_continuation
+N1.3.4	implemented	Unknown or duplicate persistence completions fail closed	trap_unknown_or_duplicate_io_completion_fails_closed
+N1.3.5	implemented	A pending synchronous I/O continuation blocks new input	trap_node_processes_no_input_while_sync_io_is_blocked
+N1.3.6	implemented	Effect order survives multiple durability barriers	trap_effect_order_survives_two_barriers
+N1.4.1	implemented	Durable-log recovery is idempotent	trap_log_recovery_is_idempotent
+N1.4.2	implemented	Torn final log tail recovers to a prefix	trap_log_torn_tail_is_prefix_safe
+N1.4.3	implemented	Mid-segment log corruption fails closed	trap_log_midsegment_corruption_fails_closed
+N1.4.4	implemented	Hard-state term regression is corruption	trap_lower_hard_term_is_corruption
+N1.4.5	implemented	Vote change in one term is corruption	trap_vote_change_in_one_term_is_corruption
+N1.4.6	implemented	Snapshot marks require a verified durable snapshot	trap_snapshot_mark_requires_durable_snapshot
+N1.4.7	implemented	Genesis recovery requires exact CCID and policy	trap_genesis_policy_must_match_ccid_and_recovery_config
+N1.4.8	implemented	Log recovery canonicalizes filesystem segment enumeration	trap_log_recovery_sorts_enumerated_segments_by_sequence
+N1.5.1	implemented	Shared driver correlates write and fsync before continuation	trap_driver_correlates_write_and_fsync_before_continuation
+N1.5.2	implemented	Shared driver rejects unknown I/O completions	trap_driver_rejects_unknown_or_failed_io_completion
+N1.5.3	implemented	Shared driver ignores stale timer generations	trap_driver_ignores_stale_timer_generation
+N1.5.4	implemented	Shared driver releases a delayed outcome exactly once	trap_driver_release_is_exactly_once
+N1.5.5	implemented	Critical host write failure carries I/O and file identity	trap_driver_failed_critical_write_is_a_durability_error
+N1.6.1	implemented	Strict config rejects missing defaults and duplicate identity	trap_strict_config_rejects_defaults_and_duplicate_identity
+N1.6.2	implemented	Cluster IDs have one nonzero lowercase hexadecimal representation	trap_cluster_id_has_one_nonzero_canonical_text_form
+N1.6.3	implemented	CCID rejects mismatched node and cluster identity	trap_ccid_rejects_mismatched_node_or_cluster_identity
+N1.6.4	implemented	CCID rejects corruption and removed-directory reuse	trap_ccid_is_exact_checksum_fenced_and_removed_is_terminal
+N1.6.5	implemented	CCID refuses a symlinked data directory before opening state	trap_ccid_refuses_a_symlinked_data_directory_before_opening_state
+N1.6.6	implemented	Pre-N1 command journals are refused without mutation	trap_pre_upgrade_data_dir_is_refused_before_writes
+N1.6.7	implemented	CC.REQUEST only admits one state-changing command	trap_cc_request_rejects_reads_and_multikey_commands
+N1.6.8	implemented	CCHL advertises the CCRP semantic version used by the adapter	trap_hello_advertises_the_same_semantic_version_as_ccrp
+N1.7.1	implemented	Input journal pairs each input with its effect batch	trap_journal_record_pairs_input_and_effects
+N1.7.2	implemented	Input journal discards only a torn final record	trap_input_journal_is_prefix_durable
+N1.7.3	implemented	Input journal rejects complete-record CRC corruption	trap_input_journal_rejects_complete_crc_corruption
+N1.7.4	implemented	A capped journal is marked as a replayable prefix	trap_capped_journal_never_claims_complete
+N1.7.5	implemented	Recorder creates private files and rejects symlink paths	trap_record_path_permissions_and_symlinks_are_rejected
+N1.7.6	implemented	Replay consumes recorded block reads and their service time	trap_replay_consumes_recorded_block_reads_and_service_time
+N1.7.7	implemented	Replay rejects a changed recorded block-read order	trap_replay_rejects_block_read_request_order_divergence
+N1.7.8	implemented	Required recording refuses an unrecorded invocation	trap_record_required_refuses_unrecorded_mode
+N1.7.9	implemented	Replay starts only from the captured boot image	trap_replay_starts_from_captured_boot_image
+N1.7.10	implemented	Terminal recording footers are synced and carry their status	trap_terminal_recording_footer_is_synced_and_labeled
+N1.7.11	implemented	Failed block reads retain service time through recording and replay	trap_failed_block_read_keeps_recorded_service_time
+N1.7.12	implemented	A bounded real-host run emits a synced complete CCIJ footer	trap_bounded_run_can_finish_a_complete_recording
+N1.7.13	implemented	A real-host CCIJ receipt replays with identical effects	trap_real_host_effects_match_replay
+N1.7.14	implemented	CCIJ writer rejects a timestamp regression before it reaches disk	trap_record_writer_rejects_nonmonotonic_transition_time
+N1.8.1	implemented	Cluster scheduler enforces its configured per-instant event cap	trap_single_scheduler_enforces_per_instant_limit
+N1.8.2	implemented	Simulator recovery uses the framed cc-log durable prefix	trap_simulator_recovers_framed_cc_log_prefix
+N1.8.3	implemented	Shared simulator event queue preserves virtual-time FIFO ordering	equal_time_events_use_insertion_order
+N1.8.4	implemented	Wiped simulator node catches up without an out-of-band state copy	trap_wipe_has_no_out_of_band_state_copy
+N1.8.5	implemented	Wasm theater wraps the same Driver-backed simulator	trap_wasm_wraps_the_same_driver_backed_simcluster
+N1.8.6	implemented	Crash discards volatile simulator state	trap_crash_discards_volatile_state
+N1.8.7	implemented	Restart recovers hard state, log, and membership from durable bytes	trap_restart_recovers_hard_state_log_and_membership_from_disk
+N1.8.8	implemented	Simulator nodes use one Driver boundary and the cc-log durable vocabulary	trap_architecture_has_one_host_boundary_and_one_raft_log
+N2.1.1	implemented	CCHL v1 round trips canonically	golden_cchl_vectors
+N2.1.2	implemented	CCRP v1 round trips canonically	golden_ccrp_vectors
+N2.1.3	implemented	Peer hello requires a version overlap	trap_peer_hello_requires_version_overlap
+N2.1.4	implemented	Fragmented or coalesced hello preserves first frame	trap_fragmented_or_coalesced_hello_preserves_first_frame
+N2.1.5	implemented	Peer hello rejects policy mismatches	trap_peer_hello_rejects_cluster_policy_mismatch
+N2.1.6	implemented	Peer hello rejects unavailable required features	trap_peer_hello_rejects_missing_required_feature
+N2.1.7	implemented	CCRP preserves ReadIndex round	trap_ccrp_preserves_read_round
+N2.1.8	implemented	CCRP count is bounded by remaining bytes	trap_ccrp_count_is_bounded_by_remaining_bytes
+N2.1.9	implemented	CCRP rejects noncanonical options	trap_ccrp_rejects_noncanonical_options
+N2.1.10	implemented	Snapshot chunks and acknowledgements are canonical	trap_snapshot_chunk_done_and_ack_offsets_are_canonical
+N2.1.11	implemented	TimeoutNow requires a nonzero intent	trap_timeout_now_codec_requires_nonzero_intent
+N2.1.12	implemented	CCPF and CCRP semantic versions agree	trap_ccpf_and_ccrp_semantic_versions_must_match
+N2.1.13	implemented	Unknown CCRP tags return typed errors	trap_unknown_message_tag_is_a_typed_error
+N2.2.1	implemented	Simulator sends complete CCPF/CCRP frame bytes without a message side channel	trap_simulator_has_no_message_side_channel
+N2.2.2	implemented	Network byte reservations release for delivery and horizon cancellation	trap_network_byte_charge_releases_for_every_delivery_outcome
+N2.2.3	implemented	Transport trace payloads use canonical binary fingerprints	trap_trace_payloads_do_not_use_debug_format
+N2.2.4	implemented	Unexpected valid-outer CCRP decode failures stop the simulator	trap_valid_frame_decode_failure_is_an_invariant
+N2.3.1	implemented	Replayed snapshot chunks are idempotent	trap_replayed_snapshot_chunk_is_idempotent
+N2.3.2	implemented	Corrupt CCPF frames never reach the Raft decoder	trap_corrupt_frame_never_reaches_raft_decoder
+N2.3.3	implemented	Truncated CCPF frames never reach the Raft decoder	trap_truncated_frame_is_rejected_before_allocation
+N2.3.4	implemented	Rechecksummed malformed CCRP never reaches the state machine	trap_rechecksummed_malformed_ccrp_never_reaches_state_machine
+N2.3.5	implemented	Heal clears sustained frame faults and replay bytes	trap_heal_clears_sustained_link_fault_without_leaking_bytes
+N2.3.6	implemented	Replayed Append frames are idempotent	trap_replayed_append_is_idempotent
+N3.1.1	planned	Store watermark publication is atomic	trap_store_watermark_is_atomic_with_write_batch
+N3.2.1	planned	SST v2 has golden vectors	golden_sst_v2_vectors
+N4.1.1	implemented	Host limits reject zero admission caps	trap_host_limits_reject_zero_admission_caps
+N4.1.2	implemented	Driver class queues are bounded and deliver I/O before clients	trap_every_host_queue_has_a_limit
+N4.1.3	implemented	Driver input bytes are reserved before queue admission	trap_driver_queue_byte_limit_is_charged_before_admission
+N4.2.1	planned	Streamed snapshot lifecycle is bounded and resumable	trap_streamed_snapshot_lifecycle_is_bounded
+N4.3.1	implemented	Driver footprint exposes deterministic current, peak, and limit queue-byte charges	trap_footprint_counts_encoded_queue_bytes
+N4.5.1	implemented	Slow disk delays durability completion before dependent traffic	trap_slow_disk_preserves_election_safety
+N4.5.2	implemented	A crash drops delayed durability continuations	trap_crash_discards_a_delayed_durability_continuation
+N4.5.3	implemented	ENOSPC suppresses a dependent vote reply and enters StorageFault	trap_enospc_fails_closed_before_a_vote_reply
+N4.5.4	implemented	At-rest bit rot is detected during recovery and never served	trap_bitrot_is_detected_not_served
+N4.5.5	implemented	Persistent disk-fault trace specifications preserve their selected fields	persistent_disk_fault_specs_round_trip_all_selected_fields
+N5.1.1	implemented	Checker emits a deterministic minimal witness	trap_minimal_witness_is_deterministic
+N5.1.2	implemented	An exhausted witness budget never returns a passing subset	trap_witness_budget_never_returns_a_passing_subset
+N5.2.1	implemented	Anomaly classifier uses only certain real-time order	trap_anomaly_classifier_uses_only_certain_real_time_order
+N5.2.2	implemented	Anomaly classifier labels stale reads without an intervening write	trap_anomaly_classifier_labels_stale_read_without_intervening_write
+N5.5.1	implemented	Trace reads current binary and JSON export forms	trap_trace_reads_current_binary_and_json_exports
+N6.1.1	implemented	Seed ledger records campaign outcomes	trap_seed_ledger_is_append_only
+N6.1.2	implemented	Campaign resume skips only prior successful ledger rows	trap_ledger_resume_only_skips_prior_ok_rows
+N6.2.1	implemented	Shards partition seeds exactly once and validate bounds	trap_shards_partition_each_seed_once_and_validate_bounds
+N7.1.1	planned	Compatibility matrix is enforced	trap_compatibility_matrix_is_enforced
+N8.1.1	planned	Real membership operations use replicated config	trap_real_membership_operations_are_replicated
+N8.2.1	implemented	Non-loopback listeners require an explicit unsafe opt-in	trap_non_loopback_bind_requires_the_flag
+N8.2.2	implemented	Unsafe listener warning includes the actual bound address	trap_unsafe_warning_names_actual_listener
+N9.1.1	implemented	Every rendered theater control has a contract row and functional controls change observable state	every_control_changes_observable_state
+N9.1.2	implemented	Theater packet loss maps to an effective LinkDegrade P16 value	trap_packet_loss_uses_the_effective_link_p16_value
+N9.1.3	implemented	Theater disk latency maps to effective persistent SlowDisk service time	trap_slow_disk_reports_the_effective_persistent_delay
+N9.2.1	implemented	Timeline markers use stable trace-sequence keys and emit no duplicate-key console error	timeline markers render without duplicate React keys
+N10.1.1	planned	Batch applies atomically or not at all	trap_batch_applies_atomically_or_not_at_all
+N10.2.1	planned	Follower read waits for ReadIndex	trap_follower_read_waits_for_readindex
+N11.1.1	planned	Documentation inventory is coherent	doc_coherence
