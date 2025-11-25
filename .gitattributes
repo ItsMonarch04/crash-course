@@ -15,3 +15,4 @@
 *.pptx binary
 *.pdf binary
 *.zip binary
+tests/golden/*.bin binary

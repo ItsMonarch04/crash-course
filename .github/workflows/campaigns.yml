@@ -1,10 +1,21 @@
-name: campaign-pr
+name: campaigns
 
+# This is the heaviest gate in the repository, and work lands directly on
+# `main` rather than through pull requests. A `pull_request`-only trigger
+# therefore never fires: the campaigns, the beacon assertions, and the
+# porcupine crosscheck would sit in the workflow list contributing nothing.
 on:
+  push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: campaign-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   bounded-campaigns:
