@@ -9,15 +9,24 @@ use std::fmt;
 
 use cc_core::{
     ConfigEnvelope, ConfigOperation, Duration, JointMembership, LogIndex, MembershipState, NodeId,
-    Seed, Term, Time, TimerId, TransferResult, Xoshiro256pp,
+    Seed, SessionKey, SessionNamespace, Term, Time, TimerId, TransferResult, Xoshiro256pp,
 };
 
 pub mod codec;
 pub mod model;
 
-/// Bumped to 2 when append requests and responses gained `read_round`, which
-/// scopes a ReadIndex confirmation to the round that raised it.
+/// The frozen v2 vocabulary. New connections may negotiate v3, but ordinary
+/// Raft traffic continues to use this version so a v3 node can communicate
+/// with a v2 peer without changing the v2 bytes or entry layout.
 pub const PROTOCOL_VERSION: u16 = 2;
+/// Semantic v3 adds opt-in, connection-gated follower read messages.
+pub const SEMANTIC_VERSION_V3: u16 = 3;
+pub const MIN_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
+
+#[must_use]
+pub const fn supports_protocol_version(version: u16) -> bool {
+    matches!(version, PROTOCOL_VERSION | SEMANTIC_VERSION_V3)
+}
 pub const DEFAULT_ELECTION_MIN: Duration = Duration::from_millis(150);
 pub const DEFAULT_ELECTION_MAX: Duration = Duration::from_millis(300);
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_millis(50);
@@ -138,6 +147,20 @@ pub enum MessageKind {
     TimeoutNow {
         intent_index: LogIndex,
     },
+    /// Semantic-v3 request for a leader-confirmed read on the receiver.
+    /// `command_hash` correlates a canonical CCKV command; it is not an
+    /// authentication primitive and no client data crosses this message.
+    FollowerReadRequest {
+        request_id: u64,
+        command_hash: u64,
+    },
+    /// Semantic-v3 response after the leader's ReadIndex round is confirmed.
+    FollowerReadGrant {
+        request_id: u64,
+        command_hash: u64,
+        read_index: LogIndex,
+        read_time: Time,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +206,14 @@ pub enum TimerKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RaftEffect {
     Send(Message),
+    /// Snapshot bytes cross the durable host boundary before Raft advances
+    /// its snapshot base. Raft only validates immutable wire metadata here;
+    /// the host/core installation continuation emits the eventual Ack.
+    ReceiveSnapshotChunk(Message),
+    /// Snapshot acknowledgement is host-owned transfer state. Raft validates
+    /// the message envelope and forwards it without treating an Ack as a
+    /// consensus transition.
+    ReceiveSnapshotAck(Message),
     PersistHard(HardState),
     PersistEntries(Vec<Entry>),
     TruncateSuffix(LogIndex),
@@ -197,6 +228,22 @@ pub enum RaftEffect {
     },
     ReadBarrierReady {
         index: LogIndex,
+    },
+    /// The cluster composition layer owns the bounded pending request/grant
+    /// tables; Raft supplies only a term-checked inbound protocol event.
+    FollowerReadRequest {
+        from: NodeId,
+        request_id: u64,
+        command_hash: u64,
+        at: Time,
+    },
+    FollowerReadGrant {
+        from: NodeId,
+        term: Term,
+        request_id: u64,
+        command_hash: u64,
+        read_index: LogIndex,
+        read_time: Time,
     },
     Trace {
         name: &'static str,
@@ -263,12 +310,19 @@ pub struct RaftNode {
     base_joint_enter_index: Option<LogIndex>,
     base_addresses: BTreeMap<NodeId, cc_core::PeerAddress>,
     pub addresses: BTreeMap<NodeId, cc_core::PeerAddress>,
+    active_features: u64,
+    base_active_features: u64,
     pub log: Vec<Entry>,
     pub commit_index: LogIndex,
     pub applied_index: LogIndex,
     pub leader_id: Option<NodeId>,
     pub next_index: BTreeMap<NodeId, LogIndex>,
     pub match_index: BTreeMap<NodeId, LogIndex>,
+    /// Volatile time of the most recent successful replication/snapshot
+    /// acknowledgement from each peer. It is advisory availability evidence,
+    /// never persisted consensus state.
+    pub last_contact: BTreeMap<NodeId, Time>,
+    retiring_peers: BTreeMap<NodeId, LogIndex>,
     pub election_deadline: Time,
     pub heartbeat_deadline: Time,
     pub config: RaftConfig,
@@ -280,10 +334,8 @@ pub struct RaftNode {
     read_acks: BTreeSet<NodeId>,
     read_round: u64,
     read_index: Option<LogIndex>,
-    snapshot_buffer: Vec<u8>,
     snapshot_index: LogIndex,
     snapshot_term: Term,
-    snapshot_transfer: Option<SnapshotTransfer>,
     next_snapshot_transfer_id: u64,
     transfer: Option<LeadershipTransfer>,
 }
@@ -294,6 +346,7 @@ struct LeadershipTransfer {
     target: NodeId,
     deadline: Time,
     finishing: bool,
+    admin_session: Option<(SessionKey, u64)>,
 }
 
 /// The durable portion of a leadership-transfer workflow.  It is deliberately
@@ -305,15 +358,7 @@ pub struct LeadershipTransferState {
     pub target: NodeId,
     pub deadline: Time,
     pub finishing: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SnapshotTransfer {
-    id: u64,
-    index: LogIndex,
-    term: Term,
-    total_len: u64,
-    crc32c: u32,
+    pub admin_session: Option<(SessionKey, u64)>,
 }
 
 impl RaftNode {
@@ -340,12 +385,16 @@ impl RaftNode {
             base_joint_enter_index: None,
             base_addresses: BTreeMap::new(),
             addresses: BTreeMap::new(),
+            active_features: 0,
+            base_active_features: 0,
             log: Vec::new(),
             commit_index: LogIndex::new(0),
             applied_index: LogIndex::new(0),
             leader_id: None,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            last_contact: BTreeMap::new(),
+            retiring_peers: BTreeMap::new(),
             election_deadline: Time::from_nanos(0),
             heartbeat_deadline: Time::from_nanos(0),
             config,
@@ -357,10 +406,8 @@ impl RaftNode {
             read_acks: BTreeSet::new(),
             read_round: 0,
             read_index: None,
-            snapshot_buffer: Vec::new(),
             snapshot_index: LogIndex::new(0),
             snapshot_term: Term::new(0),
-            snapshot_transfer: None,
             next_snapshot_transfer_id: 1,
             transfer: None,
         };
@@ -430,6 +477,9 @@ impl RaftNode {
         if self.role == Role::Leader && now >= self.heartbeat_deadline {
             self.heartbeat_deadline = now + self.config.heartbeat;
             let mut effects = self.broadcast_append();
+            if let Some(nudge) = self.transfer_nudge() {
+                effects.push(nudge);
+            }
             effects.push(RaftEffect::ArmTimer {
                 id: TimerId::new(self.id.get().saturating_mul(2).saturating_add(1)),
                 at: self.heartbeat_deadline,
@@ -445,11 +495,46 @@ impl RaftNode {
 
     pub fn on_timer(&mut self, now: Time, timer: TimerKind) -> Vec<RaftEffect> {
         match timer {
-            TimerKind::Election if self.role == Role::Leader => self.broadcast_append(),
+            TimerKind::Election if self.role == Role::Leader => {
+                let mut effects = self.broadcast_append();
+                if let Some(nudge) = self.transfer_nudge() {
+                    effects.push(nudge);
+                }
+                effects
+            }
             TimerKind::Election => self.start_pre_vote(now),
-            TimerKind::Heartbeat if self.role == Role::Leader => self.broadcast_append(),
+            TimerKind::Heartbeat if self.role == Role::Leader => {
+                let mut effects = self.broadcast_append();
+                if let Some(nudge) = self.transfer_nudge() {
+                    effects.push(nudge);
+                }
+                effects
+            }
             TimerKind::Heartbeat => Vec::new(),
         }
+    }
+
+    fn transfer_nudge(&self) -> Option<RaftEffect> {
+        let transfer = self.transfer?;
+        (self.role == Role::Leader
+            && !transfer.finishing
+            && transfer.target != self.id
+            && self.commit_index >= transfer.intent_index
+            && self
+                .match_index
+                .get(&transfer.target)
+                .is_some_and(|index| *index >= transfer.intent_index))
+        .then(|| {
+            RaftEffect::Send(Message {
+                proto_version: PROTOCOL_VERSION,
+                from: self.id,
+                to: transfer.target,
+                term: self.hard_state.term,
+                kind: MessageKind::TimeoutNow {
+                    intent_index: transfer.intent_index,
+                },
+            })
+        })
     }
 
     pub fn propose(&mut self, payload: Vec<u8>) -> Result<Vec<RaftEffect>, RaftError> {
@@ -491,12 +576,12 @@ impl RaftNode {
         if self.transfer.is_some() {
             return Err(RaftError::TransferInProgress);
         }
-        if self
-            .log
-            .iter()
-            .find(|entry| entry.term == self.hard_state.term && entry.kind == EntryKind::Noop)
-            .is_none_or(|entry| entry.index > self.commit_index)
-        {
+        let current_term_is_committed = (self.snapshot_index <= self.commit_index
+            && self.snapshot_term == self.hard_state.term)
+            || self.log.iter().any(|entry| {
+                entry.term == self.hard_state.term && entry.index <= self.commit_index
+            });
+        if !current_term_is_committed {
             return Err(RaftError::ReadBarrierNotReady);
         }
         self.read_round = self.read_round.saturating_add(1);
@@ -516,15 +601,40 @@ impl RaftNode {
         Ok(effects)
     }
 
-    pub fn add_learner(&mut self, node: NodeId) -> Result<(), RaftError> {
-        if node.get() == 0 || self.voters.contains(&node) || self.learners.contains(&node) {
+    /// Propose a learner addition as a replicated configuration entry. The
+    /// append projection changes immediately for quorum/routing safety, but
+    /// the durable membership authority is the config entry and its fsync
+    /// continuation, never this caller's process-local mutation.
+    pub fn add_learner(&mut self, node: NodeId) -> Result<Vec<RaftEffect>, RaftError> {
+        if self.role != Role::Leader {
+            return Err(RaftError::NotLeader);
+        }
+        if node.get() == 0
+            || self.joint.is_some()
+            || self.voters.contains(&node)
+            || self.learners.contains(&node)
+            || self.config_transition_in_flight_before(LogIndex::new(
+                self.last_index().get().saturating_add(1),
+            ))
+        {
             return Err(RaftError::InvalidMessage);
         }
-        self.learners.insert(node);
-        Ok(())
+        self.append_config(ConfigEnvelope {
+            admin_session: None,
+            leader_time: Time::from_nanos(0),
+            operation: ConfigOperation::AddLearner {
+                id: node,
+                address: None,
+            },
+        })
     }
 
-    pub fn promote_learner(&mut self, node: NodeId) -> Result<(), RaftError> {
+    /// Promotion begins the normal joint-consensus transition. Final voter
+    /// membership remains pending until the caller later commits `leave_joint`.
+    pub fn promote_learner(&mut self, node: NodeId) -> Result<Vec<RaftEffect>, RaftError> {
+        if self.role != Role::Leader {
+            return Err(RaftError::NotLeader);
+        }
         if !self.learners.contains(&node) {
             return Err(RaftError::InvalidMessage);
         }
@@ -535,12 +645,9 @@ impl RaftNode {
         {
             return Err(RaftError::Busy);
         }
-        self.learners.remove(&node);
-        self.voters.insert(node);
-        self.next_index
-            .insert(node, LogIndex::new(self.last_index().get() + 1));
-        self.match_index.insert(node, self.last_index());
-        Ok(())
+        let mut voters = self.voters.clone();
+        voters.insert(node);
+        self.enter_joint(voters)
     }
 
     pub fn enter_joint(
@@ -589,25 +696,11 @@ impl RaftNode {
         if self.commit_index < enter_index {
             return Err(RaftError::Busy);
         }
-        let entry = Entry {
-            term: self.hard_state.term,
-            index: LogIndex::new(self.last_index().get() + 1),
-            kind: EntryKind::Config,
-            payload: ConfigEnvelope {
-                admin_session: None,
-                leader_time: Time::from_nanos(0),
-                operation: ConfigOperation::LeaveJoint { enter_index },
-            }
-            .encode(),
-        };
-        self.apply_config_on_append(&entry)?;
-        self.log.push(entry.clone());
-        if !self.voters.contains(&self.id) {
-            self.role = Role::Follower;
-        }
-        let mut effects = vec![RaftEffect::PersistEntries(vec![entry])];
-        effects.extend(self.broadcast_append());
-        Ok(effects)
+        self.append_config(ConfigEnvelope {
+            admin_session: None,
+            leader_time: Time::from_nanos(0),
+            operation: ConfigOperation::LeaveJoint { enter_index },
+        })
     }
 
     /// Append the durable transfer intent only after the target has caught up
@@ -621,14 +714,15 @@ impl RaftNode {
         if self.role != Role::Leader {
             return Err(RaftError::NotLeader);
         }
-        if self.joint.is_some() || self.transfer.is_some() || target == self.id {
+        if self.joint.is_some() || self.transfer.is_some() {
             return Err(RaftError::TransferInProgress);
         }
         if !self.voters.contains(&target)
-            || self
-                .match_index
-                .get(&target)
-                .is_none_or(|index| *index < self.last_index())
+            || (target != self.id
+                && self
+                    .match_index
+                    .get(&target)
+                    .is_none_or(|index| *index < self.last_index()))
         {
             return Err(RaftError::Busy);
         }
@@ -649,6 +743,16 @@ impl RaftNode {
         let envelope =
             ConfigEnvelope::decode(&entry.payload).map_err(|_| RaftError::InvalidMessage)?;
         match envelope.operation {
+            ConfigOperation::AddLearner { id, .. } => {
+                // The proposal-time AppendEntries can race a real host's
+                // publication of the newly committed route.  Once the
+                // configuration apply is durable, explicitly seed the new
+                // learner's catch-up instead of waiting for an unrelated
+                // heartbeat generation.
+                if self.role == Role::Leader && self.learners.contains(&id) {
+                    return Ok(self.send_append(id));
+                }
+            }
             ConfigOperation::BeginLeaderTransfer { target } => {
                 if self.transfer.is_some() || !self.voters.contains(&target) {
                     return Err(RaftError::InvalidMessage);
@@ -659,7 +763,12 @@ impl RaftNode {
                     target,
                     deadline,
                     finishing: false,
+                    admin_session: envelope.admin_session,
                 });
+                if self.role == Role::Leader && target == self.id {
+                    return self
+                        .finish_leadership_transfer(TransferResult::Success, envelope.leader_time);
+                }
                 if self.role == Role::Leader
                     && self
                         .match_index
@@ -690,23 +799,189 @@ impl RaftNode {
                     return Err(RaftError::InvalidMessage);
                 }
             }
+            ConfigOperation::ActivateFeature { feature } => {
+                if feature != cc_core::ATOMIC_BATCH_FEATURE || self.active_features & feature != 0 {
+                    return Err(RaftError::InvalidMessage);
+                }
+                self.active_features |= feature;
+            }
             _ => {}
         }
         Ok(Vec::new())
     }
 
     fn append_config(&mut self, envelope: ConfigEnvelope) -> Result<Vec<RaftEffect>, RaftError> {
+        // A voter removed by LeaveJoint must still receive the final entry so
+        // it can durably discover that its local identity is terminal.  It no
+        // longer participates in the post-leave quorum, but remains a
+        // best-effort replication target for this one append.
+        let removed_voters = match &envelope.operation {
+            ConfigOperation::LeaveJoint { .. } => self
+                .joint
+                .as_ref()
+                .map(|(old, new)| old.difference(new).copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         let entry = Entry {
             term: self.hard_state.term,
             index: LogIndex::new(self.last_index().get().saturating_add(1)),
             kind: EntryKind::Config,
             payload: envelope.encode(),
         };
+        let terminal_index = entry.index;
         self.apply_config_on_append(&entry)?;
         self.log.push(entry.clone());
+        for peer in removed_voters
+            .iter()
+            .copied()
+            .filter(|peer| *peer != self.id)
+        {
+            self.retiring_peers.insert(peer, terminal_index);
+        }
         let mut effects = vec![RaftEffect::PersistEntries(vec![entry])];
         effects.extend(self.broadcast_append());
+        effects.extend(
+            removed_voters
+                .into_iter()
+                .filter(|peer| *peer != self.id)
+                .flat_map(|peer| self.send_append(peer)),
+        );
         Ok(effects)
+    }
+
+    /// Propose one operator-owned configuration transition. The durable
+    /// AdminRequest identity is part of the canonical CCCF bytes; callers use
+    /// it to resolve a lost reply without creating a second workflow.
+    pub fn propose_admin_config(
+        &mut self,
+        envelope: ConfigEnvelope,
+    ) -> Result<Vec<RaftEffect>, RaftError> {
+        if self.role != Role::Leader {
+            return Err(RaftError::NotLeader);
+        }
+        let Some((session, sequence)) = envelope.admin_session else {
+            return Err(RaftError::InvalidMessage);
+        };
+        if session.namespace != SessionNamespace::AdminRequest as u8 || sequence == 0 {
+            return Err(RaftError::InvalidMessage);
+        }
+        let next_index = LogIndex::new(self.last_index().get().saturating_add(1));
+        let contact_is_recent = |peer: &NodeId| {
+            *peer == self.id
+                || self.last_contact.get(peer).is_some_and(|contact| {
+                    envelope
+                        .leader_time
+                        .as_nanos()
+                        .saturating_sub(contact.as_nanos())
+                        <= self.config.leader_transfer_timeout.as_nanos()
+                })
+        };
+        match &envelope.operation {
+            ConfigOperation::AddLearner { id, address } => {
+                let Some(address) = address else {
+                    return Err(RaftError::InvalidMessage);
+                };
+                if id.get() == 0
+                    || self.joint.is_some()
+                    || self.voters.contains(id)
+                    || self.learners.contains(id)
+                    || self.addresses.values().any(|existing| existing == address)
+                    || self.config_transition_in_flight_before(next_index)
+                {
+                    return Err(RaftError::InvalidMessage);
+                }
+            }
+            ConfigOperation::RemoveLearner { id } => {
+                if self.joint.is_some()
+                    || !self.learners.contains(id)
+                    || self.config_transition_in_flight_before(next_index)
+                {
+                    return Err(RaftError::InvalidMessage);
+                }
+            }
+            ConfigOperation::UpdateAddress { id, address } => {
+                if self.joint.is_some()
+                    || (!self.voters.contains(id) && !self.learners.contains(id))
+                    || self
+                        .addresses
+                        .iter()
+                        .any(|(node, existing)| node != id && existing == address)
+                    || self.config_transition_in_flight_before(next_index)
+                {
+                    return Err(RaftError::InvalidMessage);
+                }
+            }
+            ConfigOperation::EnterJoint { new_voters } => {
+                if self.joint.is_some()
+                    || new_voters.is_empty()
+                    || new_voters == &self.voters
+                    || new_voters.iter().any(|id| id.get() == 0)
+                    || self.config_transition_in_flight_before(next_index)
+                {
+                    return Err(RaftError::Busy);
+                }
+                for added in new_voters.difference(&self.voters) {
+                    if !self.learners.contains(added)
+                        || self
+                            .match_index
+                            .get(added)
+                            .is_none_or(|index| *index < self.commit_index)
+                        || !contact_is_recent(added)
+                    {
+                        return Err(RaftError::Busy);
+                    }
+                }
+                let old_available = self
+                    .voters
+                    .iter()
+                    .filter(|member| contact_is_recent(member))
+                    .count();
+                let new_available = new_voters
+                    .iter()
+                    .filter(|member| contact_is_recent(member))
+                    .count();
+                if old_available <= self.voters.len() / 2 || new_available <= new_voters.len() / 2 {
+                    return Err(RaftError::Busy);
+                }
+            }
+            ConfigOperation::LeaveJoint { enter_index } => {
+                if self.joint.is_none()
+                    || self.joint_enter_index != Some(*enter_index)
+                    || self.commit_index < *enter_index
+                {
+                    return Err(RaftError::Busy);
+                }
+            }
+            ConfigOperation::BeginLeaderTransfer { target } => {
+                if self.joint.is_some() || self.transfer.is_some() {
+                    return Err(RaftError::TransferInProgress);
+                }
+                if !self.voters.contains(target)
+                    || (*target != self.id
+                        && (self
+                            .match_index
+                            .get(target)
+                            .is_none_or(|index| *index < self.commit_index)
+                            || !contact_is_recent(target)))
+                {
+                    return Err(RaftError::Busy);
+                }
+            }
+            ConfigOperation::ActivateFeature { feature } => {
+                if *feature != cc_core::ATOMIC_BATCH_FEATURE
+                    || self.active_features & *feature != 0
+                    || self.joint.is_some()
+                    || self.config_transition_in_flight_before(next_index)
+                {
+                    return Err(RaftError::Busy);
+                }
+            }
+            ConfigOperation::FinishLeaderTransfer { .. } => {
+                return Err(RaftError::InvalidMessage);
+            }
+        }
+        self.append_config(envelope)
     }
 
     fn finish_leadership_transfer(
@@ -723,7 +998,7 @@ impl RaftNode {
         transfer.finishing = true;
         self.transfer = Some(transfer);
         match self.append_config(ConfigEnvelope {
-            admin_session: None,
+            admin_session: transfer.admin_session,
             leader_time,
             operation: ConfigOperation::FinishLeaderTransfer {
                 intent_index: transfer.intent_index,
@@ -747,8 +1022,51 @@ impl RaftNode {
     }
 
     #[must_use]
+    pub fn has_retiring_peers(&self) -> bool {
+        !self.retiring_peers.is_empty()
+    }
+
+    #[must_use]
+    pub const fn active_features(&self) -> u64 {
+        self.active_features
+    }
+
+    /// Replicate a monotonic semantic feature fence. It deliberately does not
+    /// take effect while merely appended; `apply_committed_config` owns the
+    /// activation point seen by client admission.
+    pub fn activate_feature(
+        &mut self,
+        feature: u64,
+        leader_time: Time,
+    ) -> Result<Vec<RaftEffect>, RaftError> {
+        if self.role != Role::Leader {
+            return Err(RaftError::NotLeader);
+        }
+        if feature != cc_core::ATOMIC_BATCH_FEATURE
+            || self.active_features & feature != 0
+            || self.joint.is_some()
+        {
+            return Err(RaftError::Busy);
+        }
+        self.append_config(ConfigEnvelope {
+            admin_session: None,
+            leader_time,
+            operation: ConfigOperation::ActivateFeature { feature },
+        })
+    }
+
+    #[must_use]
     pub fn snapshot_needed(&self, applied_bytes: u64) -> bool {
         applied_bytes >= SNAPSHOT_TRIGGER_BYTES
+    }
+
+    /// Return the compacted log origin. A peer needs snapshot transfer only
+    /// when its next requested index is at or below this durable base; index
+    /// one on a fresh, uncompacted leader is still available through normal
+    /// AppendEntries and must not trigger an eager checkpoint.
+    #[must_use]
+    pub const fn snapshot_base(&self) -> (LogIndex, Term) {
+        (self.snapshot_index, self.snapshot_term)
     }
 
     pub fn install_snapshot_state(&mut self, index: LogIndex, term: Term) {
@@ -771,6 +1089,7 @@ impl RaftNode {
             target: transfer.target,
             deadline: transfer.deadline,
             finishing: transfer.finishing,
+            admin_session: transfer.admin_session,
         })
     }
 
@@ -796,12 +1115,19 @@ impl RaftNode {
             target: transfer.target,
             deadline: transfer.deadline,
             finishing: transfer.finishing,
+            admin_session: transfer.admin_session,
         });
         Ok(())
     }
 
     #[must_use]
     pub fn membership_state(&self) -> MembershipState {
+        let addresses = self
+            .addresses
+            .iter()
+            .filter(|(id, _)| self.voters.contains(id) || self.learners.contains(id))
+            .map(|(id, address)| (*id, address.clone()))
+            .collect();
         MembershipState {
             voters: self.voters.clone(),
             learners: self.learners.clone(),
@@ -812,8 +1138,21 @@ impl RaftNode {
                     enter_index,
                 })
             }),
-            addresses: self.addresses.clone(),
+            addresses,
+            active_features: self.active_features,
         }
+    }
+
+    /// Membership projection at a durable applied boundary. The live Raft
+    /// projection intentionally includes an appended, possibly uncommitted
+    /// configuration suffix; a checkpoint may include only its covered
+    /// prefix.
+    #[must_use]
+    pub fn membership_state_at(&self, index: LogIndex) -> MembershipState {
+        let mut projected = self.clone();
+        projected.log.retain(|entry| entry.index <= index);
+        projected.rebuild_membership_from_log();
+        projected.membership_state()
     }
 
     /// Install the committed membership base recovered from a snapshot.  Any
@@ -829,12 +1168,30 @@ impl RaftNode {
             .map(|joint| (joint.old_voters.clone(), joint.new_voters.clone()));
         self.joint_enter_index = state.joint.as_ref().map(|joint| joint.enter_index);
         self.addresses = state.addresses.clone();
+        self.active_features = state.active_features;
         self.base_voters = state.voters;
         self.base_learners = state.learners;
         self.base_joint = self.joint.clone();
         self.base_joint_enter_index = self.joint_enter_index;
         self.base_addresses = state.addresses;
+        self.base_active_features = state.active_features;
         Ok(())
+    }
+
+    /// Re-project configuration entries retained above a newly installed
+    /// snapshot onto that snapshot's membership base. Snapshot installation
+    /// deliberately preserves a valid suffix; its append-time membership
+    /// effects must be preserved as well or the next LeaveJoint/address entry
+    /// will be judged against stale checkpoint membership.
+    pub fn replay_retained_membership_suffix(&mut self) {
+        self.rebuild_membership_from_log();
+    }
+
+    #[must_use]
+    pub fn allocate_snapshot_transfer_id(&mut self) -> u64 {
+        let transfer_id = self.next_snapshot_transfer_id;
+        self.next_snapshot_transfer_id = self.next_snapshot_transfer_id.saturating_add(1).max(1);
+        transfer_id
     }
 
     #[must_use]
@@ -849,8 +1206,7 @@ impl RaftNode {
         if bytes.is_empty() {
             return Vec::new();
         }
-        let transfer_id = self.next_snapshot_transfer_id;
-        self.next_snapshot_transfer_id = self.next_snapshot_transfer_id.saturating_add(1).max(1);
+        let transfer_id = self.allocate_snapshot_transfer_id();
         let total_len = u64::try_from(bytes.len()).expect("invariant: snapshot length fits u64");
         let snapshot_crc32c = cc_core::crc32c(bytes);
         bytes
@@ -886,7 +1242,7 @@ impl RaftNode {
     /// the timestamped entry is the integration hook used by the simulator so
     /// election deadlines are reset relative to delivery, not the epoch.
     pub fn on_message_at(&mut self, message: Message, now: Time) -> Vec<RaftEffect> {
-        if message.proto_version != PROTOCOL_VERSION {
+        if !supports_protocol_version(message.proto_version) {
             return vec![RaftEffect::Trace {
                 name: "proto_version_rejected",
                 index: self.last_index(),
@@ -960,7 +1316,7 @@ impl RaftNode {
                 effects.extend(self.append_request(&message, request, now))
             }
             MessageKind::AppendResp(response) => {
-                effects.extend(self.append_response(&message, response))
+                effects.extend(self.append_response(&message, response, now))
             }
             chunk @ MessageKind::SnapshotChunk { .. } => {
                 effects.extend(self.snapshot_chunk(&message, chunk))
@@ -968,9 +1324,13 @@ impl RaftNode {
             MessageKind::SnapshotAck {
                 transfer_id: _,
                 next_offset,
-                accepted: _,
+                accepted,
                 reason: _,
             } => {
+                if accepted && message.term == self.hard_state.term {
+                    self.last_contact.insert(message.from, now);
+                }
+                effects.push(RaftEffect::ReceiveSnapshotAck(message.clone()));
                 effects.push(RaftEffect::Trace {
                     name: "snapshot_ack",
                     index: LogIndex::new(next_offset),
@@ -992,6 +1352,54 @@ impl RaftNode {
                     });
                 } else {
                     effects.extend(self.start_election());
+                }
+            }
+            MessageKind::FollowerReadRequest {
+                request_id,
+                command_hash,
+            } => {
+                if message.proto_version == SEMANTIC_VERSION_V3
+                    && request_id != 0
+                    && message.term == self.hard_state.term
+                    && self.role == Role::Leader
+                {
+                    effects.push(RaftEffect::FollowerReadRequest {
+                        from: message.from,
+                        request_id,
+                        command_hash,
+                        at: now,
+                    });
+                } else {
+                    effects.push(RaftEffect::Trace {
+                        name: "follower_read_request_rejected",
+                        index: self.last_index(),
+                    });
+                }
+            }
+            MessageKind::FollowerReadGrant {
+                request_id,
+                command_hash,
+                read_index,
+                read_time,
+            } => {
+                if message.proto_version == SEMANTIC_VERSION_V3
+                    && request_id != 0
+                    && message.term == self.hard_state.term
+                    && self.leader_id == Some(message.from)
+                {
+                    effects.push(RaftEffect::FollowerReadGrant {
+                        from: message.from,
+                        term: message.term,
+                        request_id,
+                        command_hash,
+                        read_index,
+                        read_time,
+                    });
+                } else {
+                    effects.push(RaftEffect::Trace {
+                        name: "follower_read_grant_rejected",
+                        index: read_index,
+                    });
                 }
             }
         }
@@ -1050,6 +1458,17 @@ impl RaftNode {
     }
 
     fn start_pre_vote(&mut self, now: Time) -> Vec<RaftEffect> {
+        // A discovery-only joining process is deliberately absent from the
+        // committed voter set.  It may receive and persist replication, but
+        // it must never advance the cluster term or solicit votes before a
+        // committed promotion makes it a voter.
+        if !self.voters.contains(&self.id) {
+            self.role = Role::Learner;
+            self.pre_votes.clear();
+            self.votes.clear();
+            self.reset_election(now);
+            return Vec::new();
+        }
         self.role = Role::Candidate;
         self.pre_votes.clear();
         self.pre_votes.insert(self.id);
@@ -1084,6 +1503,12 @@ impl RaftNode {
     }
 
     fn start_election(&mut self) -> Vec<RaftEffect> {
+        if !self.voters.contains(&self.id) {
+            self.role = Role::Learner;
+            self.pre_votes.clear();
+            self.votes.clear();
+            return Vec::new();
+        }
         self.role = Role::Candidate;
         self.hard_state.term = Term::new(self.hard_state.term.get() + 1);
         self.hard_state.voted_for = Some(self.id);
@@ -1143,6 +1568,34 @@ impl RaftNode {
         // it ReadIndex and every subsequent client proposal wait forever for
         // an AppendResp that no peer can send.
         effects.extend(self.advance_commit());
+        // A committed EnterJoint can have been applied while this node was a
+        // follower.  In that case the old leader may disappear before it
+        // appends LeaveJoint, and there is no newly committed EnterJoint for
+        // the cluster adapter to observe after this election.  Resume the
+        // durable two-entry admin workflow here, preserving the original
+        // request identity and leader timestamp.  An uncommitted EnterJoint
+        // is deliberately left alone: the current-term no-op must first make
+        // it committed, after which committed apply appends the matching
+        // leave through the normal path.
+        if let Some(enter_index) = self.joint_enter_index
+            && self.commit_index >= enter_index
+            && let Some(enter) = self
+                .log
+                .iter()
+                .find(|candidate| candidate.index == enter_index)
+                .and_then(|candidate| ConfigEnvelope::decode(&candidate.payload).ok())
+            && matches!(enter.operation, ConfigOperation::EnterJoint { .. })
+            && enter.admin_session.is_some()
+        {
+            if let Ok(finish) = self.append_config(ConfigEnvelope {
+                admin_session: enter.admin_session,
+                leader_time: enter.leader_time,
+                operation: ConfigOperation::LeaveJoint { enter_index },
+            }) {
+                effects.extend(finish);
+                return effects;
+            }
+        }
         // A committed transfer intent belongs to the cluster, not the old
         // leader.  The first leader elected afterwards makes the terminal
         // result durable in its own term so the workflow cannot pause future
@@ -1188,12 +1641,23 @@ impl RaftNode {
             Role::Learner
         };
         self.leader_id = Some(message.from);
+        // A current-term AppendEntries identifies the current leader even
+        // when the follower must reject it to repair a log/snapshot gap. Not
+        // resetting here lets a recovering follower campaign on every
+        // election deadline, repeatedly deposing the leader that is trying to
+        // bring it up to date.
+        self.reset_election(now);
         if self.term_at(request.prev_index) != Some(request.prev_term) {
-            let conflict_index = self
-                .log
-                .iter()
-                .find(|entry| entry.index >= request.prev_index)
-                .map_or(self.last_index(), |entry| entry.index);
+            let conflict_index = if request.prev_index > self.last_index() {
+                LogIndex::new(self.last_index().get().saturating_add(1))
+            } else {
+                LogIndex::new(
+                    request
+                        .prev_index
+                        .get()
+                        .max(self.snapshot_index.get().saturating_add(1)),
+                )
+            };
             return vec![self.make_append_response(
                 message,
                 false,
@@ -1202,7 +1666,6 @@ impl RaftNode {
                 conflict_index,
             )];
         }
-        self.reset_election(now);
         let mut effects = Vec::new();
         let mut appended = Vec::new();
         for entry in request.entries {
@@ -1225,6 +1688,20 @@ impl RaftNode {
                 } else {
                     continue;
                 }
+            }
+            if entry.index.get() != self.last_index().get().saturating_add(1) {
+                effects.push(RaftEffect::Trace {
+                    name: "append_gap_rejected",
+                    index: entry.index,
+                });
+                effects.push(self.make_append_response(
+                    message,
+                    false,
+                    self.last_index(),
+                    None,
+                    LogIndex::new(self.last_index().get().saturating_add(1)),
+                ));
+                return effects;
             }
             if entry.kind == EntryKind::Config && self.apply_config_on_append(&entry).is_err() {
                 // Do not retain an entry whose append-time configuration
@@ -1309,6 +1786,27 @@ impl RaftNode {
                 self.read_index = None;
                 effects.push(RaftEffect::ReadBarrierReady { index });
             }
+            if self.role == Role::Leader
+                && let Some(transfer) = self.transfer
+                && !transfer.finishing
+                && transfer.target == peer
+                && self.commit_index >= transfer.intent_index
+                && response.match_index >= transfer.intent_index
+            {
+                // The target is commonly one entry behind when the intent is
+                // applied. Its later acknowledgement is the first safe point
+                // to trigger the election; without this edge the transfer can
+                // remain InProgress until its timeout despite healthy links.
+                effects.push(RaftEffect::Send(Message {
+                    proto_version: PROTOCOL_VERSION,
+                    from: self.id,
+                    to: peer,
+                    term: self.hard_state.term,
+                    kind: MessageKind::TimeoutNow {
+                        intent_index: transfer.intent_index,
+                    },
+                }));
+            }
             if self
                 .next_index
                 .get(&peer)
@@ -1324,12 +1822,33 @@ impl RaftNode {
         }
     }
 
-    fn append_response(&mut self, message: &Message, response: AppendResponse) -> Vec<RaftEffect> {
+    fn append_response(
+        &mut self,
+        message: &Message,
+        response: AppendResponse,
+        now: Time,
+    ) -> Vec<RaftEffect> {
         if self.role != Role::Leader
             || message.term != self.hard_state.term
-            || (!self.voters.contains(&message.from) && !self.learners.contains(&message.from))
+            || (!self.voters.contains(&message.from)
+                && !self.learners.contains(&message.from)
+                && !self.retiring_peers.contains_key(&message.from))
         {
             return Vec::new();
+        }
+        if response.success {
+            self.last_contact.insert(message.from, now);
+            if self
+                .retiring_peers
+                .get(&message.from)
+                .is_some_and(|terminal| response.match_index >= *terminal)
+            {
+                self.retiring_peers.remove(&message.from);
+                self.next_index.remove(&message.from);
+                self.match_index.remove(&message.from);
+                self.addresses.remove(&message.from);
+                return Vec::new();
+            }
         }
         self.append_response_from_peer(message.from, response)
     }
@@ -1368,9 +1887,24 @@ impl RaftNode {
         self.voters
             .iter()
             .chain(self.learners.iter())
+            .chain(self.retiring_peers.keys())
             .filter(|peer| **peer != self.id)
             .flat_map(|peer| self.send_append(*peer))
             .collect()
+    }
+
+    /// Resume ordinary suffix replication immediately after a host-owned
+    /// snapshot transfer finishes. Waiting for a later heartbeat is both
+    /// unnecessary and can strand a learner if that timer generation was
+    /// coalesced while snapshot I/O was blocking the driver.
+    pub fn replicate_peer(&self, peer: NodeId) -> Result<Vec<RaftEffect>, RaftError> {
+        if self.role != Role::Leader
+            || peer == self.id
+            || (!self.voters.contains(&peer) && !self.learners.contains(&peer))
+        {
+            return Err(RaftError::InvalidMessage);
+        }
+        Ok(self.send_append(peer))
     }
 
     fn advance_commit(&mut self) -> Vec<RaftEffect> {
@@ -1409,13 +1943,13 @@ impl RaftNode {
         }
     }
 
-    fn snapshot_chunk(&mut self, message: &Message, chunk: MessageKind) -> Vec<RaftEffect> {
+    fn snapshot_chunk(&self, message: &Message, chunk: MessageKind) -> Vec<RaftEffect> {
         let MessageKind::SnapshotChunk {
             transfer_id,
             last_included_index,
             last_included_term,
             total_len,
-            snapshot_crc32c,
+            snapshot_crc32c: _,
             offset,
             data,
             done,
@@ -1462,92 +1996,7 @@ impl RaftNode {
                 Some(SnapshotRejectReason::Corrupt),
             )];
         }
-        let same_transfer = self.snapshot_transfer.is_some_and(|transfer| {
-            transfer.id == transfer_id
-                && transfer.index == last_included_index
-                && transfer.term == last_included_term
-                && transfer.total_len == total_len
-                && transfer.crc32c == snapshot_crc32c
-        });
-        if offset == 0 && !same_transfer {
-            self.snapshot_buffer.clear();
-            self.snapshot_transfer = Some(SnapshotTransfer {
-                id: transfer_id,
-                index: last_included_index,
-                term: last_included_term,
-                total_len,
-                crc32c: snapshot_crc32c,
-            });
-        }
-        let Some(transfer) = self.snapshot_transfer else {
-            return vec![self.snapshot_ack(
-                message,
-                transfer_id,
-                0,
-                false,
-                Some(SnapshotRejectReason::RestartFromZero),
-            )];
-        };
-        if transfer.id != transfer_id
-            || transfer.index != last_included_index
-            || transfer.term != last_included_term
-            || transfer.total_len != total_len
-            || transfer.crc32c != snapshot_crc32c
-        {
-            return vec![self.snapshot_ack(
-                message,
-                transfer_id,
-                0,
-                false,
-                Some(SnapshotRejectReason::Conflict),
-            )];
-        }
-        let expected_offset = self.snapshot_buffer.len() as u64;
-        if offset < expected_offset {
-            let start = usize::try_from(offset).expect("snapshot offset is bounded");
-            let finish = usize::try_from(end).expect("snapshot end is bounded");
-            if finish <= self.snapshot_buffer.len() && self.snapshot_buffer[start..finish] == data {
-                return vec![self.snapshot_ack(message, transfer_id, expected_offset, true, None)];
-            }
-            return vec![self.snapshot_ack(
-                message,
-                transfer_id,
-                expected_offset,
-                false,
-                Some(SnapshotRejectReason::Conflict),
-            )];
-        }
-        if offset > expected_offset {
-            return vec![self.snapshot_ack(
-                message,
-                transfer_id,
-                expected_offset,
-                false,
-                Some(SnapshotRejectReason::Gap),
-            )];
-        }
-        self.snapshot_buffer.extend_from_slice(&data);
-        if done {
-            if cc_core::crc32c(&self.snapshot_buffer) != snapshot_crc32c {
-                self.snapshot_buffer.clear();
-                self.snapshot_transfer = None;
-                return vec![self.snapshot_ack(
-                    message,
-                    transfer_id,
-                    0,
-                    false,
-                    Some(SnapshotRejectReason::Corrupt),
-                )];
-            }
-            self.log.retain(|entry| entry.index > last_included_index);
-            self.commit_index = self.commit_index.max(last_included_index);
-            self.applied_index = last_included_index;
-            self.snapshot_index = last_included_index;
-            self.snapshot_term = last_included_term;
-            self.snapshot_buffer.clear();
-            self.snapshot_transfer = None;
-        }
-        vec![self.snapshot_ack(message, transfer_id, end, true, None)]
+        vec![RaftEffect::ReceiveSnapshotChunk(message.clone())]
     }
 
     fn snapshot_ack(
@@ -1654,6 +2103,7 @@ impl RaftNode {
                     return Err(RaftError::InvalidMessage);
                 }
                 self.addresses.remove(&id);
+                self.last_contact.remove(&id);
             }
             ConfigOperation::UpdateAddress { id, address } => {
                 if !self.voters.contains(&id) && !self.learners.contains(&id) {
@@ -1684,6 +2134,12 @@ impl RaftNode {
                     return Err(RaftError::InvalidMessage);
                 }
                 self.voters = new;
+                self.last_contact
+                    .retain(|id, _| self.voters.contains(id) || self.learners.contains(id));
+                // Keep old routes internally until the final LeaveJoint has
+                // been offered to removed voters. `membership_state` filters
+                // them from the authoritative public projection, and log
+                // rebuild/checkpoint projection prunes them permanently.
                 self.joint = None;
                 self.joint_enter_index = None;
                 if !self.voters.contains(&self.id) {
@@ -1713,6 +2169,23 @@ impl RaftNode {
                     return Err(RaftError::InvalidMessage);
                 }
             }
+            ConfigOperation::ActivateFeature { feature } => {
+                if feature != cc_core::ATOMIC_BATCH_FEATURE
+                    || self.active_features & feature != 0
+                    || self.log.iter().any(|prior| {
+                        prior.kind == EntryKind::Config
+                            && ConfigEnvelope::decode(&prior.payload).is_ok_and(|envelope| {
+                                matches!(
+                                    envelope.operation,
+                                    ConfigOperation::ActivateFeature { feature: prior_feature }
+                                        if prior_feature == feature
+                                )
+                            })
+                    })
+                {
+                    return Err(RaftError::Busy);
+                }
+            }
         }
         Ok(())
     }
@@ -1723,15 +2196,71 @@ impl RaftNode {
         self.joint = self.base_joint.clone();
         self.joint_enter_index = self.base_joint_enter_index;
         self.addresses = self.base_addresses.clone();
+        self.active_features = self.base_active_features;
+        self.retiring_peers.clear();
         for entry in self
             .log
             .clone()
             .iter()
             .filter(|entry| entry.kind == EntryKind::Config)
         {
-            if self.apply_config_on_append(entry).is_err() {
+            let Ok(envelope) = ConfigEnvelope::decode(&entry.payload) else {
                 break;
+            };
+            match envelope.operation {
+                ConfigOperation::AddLearner { id, address } => {
+                    self.learners.insert(id);
+                    if let Some(address) = address {
+                        self.addresses.insert(id, address);
+                    }
+                }
+                ConfigOperation::RemoveLearner { id } => {
+                    self.learners.remove(&id);
+                    self.addresses.remove(&id);
+                    self.last_contact.remove(&id);
+                }
+                ConfigOperation::UpdateAddress { id, address } => {
+                    self.addresses.insert(id, address);
+                }
+                ConfigOperation::EnterJoint { new_voters } => {
+                    let old = self.voters.clone();
+                    let mut union = old.clone();
+                    union.extend(new_voters.iter().copied());
+                    self.learners.retain(|id| !new_voters.contains(id));
+                    self.joint = Some((old, new_voters));
+                    self.joint_enter_index = Some(entry.index);
+                    self.voters = union;
+                }
+                ConfigOperation::LeaveJoint { enter_index }
+                    if self.joint_enter_index == Some(enter_index) =>
+                {
+                    if let Some((old, new)) = self.joint.take() {
+                        for peer in old
+                            .difference(&new)
+                            .copied()
+                            .filter(|peer| *peer != self.id)
+                        {
+                            self.retiring_peers.insert(peer, entry.index);
+                        }
+                        self.voters = new;
+                    }
+                    self.joint_enter_index = None;
+                    self.addresses.retain(|id, _| {
+                        self.voters.contains(id)
+                            || self.learners.contains(id)
+                            || self.retiring_peers.contains_key(id)
+                    });
+                }
+                ConfigOperation::LeaveJoint { .. }
+                | ConfigOperation::BeginLeaderTransfer { .. }
+                | ConfigOperation::FinishLeaderTransfer { .. }
+                | ConfigOperation::ActivateFeature { .. } => {}
             }
+        }
+        self.last_contact
+            .retain(|id, _| self.voters.contains(id) || self.learners.contains(id));
+        if !self.voters.contains(&self.id) && !self.learners.contains(&self.id) {
+            self.role = Role::Follower;
         }
     }
 
@@ -2019,6 +2548,64 @@ mod tests {
     }
 
     #[test]
+    fn trap_read_barrier_survives_current_term_snapshot_compaction() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(4);
+        leader.log.push(Entry {
+            term: Term::new(4),
+            index: LogIndex::new(1),
+            kind: EntryKind::Noop,
+            payload: Vec::new(),
+        });
+        leader.commit_index = LogIndex::new(1);
+        leader.applied_index = LogIndex::new(1);
+        leader.install_snapshot_state(LogIndex::new(1), Term::new(4));
+        assert!(leader.log.is_empty(), "the current-term proof is compacted");
+        assert!(leader.request_read().is_ok());
+    }
+
+    #[test]
+    fn trap_append_entries_rejects_a_gap_from_a_compacted_leader() {
+        let mut follower = node(2);
+        follower.hard_state.term = Term::new(1);
+        let effects = follower.on_message_at(
+            Message {
+                proto_version: PROTOCOL_VERSION,
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                term: Term::new(1),
+                kind: MessageKind::AppendReq(AppendRequest {
+                    prev_index: LogIndex::new(0),
+                    prev_term: Term::new(0),
+                    entries: vec![Entry {
+                        term: Term::new(1),
+                        index: LogIndex::new(5),
+                        kind: EntryKind::App,
+                        payload: b"gap".to_vec(),
+                    }],
+                    leader_commit: LogIndex::new(5),
+                    read_round: 0,
+                }),
+            },
+            Time::from_nanos(1),
+        );
+        assert!(follower.log.is_empty());
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RaftEffect::PersistEntries(_)))
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RaftEffect::Send(Message {
+                kind: MessageKind::AppendResp(AppendResponse { success: false, .. }),
+                ..
+            })
+        )));
+    }
+
+    #[test]
     fn trap_leave_joint_waits_for_committed_enter_joint() {
         let mut leader = node(1);
         leader.role = Role::Leader;
@@ -2054,8 +2641,9 @@ mod tests {
     }
 
     #[test]
-    fn trap_timer_reset_discipline() {
+    fn trap_stale_append_does_not_reset_but_current_leader_conflict_does() {
         let mut follower = node(2);
+        follower.hard_state.term = Term::new(1);
         let before = follower.election_deadline;
         let effects = follower.on_message_at(
             Message {
@@ -2085,9 +2673,12 @@ mod tests {
                 proto_version: PROTOCOL_VERSION,
                 from: NodeId::new(1),
                 to: NodeId::new(2),
-                term: Term::new(0),
+                term: Term::new(1),
                 kind: MessageKind::AppendReq(AppendRequest {
-                    prev_index: LogIndex::new(0),
+                    // The current leader is valid but this follower is behind,
+                    // so the append is rejected while still suppressing an
+                    // unnecessary election.
+                    prev_index: LogIndex::new(1),
                     prev_term: Term::new(0),
                     entries: Vec::new(),
                     leader_commit: LogIndex::new(0),
@@ -2097,6 +2688,72 @@ mod tests {
             Time::from_nanos(1_000_000_000),
         );
         assert!(follower.election_deadline > Time::from_nanos(1_000_000_000));
+    }
+
+    #[test]
+    fn trap_snapshot_follower_conflict_points_to_first_missing_suffix() {
+        let mut follower = node(2);
+        follower.hard_state.term = Term::new(3);
+        follower.install_snapshot_state(LogIndex::new(45), Term::new(1));
+        let conflict = follower.on_message_at(
+            Message {
+                proto_version: PROTOCOL_VERSION,
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                term: Term::new(3),
+                kind: MessageKind::AppendReq(AppendRequest {
+                    prev_index: LogIndex::new(47),
+                    prev_term: Term::new(3),
+                    entries: Vec::new(),
+                    leader_commit: LogIndex::new(47),
+                    read_round: 0,
+                }),
+            },
+            Time::from_nanos(1_000_000_000),
+        );
+        assert!(conflict.iter().any(|effect| matches!(
+            effect,
+            RaftEffect::Send(Message {
+                kind: MessageKind::AppendResp(AppendResponse {
+                    success: false,
+                    conflict_index,
+                    ..
+                }),
+                ..
+            }) if *conflict_index == LogIndex::new(46)
+        )));
+
+        follower.on_message_at(
+            Message {
+                proto_version: PROTOCOL_VERSION,
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                term: Term::new(3),
+                kind: MessageKind::AppendReq(AppendRequest {
+                    prev_index: LogIndex::new(45),
+                    prev_term: Term::new(1),
+                    entries: vec![
+                        Entry {
+                            term: Term::new(3),
+                            index: LogIndex::new(46),
+                            kind: EntryKind::Noop,
+                            payload: Vec::new(),
+                        },
+                        Entry {
+                            term: Term::new(3),
+                            index: LogIndex::new(47),
+                            kind: EntryKind::Noop,
+                            payload: Vec::new(),
+                        },
+                    ],
+                    leader_commit: LogIndex::new(47),
+                    read_round: 0,
+                }),
+            },
+            Time::from_nanos(1_050_000_000),
+        );
+        assert_eq!(follower.last_index(), LogIndex::new(47));
+        assert_eq!(follower.commit_index, LogIndex::new(47));
     }
 
     #[test]
@@ -2123,9 +2780,9 @@ mod tests {
         assert!(
             effects
                 .iter()
-                .any(|effect| matches!(effect, RaftEffect::Send(_)))
+                .any(|effect| matches!(effect, RaftEffect::ReceiveSnapshotChunk(Message { .. })))
         );
-        assert!(follower.applied_index <= follower.commit_index);
+        assert_eq!(follower.applied_index, LogIndex::new(2));
     }
 
     #[test]
@@ -2147,20 +2804,16 @@ mod tests {
                 done: false,
             },
         };
-        follower.on_message(first.clone());
+        let first_effects = follower.on_message(first.clone());
         let replay = follower.on_message(first);
-        assert_eq!(follower.snapshot_buffer, vec![9]);
+        assert!(
+            first_effects
+                .iter()
+                .any(|effect| matches!(effect, RaftEffect::ReceiveSnapshotChunk(_)))
+        );
         assert!(matches!(
             replay.as_slice(),
-            [RaftEffect::Send(Message {
-                kind: MessageKind::SnapshotAck {
-                    transfer_id: 3,
-                    next_offset: 1,
-                    accepted: true,
-                    reason: None,
-                },
-                ..
-            })]
+            [RaftEffect::ReceiveSnapshotChunk(_)]
         ));
     }
 
@@ -2298,6 +2951,15 @@ mod tests {
         let mut leader = node(1);
         leader.role = Role::Leader;
         leader.hard_state.term = Term::new(1);
+        for id in 1..=4 {
+            leader.addresses.insert(
+                NodeId::new(id),
+                cc_core::PeerAddress::V4 {
+                    ip: [127, 0, 0, 1],
+                    port: 10_000 + id as u16,
+                },
+            );
+        }
         let new_voters = [NodeId::new(2), NodeId::new(3), NodeId::new(4)]
             .into_iter()
             .collect();
@@ -2306,6 +2968,62 @@ mod tests {
         leader.commit_index = leader.last_index();
         leader.leave_joint().expect("leave");
         assert_eq!(leader.role, Role::Follower);
+        assert!(
+            !leader
+                .membership_state()
+                .addresses
+                .contains_key(&NodeId::new(1)),
+            "the final configuration must not publish a removed voter's address"
+        );
+        assert!(leader.membership_state().validate().is_ok());
+    }
+
+    #[test]
+    fn trap_leave_joint_offers_the_final_entry_to_removed_voters() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(1);
+        let new_voters = [NodeId::new(1), NodeId::new(2), NodeId::new(4)]
+            .into_iter()
+            .collect();
+        leader.enter_joint(new_voters).expect("joint");
+        leader.commit_index = leader.last_index();
+        leader
+            .next_index
+            .insert(NodeId::new(3), LogIndex::new(leader.last_index().get() + 1));
+        let effects = leader.leave_joint().expect("leave");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                RaftEffect::Send(Message {
+                    to,
+                    kind: MessageKind::AppendReq(AppendRequest { entries, .. }),
+                    ..
+                }) if *to == NodeId::new(3) && entries.iter().any(|entry| {
+                    ConfigEnvelope::decode(&entry.payload).is_ok_and(|envelope| matches!(
+                        envelope.operation,
+                        ConfigOperation::LeaveJoint { .. }
+                    ))
+                })
+            )),
+            "removed voter did not receive the terminal LeaveJoint append"
+        );
+        assert!(leader.has_retiring_peers());
+        let terminal = leader.last_index();
+        leader.on_message(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(3),
+            to: NodeId::new(1),
+            term: Term::new(1),
+            kind: MessageKind::AppendResp(AppendResponse {
+                success: true,
+                match_index: terminal,
+                conflict_term: None,
+                conflict_index: LogIndex::new(0),
+                read_round: 0,
+            }),
+        });
+        assert!(!leader.has_retiring_peers());
     }
 
     #[test]
@@ -2342,6 +3060,29 @@ mod tests {
         leader.enter_joint(new_voters).expect("joint");
         leader.install_snapshot_state(LogIndex::new(1), Term::new(1));
         assert!(leader.joint_active());
+    }
+
+    #[test]
+    fn trap_checkpoint_uses_applied_membership_not_appended_leave() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(1);
+        leader
+            .enter_joint(
+                [NodeId::new(1), NodeId::new(2), NodeId::new(4)]
+                    .into_iter()
+                    .collect(),
+            )
+            .expect("joint");
+        let enter = leader.last_index();
+        leader.commit_index = enter;
+        leader.applied_index = enter;
+        leader.leave_joint().expect("appended leave");
+        assert!(!leader.joint_active(), "live suffix includes LeaveJoint");
+        assert!(
+            leader.membership_state_at(enter).joint.is_some(),
+            "the checkpoint boundary still owns the unfinished admin workflow"
+        );
     }
 
     #[test]
@@ -2396,7 +3137,7 @@ mod tests {
     }
 
     #[test]
-    fn trap_learner_append_response_cannot_commit() {
+    fn trap_learner_never_counts_toward_quorum() {
         let mut leader = node(1);
         leader.role = Role::Leader;
         leader.hard_state.term = Term::new(2);
@@ -2420,8 +3161,115 @@ mod tests {
                 read_round: 0,
             }),
         });
-        assert!(effects.is_empty());
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RaftEffect::Apply(_))),
+            "a learner acknowledgement may drive further replication, never commit"
+        );
         assert_eq!(leader.commit_index, LogIndex::new(0));
+    }
+
+    #[test]
+    fn trap_learner_add_and_promotion_are_replicated_config_transitions() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(2);
+        let add = leader.add_learner(NodeId::new(4)).expect("add learner");
+        assert!(matches!(
+            add.first(),
+            Some(RaftEffect::PersistEntries(entries)) if matches!(
+                entries.as_slice(),
+                [Entry { kind: EntryKind::Config, payload, .. }]
+                if matches!(ConfigEnvelope::decode(payload), Ok(ConfigEnvelope {
+                    operation: ConfigOperation::AddLearner { id, address: None }, ..
+                }) if id == NodeId::new(4))
+            )
+        ));
+        assert!(leader.learners.contains(&NodeId::new(4)));
+        leader.commit_index = leader.last_index();
+        let _ = leader.apply_committed();
+        leader
+            .match_index
+            .insert(NodeId::new(4), leader.last_index());
+        let promote = leader.promote_learner(NodeId::new(4)).expect("promote");
+        assert!(matches!(
+            promote.first(),
+            Some(RaftEffect::PersistEntries(entries)) if matches!(
+                entries.as_slice(),
+                [Entry { kind: EntryKind::Config, payload, .. }]
+                if matches!(ConfigEnvelope::decode(payload), Ok(ConfigEnvelope {
+                    operation: ConfigOperation::EnterJoint { .. }, ..
+                }))
+            )
+        ));
+        assert!(leader.joint_active());
+        assert!(!leader.learners.contains(&NodeId::new(4)));
+        assert!(leader.voters.contains(&NodeId::new(4)));
+    }
+
+    #[test]
+    fn trap_promotion_refuses_a_lagging_learner() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(2);
+        leader.add_learner(NodeId::new(4)).expect("learner");
+        leader.log.push(Entry {
+            term: Term::new(2),
+            index: LogIndex::new(leader.last_index().get() + 1),
+            kind: EntryKind::App,
+            payload: b"not-on-learner".to_vec(),
+        });
+        leader.match_index.insert(NodeId::new(4), LogIndex::new(1));
+        assert_eq!(leader.promote_learner(NodeId::new(4)), Err(RaftError::Busy));
+        assert!(leader.learners.contains(&NodeId::new(4)));
+        assert!(!leader.voters.contains(&NodeId::new(4)));
+    }
+
+    #[test]
+    fn trap_second_config_change_is_rejected_while_one_is_in_flight() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(2);
+        leader
+            .enter_joint(
+                [NodeId::new(1), NodeId::new(2), NodeId::new(4)]
+                    .into_iter()
+                    .collect(),
+            )
+            .expect("first transition");
+        assert!(leader.joint_active());
+        assert!(leader.add_learner(NodeId::new(5)).is_err());
+        assert!(
+            leader.joint_active(),
+            "rejection mutated the first workflow"
+        );
+    }
+
+    #[test]
+    fn trap_atomic_batch_feature_changes_only_when_activation_commits() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(1);
+        let effects = leader
+            .activate_feature(cc_core::ATOMIC_BATCH_FEATURE, Time::from_nanos(1))
+            .expect("activation append");
+        assert_eq!(leader.active_features(), 0, "append is not activation");
+        let entry = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RaftEffect::PersistEntries(entries) => entries.first().cloned(),
+                _ => None,
+            })
+            .expect("activation persistence");
+        leader
+            .apply_committed_config(&entry)
+            .expect("activation commit");
+        assert_eq!(
+            leader.active_features(),
+            cc_core::ATOMIC_BATCH_FEATURE,
+            "client admission changes only at the committed transition"
+        );
     }
 
     #[test]
@@ -2457,6 +3305,79 @@ mod tests {
             kind: MessageKind::VoteResp { granted: true },
         });
         assert_eq!(candidate.role, Role::Leader);
+    }
+
+    #[test]
+    fn trap_new_leader_resumes_committed_joint_admin_workflow() {
+        let mut candidate = node(1);
+        candidate.role = Role::Leader;
+        candidate.hard_state.term = Term::new(1);
+        candidate
+            .last_contact
+            .insert(NodeId::new(2), Time::from_nanos(120));
+        candidate
+            .last_contact
+            .insert(NodeId::new(3), Time::from_nanos(120));
+        let admin = SessionKey::new(
+            SessionNamespace::AdminRequest as u8,
+            cc_core::ClientId::new(41),
+        )
+        .expect("admin session");
+        let enter = candidate
+            .propose_admin_config(ConfigEnvelope {
+                admin_session: Some((admin, 7)),
+                leader_time: Time::from_nanos(123),
+                operation: ConfigOperation::EnterJoint {
+                    new_voters: [NodeId::new(1), NodeId::new(2)].into_iter().collect(),
+                },
+            })
+            .expect("enter joint");
+        let enter_index = enter
+            .iter()
+            .find_map(|effect| match effect {
+                RaftEffect::PersistEntries(entries) => entries.first().map(|entry| entry.index),
+                _ => None,
+            })
+            .expect("enter index");
+        candidate.commit_index = enter_index;
+        candidate.role = Role::Follower;
+        candidate.hard_state.term = Term::new(1);
+
+        let election = candidate.start_election();
+        assert!(
+            election
+                .iter()
+                .any(|effect| matches!(effect, RaftEffect::PersistHard(_)))
+        );
+        let effects = candidate.on_message(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(2),
+            to: NodeId::new(1),
+            term: Term::new(2),
+            kind: MessageKind::VoteResp { granted: true },
+        });
+
+        let leave = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                RaftEffect::PersistEntries(entries) => Some(entries.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .find_map(|entry| ConfigEnvelope::decode(&entry.payload).ok())
+            .filter(|envelope| {
+                envelope.admin_session == Some((admin, 7))
+                    && envelope.leader_time == Time::from_nanos(123)
+                    && matches!(
+                        envelope.operation,
+                        ConfigOperation::LeaveJoint { enter_index: index } if index == enter_index
+                    )
+            });
+        assert!(
+            leave.is_some(),
+            "the new leader must append the paired leave"
+        );
+        assert!(!candidate.joint_active());
     }
 
     #[test]
@@ -2535,6 +3456,35 @@ mod tests {
     }
 
     #[test]
+    fn trap_join_discovery_membership_never_grants_a_vote() {
+        let mut joining = RaftNode::new(
+            NodeId::new(9),
+            voters(),
+            Seed::new(9),
+            RaftConfig::default(),
+        );
+        assert_eq!(joining.role, Role::Learner);
+        let effects = joining.on_message(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(1),
+            to: NodeId::new(9),
+            term: Term::new(1),
+            kind: MessageKind::VoteReq {
+                last_index: LogIndex::new(0),
+                last_term: Term::new(0),
+            },
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RaftEffect::Send(Message {
+                kind: MessageKind::VoteResp { granted: false },
+                ..
+            })
+        )));
+        assert_ne!(joining.hard_state.voted_for, Some(NodeId::new(1)));
+    }
+
+    #[test]
     fn trap_membership_recovers_from_log_and_snapshot() {
         let snapshot_membership = MembershipState {
             voters: [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
@@ -2543,6 +3493,7 @@ mod tests {
             learners: [NodeId::new(4)].into_iter().collect(),
             joint: None,
             addresses: BTreeMap::new(),
+            active_features: 0,
         };
         let mut recovered = node(1);
         recovered
@@ -2563,10 +3514,61 @@ mod tests {
             }
             .encode(),
         });
+        let checkpoint_base = recovered.membership_state_at(LogIndex::new(8));
+        assert!(checkpoint_base.learners.contains(&NodeId::new(4)));
+        assert!(!checkpoint_base.voters.contains(&NodeId::new(4)));
+        let with_suffix = recovered.membership_state_at(LogIndex::new(9));
+        assert!(with_suffix.joint.is_some());
+        assert!(with_suffix.voters.contains(&NodeId::new(4)));
         recovered.rebuild_membership_from_log();
         assert!(recovered.joint_active());
         assert!(recovered.voters.contains(&NodeId::new(4)));
         assert!(!recovered.learners.contains(&NodeId::new(4)));
+    }
+
+    #[test]
+    fn trap_replicated_address_book_beats_stale_local_config() {
+        let mut leader = node(1);
+        let stale = cc_core::PeerAddress::V4 {
+            ip: [127, 0, 0, 1],
+            port: 7202,
+        };
+        let committed = cc_core::PeerAddress::V4 {
+            ip: [127, 0, 0, 1],
+            port: 8202,
+        };
+        let mut base = leader.membership_state();
+        base.addresses.insert(NodeId::new(2), stale);
+        leader
+            .restore_membership_state(base.clone())
+            .expect("bootstrap address");
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(2);
+        leader
+            .propose_admin_config(ConfigEnvelope {
+                admin_session: Some((
+                    SessionKey::new(
+                        SessionNamespace::AdminRequest as u8,
+                        cc_core::ClientId::new(7),
+                    )
+                    .expect("admin"),
+                    1,
+                )),
+                leader_time: Time::from_nanos(9),
+                operation: ConfigOperation::UpdateAddress {
+                    id: NodeId::new(2),
+                    address: committed.clone(),
+                },
+            })
+            .expect("replicated update");
+        leader
+            .restore_membership_state(base)
+            .expect("stale local recovery base");
+        leader.replay_retained_membership_suffix();
+        assert_eq!(
+            leader.membership_state().addresses.get(&NodeId::new(2)),
+            Some(&committed)
+        );
     }
 
     #[test]
@@ -2672,6 +3674,7 @@ mod tests {
             })
         )));
         leader.match_index.insert(NodeId::new(2), intent);
+        leader.commit_index = intent;
         let entry = leader.log.last().expect("intent entry").clone();
         let committed = leader.apply_committed_config(&entry).expect("apply intent");
         assert_eq!(
@@ -2686,6 +3689,91 @@ mod tests {
                 kind: MessageKind::TimeoutNow { intent_index },
                 ..
             }) if *to == NodeId::new(2) && *intent_index == intent
+        )));
+        let retry = leader.tick(Time::from_nanos(20));
+        assert!(
+            retry.iter().any(|effect| matches!(
+                effect,
+                RaftEffect::Send(Message {
+                    to,
+                    kind: MessageKind::TimeoutNow { intent_index },
+                    ..
+                }) if *to == NodeId::new(2) && *intent_index == intent
+            )),
+            "heartbeat must retry a lost TimeoutNow"
+        );
+    }
+
+    #[test]
+    fn trap_transfer_triggers_when_target_catches_up_after_intent_apply() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(2);
+        leader.log.push(Entry {
+            term: Term::new(2),
+            index: LogIndex::new(1),
+            kind: EntryKind::Noop,
+            payload: Vec::new(),
+        });
+        leader.match_index.insert(NodeId::new(2), LogIndex::new(1));
+        leader
+            .begin_leadership_transfer(NodeId::new(2), Time::from_nanos(10))
+            .expect("intent append");
+        let intent = leader.last_index();
+        leader.commit_index = intent;
+        let entry = leader.log.last().expect("intent").clone();
+        let at_apply = leader.apply_committed_config(&entry).expect("intent apply");
+        assert!(at_apply.is_empty(), "target is still one entry behind");
+        let effects = leader.append_response_from_peer(
+            NodeId::new(2),
+            AppendResponse {
+                success: true,
+                match_index: intent,
+                conflict_term: None,
+                conflict_index: LogIndex::new(0),
+                read_round: 0,
+            },
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RaftEffect::Send(Message {
+                to,
+                kind: MessageKind::TimeoutNow { intent_index },
+                ..
+            }) if *to == NodeId::new(2) && *intent_index == intent
+        )));
+    }
+
+    #[test]
+    fn trap_transfer_to_current_leader_finishes_durably() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(2);
+        let begin = leader
+            .begin_leadership_transfer(NodeId::new(1), Time::from_nanos(10))
+            .expect("durable begin even when the desired leader already leads");
+        let entry = begin
+            .iter()
+            .find_map(|effect| match effect {
+                RaftEffect::PersistEntries(entries) => entries.first().cloned(),
+                _ => None,
+            })
+            .expect("begin entry");
+        let finish = leader
+            .apply_committed_config(&entry)
+            .expect("already-satisfied transfer");
+        assert!(finish.iter().any(|effect| matches!(
+            effect,
+            RaftEffect::PersistEntries(entries) if entries.iter().any(|entry| matches!(
+                ConfigEnvelope::decode(&entry.payload),
+                Ok(ConfigEnvelope {
+                    operation: ConfigOperation::FinishLeaderTransfer {
+                        result: TransferResult::Success,
+                        ..
+                    },
+                    ..
+                })
+            ))
         )));
     }
 
@@ -2750,7 +3838,7 @@ mod tests {
     }
 
     #[test]
-    fn trap_leadership_transfer_recovers_or_finishes_after_crash() {
+    fn trap_admin_transfer_reports_success_only_after_target_leads() {
         let mut original = node(1);
         original.role = Role::Leader;
         original.hard_state.term = Term::new(3);
