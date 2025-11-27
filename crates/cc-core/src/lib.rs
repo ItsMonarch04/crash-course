@@ -278,6 +278,12 @@ pub enum DelayDist {
         long: Duration,
         long_chance: P16,
     },
+    /// An integer-only empirical CDF represented by repeated equiprobable
+    /// buckets. `count` selects the canonical prefix; unused slots are zero.
+    Empirical {
+        buckets: [Duration; 16],
+        count: u8,
+    },
 }
 
 impl Default for DelayDist {
@@ -379,6 +385,10 @@ impl Xoshiro256pp {
                     short
                 }
             }
+            DelayDist::Empirical { buckets, count } => {
+                let count = usize::from(count.clamp(1, 16));
+                buckets[self.range_u64(0, count as u64) as usize]
+            }
         }
     }
 }
@@ -417,6 +427,44 @@ pub struct HostLimits {
     pub max_manifest_record_bytes: u32,
     pub max_threads: usize,
     pub thread_stack_bytes: usize,
+    pub max_peer_frame_bytes: u64,
+    pub max_uncommitted_entries: u64,
+    pub max_uncommitted_bytes: u64,
+    pub max_log_bytes_before_snapshot: u64,
+    pub max_raft_log_bytes: u64,
+    pub max_store_wal_bytes: u64,
+    pub max_data_dir_bytes: u64,
+    pub maintenance_reserve_bytes: u64,
+    pub max_snapshot_chunk_bytes: u64,
+    pub max_snapshot_staging_bytes: u64,
+    pub max_snapshot_pins: u64,
+    pub max_checkpoint_builder_bytes: u64,
+    pub max_pending_reads: u64,
+    pub max_pending_read_bytes: u64,
+    pub max_pending_client_routes: u64,
+    pub max_host_connections: u64,
+    pub max_open_files: u64,
+    pub max_host_thread_stack_bytes: u64,
+    pub max_host_input_bytes: u64,
+    pub max_host_total_input_bytes: u64,
+    pub max_host_output_bytes: u64,
+    pub max_host_total_output_bytes: u64,
+    pub max_host_queued_requests: u64,
+    pub max_host_total_queued_requests: u64,
+    pub max_driver_pending_effects: u64,
+    pub max_driver_pending_effect_bytes: u64,
+    pub max_network_inflight_bytes: u64,
+    pub max_fault_replay_bytes: u64,
+    pub max_memtable_bytes: u64,
+    pub max_frozen_memtables: u64,
+    pub max_sst_files: u64,
+    pub max_referenced_sst_bytes: u64,
+    pub max_sst_metadata_bytes: u64,
+    pub max_manifest_generations: u64,
+    pub max_compaction_builder_bytes: u64,
+    pub max_history_operations: u64,
+    pub max_history_bytes: u64,
+    pub max_failure_artifact_bytes: u64,
 }
 
 impl Default for HostLimits {
@@ -431,19 +479,66 @@ impl Default for HostLimits {
             max_events: 2_000_000,
             max_events_per_instant: 100_000,
             max_trace_bytes: 64 * 1024 * 1024,
-            max_snapshot_bytes: 1024 * 1024 * 1024,
+            max_snapshot_bytes: 4 * 1024 * 1024 * 1024,
             max_block_read_bytes: 4 * 1024 * 1024,
-            max_manifest_record_bytes: 4 * 1024 * 1024,
-            max_threads: 128,
-            thread_stack_bytes: 2 * 1024 * 1024,
+            max_manifest_record_bytes: 256 * 1024 * 1024,
+            max_threads: 2_100,
+            thread_stack_bytes: 256 * 1024,
+            max_peer_frame_bytes: 4 * 1024 * 1024,
+            max_uncommitted_entries: 4_096,
+            max_uncommitted_bytes: 64 * 1024 * 1024,
+            max_log_bytes_before_snapshot: 64 * 1024 * 1024,
+            max_raft_log_bytes: 256 * 1024 * 1024,
+            max_store_wal_bytes: 256 * 1024 * 1024,
+            max_data_dir_bytes: 16 * 1024 * 1024 * 1024,
+            maintenance_reserve_bytes: 5 * 1024 * 1024 * 1024,
+            max_snapshot_chunk_bytes: 1024 * 1024,
+            max_snapshot_staging_bytes: 5 * 1024 * 1024 * 1024,
+            max_snapshot_pins: 4,
+            max_checkpoint_builder_bytes: 2 * 1024 * 1024,
+            max_pending_reads: 1_024,
+            max_pending_read_bytes: 64 * 1024 * 1024,
+            max_pending_client_routes: 4_096,
+            max_host_connections: 1_024,
+            max_open_files: 4_096,
+            max_host_thread_stack_bytes: 525 * 1024 * 1024,
+            max_host_input_bytes: 16 * 1024 * 1024,
+            max_host_total_input_bytes: 64 * 1024 * 1024,
+            max_host_output_bytes: 16 * 1024 * 1024,
+            max_host_total_output_bytes: 64 * 1024 * 1024,
+            max_host_queued_requests: 1_024,
+            max_host_total_queued_requests: 16_384,
+            max_driver_pending_effects: 16_384,
+            max_driver_pending_effect_bytes: 128 * 1024 * 1024,
+            max_network_inflight_bytes: 256 * 1024 * 1024,
+            max_fault_replay_bytes: 16 * 1024 * 1024,
+            max_memtable_bytes: 64 * 1024 * 1024,
+            max_frozen_memtables: 2,
+            max_sst_files: 16_384,
+            max_referenced_sst_bytes: 5 * 1024 * 1024 * 1024,
+            max_sst_metadata_bytes: 240 * 1024 * 1024,
+            max_manifest_generations: 64,
+            max_compaction_builder_bytes: 16 * 1024 * 1024,
+            max_history_operations: 100_000,
+            max_history_bytes: 256 * 1024 * 1024,
+            max_failure_artifact_bytes: 64 * 1024 * 1024,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LimitError {
+    pub field: &'static str,
+}
+
 impl HostLimits {
     #[must_use]
-    pub const fn is_valid(self) -> bool {
-        self.max_pending_peer > 0
+    pub fn is_valid(self) -> bool {
+        self.validate().is_ok()
+    }
+
+    pub fn validate(self) -> Result<(), LimitError> {
+        let nonzero = self.max_pending_peer > 0
             && self.max_pending_timer > 0
             && self.max_pending_io > 0
             && self.max_pending_client > 0
@@ -456,7 +551,108 @@ impl HostLimits {
             && self.max_block_read_bytes > 0
             && self.max_manifest_record_bytes > 0
             && self.max_threads > 0
-            && self.thread_stack_bytes > 0
+            && self.thread_stack_bytes > 0;
+        if !nonzero {
+            return Err(LimitError {
+                field: "host admission limit",
+            });
+        }
+        macro_rules! require_nonzero {
+            ($($field:ident),+ $(,)?) => {
+                $(if self.$field == 0 { return Err(LimitError { field: stringify!($field) }); })+
+            };
+        }
+        require_nonzero!(
+            max_peer_frame_bytes,
+            max_uncommitted_entries,
+            max_uncommitted_bytes,
+            max_log_bytes_before_snapshot,
+            max_raft_log_bytes,
+            max_store_wal_bytes,
+            max_data_dir_bytes,
+            maintenance_reserve_bytes,
+            max_snapshot_chunk_bytes,
+            max_snapshot_staging_bytes,
+            max_snapshot_pins,
+            max_checkpoint_builder_bytes,
+            max_pending_reads,
+            max_pending_read_bytes,
+            max_pending_client_routes,
+            max_host_connections,
+            max_open_files,
+            max_host_thread_stack_bytes,
+            max_host_input_bytes,
+            max_host_total_input_bytes,
+            max_host_output_bytes,
+            max_host_total_output_bytes,
+            max_host_queued_requests,
+            max_host_total_queued_requests,
+            max_driver_pending_effects,
+            max_driver_pending_effect_bytes,
+            max_network_inflight_bytes,
+            max_fault_replay_bytes,
+            max_memtable_bytes,
+            max_frozen_memtables,
+            max_sst_files,
+            max_referenced_sst_bytes,
+            max_sst_metadata_bytes,
+            max_manifest_generations,
+            max_compaction_builder_bytes,
+            max_history_operations,
+            max_history_bytes,
+            max_failure_artifact_bytes,
+        );
+        let relationships = [
+            (
+                self.max_snapshot_chunk_bytes <= self.max_peer_frame_bytes,
+                "max_snapshot_chunk_bytes",
+            ),
+            (
+                self.max_snapshot_chunk_bytes <= self.max_checkpoint_builder_bytes,
+                "max_checkpoint_builder_bytes",
+            ),
+            (
+                self.max_log_bytes_before_snapshot < self.max_raft_log_bytes,
+                "max_log_bytes_before_snapshot",
+            ),
+            (
+                self.max_snapshot_bytes <= self.max_snapshot_staging_bytes,
+                "max_snapshot_staging_bytes",
+            ),
+            (
+                self.max_host_input_bytes <= self.max_host_total_input_bytes,
+                "max_host_total_input_bytes",
+            ),
+            (
+                self.max_host_output_bytes <= self.max_host_total_output_bytes,
+                "max_host_total_output_bytes",
+            ),
+            (
+                self.max_host_queued_requests <= self.max_host_total_queued_requests,
+                "max_host_total_queued_requests",
+            ),
+            (
+                u64::try_from(self.max_threads)
+                    .unwrap_or(u64::MAX)
+                    .checked_mul(u64::try_from(self.thread_stack_bytes).unwrap_or(u64::MAX))
+                    .is_some_and(|total| total <= self.max_host_thread_stack_bytes),
+                "max_host_thread_stack_bytes",
+            ),
+            (
+                self.max_data_dir_bytes
+                    >= self
+                        .max_referenced_sst_bytes
+                        .saturating_mul(2)
+                        .saturating_add(self.max_raft_log_bytes)
+                        .saturating_add(self.max_store_wal_bytes)
+                        .saturating_add(self.max_snapshot_staging_bytes),
+                "max_data_dir_bytes",
+            ),
+        ];
+        if let Some((_, field)) = relationships.iter().find(|(valid, _)| !valid) {
+            return Err(LimitError { field });
+        }
+        Ok(())
     }
 }
 
@@ -752,10 +948,15 @@ pub struct MembershipState {
     pub learners: BTreeSet<NodeId>,
     pub joint: Option<JointMembership>,
     pub addresses: BTreeMap<NodeId, PeerAddress>,
+    /// Monotonic, replicated semantic capabilities. Feature activation is
+    /// intentionally membership state so CCSN/genesis recovery cannot turn a
+    /// committed semantic fence back into a local preference.
+    pub active_features: u64,
 }
 
 pub const MEMBERSHIP_MAGIC: u32 = u32::from_le_bytes(*b"CCMS");
-pub const MEMBERSHIP_FORMAT_VERSION: u16 = 1;
+pub const MEMBERSHIP_FORMAT_VERSION: u16 = 2;
+pub const ATOMIC_BATCH_FEATURE: u64 = 1 << 1;
 
 impl MembershipState {
     pub fn new(voters: BTreeSet<NodeId>) -> Result<Self, DecodeError> {
@@ -764,6 +965,7 @@ impl MembershipState {
             learners: BTreeSet::new(),
             joint: None,
             addresses: BTreeMap::new(),
+            active_features: 0,
         };
         state.validate()?;
         Ok(state)
@@ -775,6 +977,7 @@ impl MembershipState {
             || self.learners.iter().any(|id| id.get() == 0)
             || !self.voters.is_disjoint(&self.learners)
             || self.voters.len() + self.learners.len() > 4_096
+            || self.active_features & !ATOMIC_BATCH_FEATURE != 0
         {
             return Err(DecodeError::InvalidTag { offset: 0, tag: 0 });
         }
@@ -826,6 +1029,7 @@ impl MembershipState {
             enc.u64(id.get());
             address.encode(&mut enc);
         }
+        enc.u64(self.active_features);
         let mut bytes = enc.finish();
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         let crc = crc32c_zeroed_tail(&bytes);
@@ -850,7 +1054,20 @@ impl MembershipState {
             });
         }
         let mut dec = Dec::new(&bytes[..body_len]);
-        dec.header(MEMBERSHIP_MAGIC, MEMBERSHIP_FORMAT_VERSION)?;
+        let magic = dec.u32()?;
+        let version = dec.u16()?;
+        if magic != MEMBERSHIP_MAGIC {
+            return Err(DecodeError::InvalidMagic {
+                expected: MEMBERSHIP_MAGIC,
+                actual: magic,
+            });
+        }
+        if !matches!(version, 1 | MEMBERSHIP_FORMAT_VERSION) {
+            return Err(DecodeError::InvalidVersion {
+                expected: MEMBERSHIP_FORMAT_VERSION,
+                actual: version,
+            });
+        }
         let voters = decode_member_set(&mut dec, false)?;
         let learners = decode_member_set(&mut dec, true)?;
         let joint = match dec.u8()? {
@@ -886,12 +1103,14 @@ impl MembershipState {
                 });
             }
         }
+        let active_features = if version == 1 { 0 } else { dec.u64()? };
         dec.finish()?;
         let state = Self {
             voters,
             learners,
             joint,
             addresses,
+            active_features,
         };
         state.validate()?;
         Ok(state)
@@ -923,6 +1142,9 @@ pub enum ConfigOperation {
     FinishLeaderTransfer {
         intent_index: LogIndex,
         result: TransferResult,
+    },
+    ActivateFeature {
+        feature: u64,
     },
 }
 
@@ -956,6 +1178,7 @@ impl ConfigOperation {
             Self::LeaveJoint { .. } => 5,
             Self::BeginLeaderTransfer { .. } => 6,
             Self::FinishLeaderTransfer { .. } => 7,
+            Self::ActivateFeature { .. } => 8,
         }
     }
 
@@ -983,6 +1206,7 @@ impl ConfigOperation {
                 enc.u64(intent_index.get());
                 enc.u8(*result as u8);
             }
+            Self::ActivateFeature { feature } => enc.u64(*feature),
         }
         enc.finish()
     }
@@ -1014,6 +1238,16 @@ impl ConfigOperation {
                 intent_index: decode_nonzero_index(&mut dec)?,
                 result: TransferResult::decode(dec.u8()?)?,
             },
+            8 => {
+                let feature = dec.u64()?;
+                if feature != ATOMIC_BATCH_FEATURE {
+                    return Err(DecodeError::InvalidTag {
+                        offset: dec.position().saturating_sub(8),
+                        tag: 8,
+                    });
+                }
+                Self::ActivateFeature { feature }
+            }
             _ => return Err(DecodeError::InvalidTag { offset: 0, tag }),
         };
         dec.finish()?;
@@ -1188,7 +1422,7 @@ impl AdminReply {
         let mut dec = Dec::new(&bytes[..body_len]);
         dec.header(ADMIN_REPLY_MAGIC, CONFIG_FORMAT_VERSION)?;
         let operation_tag = dec.u8()?;
-        if !(1..=7).contains(&operation_tag) {
+        if !(1..=8).contains(&operation_tag) {
             return Err(DecodeError::InvalidTag {
                 offset: dec.position() - 1,
                 tag: operation_tag,
@@ -1554,7 +1788,44 @@ impl<'a> Dec<'a> {
 /// CRC-32C (Castagnoli), kept dependency-free for the core vocabulary crate.
 #[must_use]
 pub fn crc32c(bytes: &[u8]) -> u32 {
-    crc32c_with_zeroed_tail(bytes, false)
+    let mut state = Crc32c::new();
+    state.update(bytes);
+    state.finish()
+}
+
+/// Incremental CRC-32C (Castagnoli) state.  Streaming persisted formats use
+/// this instead of retaining an entire file solely to calculate its checksum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Crc32c {
+    state: u32,
+}
+
+impl Crc32c {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { state: u32::MAX }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.state ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = 0u32.wrapping_sub(self.state & 1);
+                self.state = (self.state >> 1) ^ (0x82f6_3b78 & mask);
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn finish(self) -> u32 {
+        !self.state
+    }
+}
+
+impl Default for Crc32c {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// CRC-32C over a record whose final four-byte checksum field is treated as
@@ -1566,7 +1837,7 @@ pub fn crc32c_zeroed_tail(bytes: &[u8]) -> u32 {
 }
 
 fn crc32c_with_zeroed_tail(bytes: &[u8], zero_tail: bool) -> u32 {
-    let mut crc = u32::MAX;
+    let mut crc = Crc32c::new();
     let zero_from = bytes.len().saturating_sub(4);
     for (index, original) in bytes.iter().enumerate() {
         let byte = if zero_tail && index >= zero_from {
@@ -1574,13 +1845,9 @@ fn crc32c_with_zeroed_tail(bytes: &[u8], zero_tail: bool) -> u32 {
         } else {
             *original
         };
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
-        }
+        crc.update(&[byte]);
     }
-    !crc
+    crc.finish()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1653,7 +1920,11 @@ impl EventKind {
         }
     }
 
-    fn from_code(code: u8) -> Option<Self> {
+    /// Resolve a stable CCTR registry code. Readers that provide diagnostic
+    /// forward compatibility may retain an unknown code rather than treating
+    /// it as an event payload schema they understand.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<Self> {
         Some(match code {
             1 => Self::NetSend,
             2 => Self::NetRecv,
@@ -2131,6 +2402,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            active_features: 0,
         };
         let bytes = state.encode().expect("membership encode");
         assert_eq!(&bytes[..4], b"CCMS");
@@ -2150,5 +2422,44 @@ mod tests {
             ..HostLimits::default()
         };
         assert!(!invalid.is_valid());
+    }
+
+    #[test]
+    fn trap_invalid_limits_fail_boot() {
+        let invalid = HostLimits {
+            max_snapshot_chunk_bytes: HostLimits::default().max_peer_frame_bytes + 1,
+            ..HostLimits::default()
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(LimitError {
+                field: "max_snapshot_chunk_bytes"
+            })
+        );
+
+        let invalid = HostLimits {
+            max_host_output_bytes: HostLimits::default().max_host_total_output_bytes + 1,
+            ..HostLimits::default()
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(LimitError {
+                field: "max_host_total_output_bytes"
+            })
+        );
+    }
+
+    #[test]
+    fn trap_wasm_accepts_stream_totals_larger_than_usize() {
+        // Stream totals are retained as u64 and are never converted to one
+        // allocation-sized usize at boot.  Four GiB therefore remains a
+        // valid configuration even for a wasm32 host; only independently
+        // bounded chunks and builders need to fit one allocation.
+        let limits = HostLimits::default();
+        assert_eq!(limits.max_snapshot_bytes, 4_u64 * 1024 * 1024 * 1024);
+        assert!(limits.max_snapshot_bytes > u64::from(u32::MAX));
+        assert!(limits.validate().is_ok());
+        assert!(limits.max_snapshot_chunk_bytes <= u64::from(u32::MAX));
+        assert!(limits.max_checkpoint_builder_bytes <= u64::from(u32::MAX));
     }
 }

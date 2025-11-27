@@ -56,8 +56,17 @@ pub enum DurableRecord {
     Genesis(Box<Genesis>),
     Hard(HardState),
     Append(Entry),
-    Truncate { from: LogIndex },
+    Truncate {
+        from: LogIndex,
+    },
+    /// A locally-created checkpoint. Its position must already exist in the
+    /// durable Raft log before the mark can retire that prefix.
     SnapshotMark(SnapshotMark),
+    /// A checkpoint installed from a leader. A follower may not retain the
+    /// covered log prefix, so the verified checkpoint itself is the durable
+    /// proof of the supplied base position. Hosts validate the referenced
+    /// file before accepting recovery from this record.
+    InstalledSnapshotMark(SnapshotMark),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -437,13 +446,18 @@ fn apply_record(state: &mut LogState, record: &DurableRecord) -> Result<(), LogE
             }
             state.entries.retain(|entry| entry.index < *from);
         }
-        DurableRecord::SnapshotMark(mark) => {
+        DurableRecord::SnapshotMark(mark) | DurableRecord::InstalledSnapshotMark(mark) => {
+            let installed = matches!(record, DurableRecord::InstalledSnapshotMark(_));
             if mark.index.get() == 0
                 || mark.index < state.base_index
-                || state.term_at(mark.index) != Some(mark.term)
                 || state
                     .snapshot
                     .is_some_and(|prior| mark.index <= prior.index)
+                || (!installed && state.term_at(mark.index) != Some(mark.term))
+                || (installed
+                    && state
+                        .term_at(mark.index)
+                        .is_some_and(|term| term != mark.term))
             {
                 return Err(LogError::Invalid("invalid snapshot mark"));
             }
@@ -494,6 +508,16 @@ fn encode_record(record: &DurableRecord) -> Result<Vec<u8>, LogError> {
                 return Err(LogError::Invalid("zero snapshot index"));
             }
             enc.u8(5);
+            enc.u64(mark.index.get());
+            enc.u64(mark.term.get());
+            enc.u64(mark.generation);
+            enc.u32(mark.crc32c);
+        }
+        DurableRecord::InstalledSnapshotMark(mark) => {
+            if mark.index.get() == 0 {
+                return Err(LogError::Invalid("zero snapshot index"));
+            }
+            enc.u8(6);
             enc.u64(mark.index.get());
             enc.u64(mark.term.get());
             enc.u64(mark.generation);
@@ -557,6 +581,18 @@ fn decode_record(bytes: &[u8]) -> Result<DurableRecord, LogError> {
                 return Err(LogError::Invalid("zero snapshot index"));
             }
             DurableRecord::SnapshotMark(SnapshotMark {
+                index,
+                term: Term::new(dec.u64()?),
+                generation: dec.u64()?,
+                crc32c: dec.u32()?,
+            })
+        }
+        6 => {
+            let index = LogIndex::new(dec.u64()?);
+            if index.get() == 0 {
+                return Err(LogError::Invalid("zero snapshot index"));
+            }
+            DurableRecord::InstalledSnapshotMark(SnapshotMark {
                 index,
                 term: Term::new(dec.u64()?),
                 generation: dec.u64()?,
@@ -673,8 +709,10 @@ mod tests {
         assert!(ordered.len() > 1, "fixture must roll WAL segments");
         let mut enumerated = ordered.clone();
         enumerated.reverse();
+        let canonical = Log::recover(&ordered, small_config).expect("ordered recovery");
         let recovered = Log::recover(&enumerated, small_config).expect("sorted recovery");
-        assert_eq!(recovered.segments, ordered);
+        assert_eq!(recovered.state, canonical.state);
+        assert_eq!(recovered.segments, canonical.segments);
     }
 
     #[test]
@@ -852,6 +890,27 @@ mod tests {
         ));
         let snapshots = [(9, 0x55aa_1234)].into_iter().collect();
         assert!(Log::recover_with_snapshots(&log.durable_images(), config(), &snapshots).is_ok());
+    }
+
+    #[test]
+    fn trap_installed_snapshot_mark_can_rebase_a_follower_without_old_entries() {
+        let (mut log, _) = Log::fresh(config(), genesis()).expect("fresh");
+        log.commit().expect("genesis commit");
+        let mark = SnapshotMark {
+            index: LogIndex::new(7),
+            term: Term::new(3),
+            generation: 7,
+            crc32c: 0x55aa_1234,
+        };
+        log.append_record(DurableRecord::InstalledSnapshotMark(mark))
+            .expect("installed mark");
+        log.commit().expect("mark commit");
+        let snapshots = [(7, 0x55aa_1234)].into_iter().collect();
+        let recovered = Log::recover_with_snapshots(&log.durable_images(), config(), &snapshots)
+            .expect("marked snapshot recovery");
+        assert_eq!(recovered.state.base_index, mark.index);
+        assert_eq!(recovered.state.base_term, mark.term);
+        assert_eq!(recovered.state.snapshot, Some(mark));
     }
 
     #[test]

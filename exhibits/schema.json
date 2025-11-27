@@ -3,13 +3,13 @@
   "type": "object",
   "required": ["schema_version", "build", "exhibits"],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "build": { "type": "string", "minLength": 1 },
     "exhibits": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "title", "kind", "seed", "trace", "verdict", "chapters"],
+        "required": ["id", "title", "kind", "seed", "trace", "verdict", "anomaly", "chapters"],
         "properties": {
           "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
           "title": { "type": "string" },
@@ -17,6 +17,7 @@
           "seed": { "type": "string" },
           "trace": { "type": "string" },
           "verdict": { "enum": ["fixed", "known-failure", "inconclusive"] },
+          "anomaly": { "type": "string", "minLength": 1 },
           "chapters": { "type": "array", "items": { "type": "string" } }
         }
       }

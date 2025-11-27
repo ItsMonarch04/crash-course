@@ -370,7 +370,7 @@ fn fingerprint(state: &ModelState) -> String {
                 node.joint,
                 node.read_round,
                 node.read_index,
-                node.snapshot_buffer.len(),
+                0_usize,
                 node.snapshot_index.get(),
                 node.snapshot_term,
                 node.election_deadline.as_nanos(),

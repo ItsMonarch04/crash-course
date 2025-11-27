@@ -8,8 +8,8 @@
 use cc_core::{Dec, DecodeError, Enc, LogIndex, NodeId, Term};
 
 use crate::{
-    AppendRequest, AppendResponse, Entry, EntryKind, Message, MessageKind, PROTOCOL_VERSION,
-    SNAPSHOT_CHUNK_BYTES, SnapshotRejectReason,
+    AppendRequest, AppendResponse, Entry, EntryKind, Message, MessageKind, SEMANTIC_VERSION_V3,
+    SNAPSHOT_CHUNK_BYTES, SnapshotRejectReason, supports_protocol_version,
 };
 
 pub const CCRP_MAGIC: u32 = u32::from_le_bytes(*b"CCRP");
@@ -46,7 +46,7 @@ impl From<DecodeError> for CodecError {
 }
 
 pub fn encode(message: &Message) -> Result<Vec<u8>, CodecError> {
-    if message.proto_version != PROTOCOL_VERSION
+    if !supports_protocol_version(message.proto_version)
         || message.from.get() == 0
         || message.to.get() == 0
         || message.from == message.to
@@ -192,6 +192,32 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, CodecError> {
             enc.u8(9);
             enc.u64(intent_index.get());
         }
+        MessageKind::FollowerReadRequest {
+            request_id,
+            command_hash,
+        } => {
+            if message.proto_version != SEMANTIC_VERSION_V3 || *request_id == 0 {
+                return Err(CodecError::Invalid("follower read request semantic or id"));
+            }
+            enc.u8(10);
+            enc.u64(*request_id);
+            enc.u64(*command_hash);
+        }
+        MessageKind::FollowerReadGrant {
+            request_id,
+            command_hash,
+            read_index,
+            read_time,
+        } => {
+            if message.proto_version != SEMANTIC_VERSION_V3 || *request_id == 0 {
+                return Err(CodecError::Invalid("follower read grant semantic or id"));
+            }
+            enc.u8(11);
+            enc.u64(*request_id);
+            enc.u64(*command_hash);
+            enc.u64(read_index.get());
+            enc.u64(read_time.as_nanos());
+        }
     }
     Ok(enc.finish())
 }
@@ -200,7 +226,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, CodecError> {
     let mut dec = Dec::new(bytes);
     dec.header(CCRP_MAGIC, CCRP_FORMAT_VERSION)?;
     let proto_version = dec.u16()?;
-    if proto_version != PROTOCOL_VERSION {
+    if !supports_protocol_version(proto_version) {
         return Err(CodecError::UnsupportedSemantic(proto_version));
     }
     let from = nonzero_node(&mut dec)?;
@@ -350,6 +376,34 @@ pub fn decode(bytes: &[u8]) -> Result<Message, CodecError> {
             }
             MessageKind::TimeoutNow { intent_index }
         }
+        10 => {
+            if proto_version != SEMANTIC_VERSION_V3 {
+                return Err(CodecError::Invalid("follower read request requires v3"));
+            }
+            let request_id = dec.u64()?;
+            if request_id == 0 {
+                return Err(CodecError::Invalid("zero follower read request id"));
+            }
+            MessageKind::FollowerReadRequest {
+                request_id,
+                command_hash: dec.u64()?,
+            }
+        }
+        11 => {
+            if proto_version != SEMANTIC_VERSION_V3 {
+                return Err(CodecError::Invalid("follower read grant requires v3"));
+            }
+            let request_id = dec.u64()?;
+            if request_id == 0 {
+                return Err(CodecError::Invalid("zero follower read grant id"));
+            }
+            MessageKind::FollowerReadGrant {
+                request_id,
+                command_hash: dec.u64()?,
+                read_index: LogIndex::new(dec.u64()?),
+                read_time: cc_core::Time::from_nanos(dec.u64()?),
+            }
+        }
         tag => {
             return Err(CodecError::Decode(DecodeError::InvalidTag {
                 offset: dec.position().saturating_sub(1),
@@ -427,6 +481,7 @@ fn decode_entry(dec: &mut Dec<'_>) -> Result<Entry, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PROTOCOL_VERSION;
     fn message(kind: MessageKind) -> Message {
         Message {
             proto_version: PROTOCOL_VERSION,
@@ -512,6 +567,46 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn trap_follower_read_tags_require_semantic_v3() {
+        let request = Message {
+            proto_version: SEMANTIC_VERSION_V3,
+            from: NodeId::new(1),
+            to: NodeId::new(2),
+            term: Term::new(3),
+            kind: MessageKind::FollowerReadRequest {
+                request_id: 9,
+                command_hash: 0xfeed,
+            },
+        };
+        let grant = Message {
+            kind: MessageKind::FollowerReadGrant {
+                request_id: 9,
+                command_hash: 0xfeed,
+                read_index: LogIndex::new(7),
+                read_time: cc_core::Time::from_nanos(8),
+            },
+            ..request.clone()
+        };
+        for message in [request, grant] {
+            assert_eq!(
+                decode(&encode(&message).expect("v3 encode")).expect("v3 decode"),
+                message
+            );
+        }
+        let invalid = Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(1),
+            to: NodeId::new(2),
+            term: Term::new(3),
+            kind: MessageKind::FollowerReadRequest {
+                request_id: 1,
+                command_hash: 1,
+            },
+        };
+        assert!(encode(&invalid).is_err());
     }
 
     #[test]

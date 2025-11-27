@@ -96,6 +96,8 @@ shows the machinery that catches it.
   magic values, versions, and bounds
 - [`docs/compatibility.md`](docs/compatibility.md) — the current compatibility
   boundary and fixture-manifest contract
+- [`docs/calibration.md`](docs/calibration.md) — named simulator calibration
+  profiles, validation results, and residuals
 - [`docs/ops.md`](docs/ops.md) — running the real `ccdb` host: shared-driver
   WAL layout, peer handshake, and current recovery limits
 - [`docs/adr/`](docs/adr/) — numbered decisions, append-only
@@ -130,4 +132,4 @@ publishes an altered simulator as a website cannot keep those changes closed.
 
 ---
 
-**Version:** v0.11.14
+**Version:** v0.12.0

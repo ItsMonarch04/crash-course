@@ -352,6 +352,7 @@ pub fn decode_peer_frame(input: &[u8]) -> Result<(WireMsg, usize), FrameError> {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub enum FileId {
     Wal { segment: u64 },
+    StoreWal { segment: u64 },
     Sst { file_no: u64 },
     Manifest { generation: u64 },
     Snapshot { generation: u64 },
@@ -836,6 +837,10 @@ fn encode_file(enc: &mut Enc, file: FileId) {
             enc.u8(1);
             enc.u64(segment);
         }
+        FileId::StoreWal { segment } => {
+            enc.u8(7);
+            enc.u64(segment);
+        }
         FileId::Sst { file_no } => {
             enc.u8(2);
             enc.u64(file_no);
@@ -858,6 +863,9 @@ fn encode_file(enc: &mut Enc, file: FileId) {
 fn decode_file(dec: &mut Dec<'_>) -> Result<FileId, BoundaryCodecError> {
     Ok(match dec.u8()? {
         1 => FileId::Wal {
+            segment: dec.u64()?,
+        },
+        7 => FileId::StoreWal {
             segment: dec.u64()?,
         },
         2 => FileId::Sst {
@@ -944,6 +952,18 @@ fn decode_io_result(dec: &mut Dec<'_>) -> Result<IoResult, BoundaryCodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trap_legacy_peer_frame_fixture_is_readable() {
+        assert_eq!(
+            decode_peer_frame(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/golden/legacy/ccpf-v1.bin"
+            )))
+            .expect("legacy CCPF fixture"),
+            (WireMsg::new(2, b"legacy-c0-peer".to_vec()), 30)
+        );
+    }
 
     #[test]
     fn file_ids_have_ordered_stable_variants() {
@@ -1095,5 +1115,43 @@ mod tests {
             left.negotiate(&right),
             Err(HelloError::RequiredFeature(FEATURE_FOLLOWER_READ))
         );
+    }
+
+    #[test]
+    fn trap_mixed_build_negotiates_semantic_v2() {
+        let mut current = hello(1);
+        current.semantic_max = 3;
+        current.supported_features = KNOWN_PEER_FEATURES;
+        let compat_base = hello(2);
+        let negotiated = current
+            .negotiate(&compat_base)
+            .expect("v3-capable current build must retain the v2 overlap");
+        assert_eq!(negotiated.semantic_version, 2);
+        assert_eq!(negotiated.features, 0);
+    }
+
+    #[test]
+    fn trap_unsupported_feature_is_never_silently_downgraded() {
+        let mut current = hello(1);
+        current.semantic_max = 3;
+        current.supported_features = FEATURE_ATOMIC_BATCH;
+        current.required_features = FEATURE_ATOMIC_BATCH;
+        let compat_base = hello(2);
+        assert_eq!(
+            current.negotiate(&compat_base),
+            Err(HelloError::RequiredFeature(FEATURE_ATOMIC_BATCH))
+        );
+    }
+
+    #[test]
+    fn trap_rolling_upgrade_rejects_cluster_policy_drift() {
+        let current = hello(1);
+        let mut drifted = hello(2);
+        drifted.cluster_policy = ClusterPolicy {
+            max_batch_commands: ClusterPolicy::default().max_batch_commands + 1,
+            ..ClusterPolicy::default()
+        }
+        .encode();
+        assert_eq!(current.negotiate(&drifted), Err(HelloError::PolicyMismatch));
     }
 }
