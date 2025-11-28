@@ -28,7 +28,7 @@ pub const MAX_BLOCK_OBSERVATIONS_PER_RECORD: usize = 4_096;
 pub const MAX_BOOT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_BOOT_BUILD_LABEL_BYTES: usize = 256;
 pub const DRIVER_BOOT_MAGIC: u32 = u32::from_le_bytes(*b"CCBI");
-pub const DRIVER_BOOT_VERSION: u16 = 2;
+pub const DRIVER_BOOT_VERSION: u16 = 3;
 const FOOTER_FRAME_BIT: u32 = 1 << 31;
 const FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"CCIF");
 const FOOTER_VERSION: u16 = 1;
@@ -59,7 +59,11 @@ impl RecordedBootImage {
         self.membership
             .validate()
             .map_err(|_| JournalError::Invalid("boot membership"))?;
-        if self.config.id.get() == 0 || !self.config.host_limits.is_valid() {
+        if self.config.id.get() == 0
+            || self.config.cluster_id != self.cluster_id
+            || self.cluster_id.iter().all(|byte| *byte == 0)
+            || !self.config.host_limits.is_valid()
+        {
             return Err(JournalError::Invalid("boot node configuration"));
         }
         let mut enc = Enc::new();
@@ -80,12 +84,25 @@ impl RecordedBootImage {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, JournalError> {
         let mut dec = Dec::new(bytes);
-        dec.header(DRIVER_BOOT_MAGIC, DRIVER_BOOT_VERSION)?;
+        let magic = dec.u32()?;
+        let boot_version = dec.u16()?;
+        if magic != DRIVER_BOOT_MAGIC {
+            return Err(JournalError::Decode(DecodeError::InvalidMagic {
+                expected: DRIVER_BOOT_MAGIC,
+                actual: magic,
+            }));
+        }
+        if !matches!(boot_version, 2 | DRIVER_BOOT_VERSION) {
+            return Err(JournalError::Decode(DecodeError::InvalidVersion {
+                expected: DRIVER_BOOT_VERSION,
+                actual: boot_version,
+            }));
+        }
         let cluster_id: [u8; 16] = dec
             .bytes()?
             .try_into()
             .map_err(|_| JournalError::Invalid("boot cluster id"))?;
-        let config = decode_node_config(&mut dec)?;
+        let config = decode_node_config(&mut dec, cluster_id, boot_version)?;
         let membership = MembershipState::decode(&dec.bytes()?)
             .map_err(|_| JournalError::Invalid("boot membership"))?;
         let boot_epoch = Time::from_nanos(dec.u64()?);
@@ -139,13 +156,59 @@ fn encode_node_config(enc: &mut Enc, config: NodeConfig) -> Result<(), JournalEr
     enc.u32(limits.max_manifest_record_bytes);
     enc.u64(u64::try_from(limits.max_threads).unwrap_or(u64::MAX));
     enc.u64(u64::try_from(limits.thread_stack_bytes).unwrap_or(u64::MAX));
+    for value in [
+        limits.max_peer_frame_bytes,
+        limits.max_uncommitted_entries,
+        limits.max_uncommitted_bytes,
+        limits.max_log_bytes_before_snapshot,
+        limits.max_raft_log_bytes,
+        limits.max_store_wal_bytes,
+        limits.max_data_dir_bytes,
+        limits.maintenance_reserve_bytes,
+        limits.max_snapshot_chunk_bytes,
+        limits.max_snapshot_staging_bytes,
+        limits.max_snapshot_pins,
+        limits.max_checkpoint_builder_bytes,
+        limits.max_pending_reads,
+        limits.max_pending_read_bytes,
+        limits.max_pending_client_routes,
+        limits.max_host_connections,
+        limits.max_open_files,
+        limits.max_host_thread_stack_bytes,
+        limits.max_host_input_bytes,
+        limits.max_host_total_input_bytes,
+        limits.max_host_output_bytes,
+        limits.max_host_total_output_bytes,
+        limits.max_host_queued_requests,
+        limits.max_host_total_queued_requests,
+        limits.max_driver_pending_effects,
+        limits.max_driver_pending_effect_bytes,
+        limits.max_network_inflight_bytes,
+        limits.max_fault_replay_bytes,
+        limits.max_memtable_bytes,
+        limits.max_frozen_memtables,
+        limits.max_sst_files,
+        limits.max_referenced_sst_bytes,
+        limits.max_sst_metadata_bytes,
+        limits.max_manifest_generations,
+        limits.max_compaction_builder_bytes,
+        limits.max_history_operations,
+        limits.max_history_bytes,
+        limits.max_failure_artifact_bytes,
+    ] {
+        enc.u64(value);
+    }
     if config.id.get() == 0 || !limits.is_valid() {
         return Err(JournalError::Invalid("boot node configuration"));
     }
     Ok(())
 }
 
-fn decode_node_config(dec: &mut Dec<'_>) -> Result<NodeConfig, JournalError> {
+fn decode_node_config(
+    dec: &mut Dec<'_>,
+    cluster_id: [u8; 16],
+    boot_version: u16,
+) -> Result<NodeConfig, JournalError> {
     let id = NodeId::new(dec.u64()?);
     if id.get() == 0 {
         return Err(JournalError::Invalid("zero boot node id"));
@@ -168,7 +231,7 @@ fn decode_node_config(dec: &mut Dec<'_>) -> Result<NodeConfig, JournalError> {
     );
     let policy = ClusterPolicy::decode(&dec.bytes()?)
         .map_err(|_| JournalError::Invalid("boot cluster policy"))?;
-    let host_limits = HostLimits {
+    let mut host_limits = HostLimits {
         max_pending_peer: decode_usize(dec, "peer queue limit")?,
         max_pending_timer: decode_usize(dec, "timer queue limit")?,
         max_pending_io: decode_usize(dec, "I/O queue limit")?,
@@ -183,12 +246,59 @@ fn decode_node_config(dec: &mut Dec<'_>) -> Result<NodeConfig, JournalError> {
         max_manifest_record_bytes: dec.u32()?,
         max_threads: decode_usize(dec, "thread limit")?,
         thread_stack_bytes: decode_usize(dec, "thread stack bytes")?,
+        ..HostLimits::default()
     };
+    if boot_version >= 3 {
+        macro_rules! take_limits {
+            ($($field:ident),+ $(,)?) => { $(host_limits.$field = dec.u64()?;)+ };
+        }
+        take_limits!(
+            max_peer_frame_bytes,
+            max_uncommitted_entries,
+            max_uncommitted_bytes,
+            max_log_bytes_before_snapshot,
+            max_raft_log_bytes,
+            max_store_wal_bytes,
+            max_data_dir_bytes,
+            maintenance_reserve_bytes,
+            max_snapshot_chunk_bytes,
+            max_snapshot_staging_bytes,
+            max_snapshot_pins,
+            max_checkpoint_builder_bytes,
+            max_pending_reads,
+            max_pending_read_bytes,
+            max_pending_client_routes,
+            max_host_connections,
+            max_open_files,
+            max_host_thread_stack_bytes,
+            max_host_input_bytes,
+            max_host_total_input_bytes,
+            max_host_output_bytes,
+            max_host_total_output_bytes,
+            max_host_queued_requests,
+            max_host_total_queued_requests,
+            max_driver_pending_effects,
+            max_driver_pending_effect_bytes,
+            max_network_inflight_bytes,
+            max_fault_replay_bytes,
+            max_memtable_bytes,
+            max_frozen_memtables,
+            max_sst_files,
+            max_referenced_sst_bytes,
+            max_sst_metadata_bytes,
+            max_manifest_generations,
+            max_compaction_builder_bytes,
+            max_history_operations,
+            max_history_bytes,
+            max_failure_artifact_bytes,
+        );
+    }
     if !host_limits.is_valid() {
         return Err(JournalError::Invalid("boot host limits"));
     }
     Ok(NodeConfig {
         id,
+        cluster_id,
         seed,
         raft,
         store,
@@ -932,7 +1042,7 @@ fn decode_record(bytes: &[u8]) -> Result<JournalRecord, JournalError> {
 
 fn file_number(file: FileId) -> u64 {
     match file {
-        FileId::Wal { segment } => segment,
+        FileId::Wal { segment } | FileId::StoreWal { segment } => segment,
         FileId::Sst { file_no } => file_no,
         FileId::Manifest { generation } | FileId::Snapshot { generation } => generation,
         FileId::Meta => 0,
@@ -1019,6 +1129,7 @@ mod tests {
         let image = RecordedBootImage {
             config: NodeConfig {
                 id: NodeId::new(7),
+                cluster_id: [7; 16],
                 seed: Seed::new(9),
                 raft: RaftConfig::default(),
                 store: StoreConfig::default(),
