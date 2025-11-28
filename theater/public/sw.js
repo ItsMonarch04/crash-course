@@ -5,7 +5,7 @@
 // never changed, so a returning visitor kept the old `index.html` forever and
 // with it the old hashed asset and wasm URLs. A deploy could not reach anyone
 // who had already loaded the theater once.
-const CACHE = "crash-course-theater-v0.12.1";
+const CACHE = "crash-course-theater-v0.12.2";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then(() => self.skipWaiting()));

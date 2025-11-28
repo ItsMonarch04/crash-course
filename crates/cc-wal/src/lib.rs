@@ -151,6 +151,7 @@ impl Segment {
 
 /// An in-memory WAL host that makes write visibility and durability explicit.
 /// A real host maps `flush` and `commit` to disk write and fsync effects.
+#[derive(Clone, Debug)]
 pub struct Wal {
     config: WalConfig,
     segments: Vec<Segment>,
@@ -560,6 +561,29 @@ pub fn recover(images: &[SegmentImage], config: WalConfig) -> Result<RecoveredWa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trap_legacy_wal_fixture_is_recoverable() {
+        let recovered = recover(
+            &[SegmentImage {
+                sequence: 0,
+                bytes: include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/golden/legacy/ccwl-v1.bin"
+                ))
+                .to_vec(),
+            }],
+            WalConfig {
+                segment_size: 256,
+                max_record_size: 64,
+            },
+        )
+        .expect("legacy CCWL fixture");
+        assert_eq!(
+            recovered.durable_payloads(),
+            vec![b"legacy-c0-wal".to_vec()]
+        );
+    }
 
     fn config() -> WalConfig {
         WalConfig {
