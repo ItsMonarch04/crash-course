@@ -9,12 +9,17 @@ are:
 | Trace binary | `CCTR` | 1 | `cc-core::Trace` |
 | WAL segment | `CCWL` | 1 | `cc-wal` |
 | SSTable | `CCST` | 1 | `cc-store` |
+| Block-structured SSTable | `CCST` | 2 | `cc-store::SstV2Table` |
 | Peer hello | `CCHL` | 1 | `cc-env` |
 | Peer stream frame | `CCPF` | 1 | `cc-env` |
 | Replicated KV command | `CCKV` | 1 | `cc-kv` |
+| Transactional KV batch command | `CCKV` | 3 | `cc-kv` |
 | Replicated KV reply | `CCKR` | 1 | `cc-kv` |
+| Transactional KV batch reply | `CCKR` | 3 | `cc-kv` |
 | Cluster policy | `CCPL` | 1 | `cc-core` |
+| Versioned membership | `CCMS` | 2 (v1 read) | `cc-core` |
 | Cluster identity | `CCID` | 1 | `cc-node` |
+| Application envelope | `CCAP` | 1 | `cc-cluster` |
 | Configuration envelope | `CCCF` | 1 | `cc-core` |
 | Admin reply | `CCAR` | 1 | `cc-core` |
 | Raft peer message | `CCRP` | 1 | `cc-raft::codec` |
@@ -23,7 +28,8 @@ are:
 | Paired input/effect journal | `CCIJ` | 1 | `cc-host::journal` |
 | Raft durability record | `CCLR` | 1 | `cc-log` |
 | History receipt | `CCHY` | 2 | `cc-checker` |
-| Offline backup archive | `CCBK` | 1 | `cc-node` |
+| Offline logical backup archive | `CCBK` | 2 (v1 reject) | `cc-node` |
+| Store metadata | `CCMT` | 2 (v1 read) | `cc-store` |
 
 The byte layouts are intentionally implemented by hand. A layout change needs
 a new decision record, a version bump, a compatibility note, and round-trip,
@@ -34,6 +40,16 @@ backward-compatible tags `12=Append`, `13=GetSet`, `14=GetDel`,
 `15=ExpireAt`, and `16=Ttl`; `17=ConditionalSet` encodes NX/XX as one
 replicated transition. Existing tag bytes and fields are unchanged.
 
+`CCKV` v3 is intentionally narrow: it emits only `tag=18 Batch`, followed by
+`count:u32` and exactly that many canonical v1 CCKV child records encoded as
+`bytes32`. Count is nonzero, policy-bounded, and nested batches are rejected.
+`CCKR` v3 similarly emits only `tag=8 Batch` (`count:u32`, then canonical v1
+CCKR replies as `bytes32`) or `tag=9 BatchError`
+(`failed_index:u32 | error_tag:u8`). A batch error publishes none of its child
+state transitions. Both v3 decoders reject v1-only tags, trailing bytes,
+nested batch values, invalid checksums, and oversize lengths; their v1 readers
+remain unchanged for compatibility fixtures.
+
 `CCID` is `magic:u32`, `format_version:u16`, `cluster_id:bytes16`,
 `node_id:u64`, `lifecycle:u8`, `cluster_policy_hash:u64`,
 `min_storage_reader:u16`, `min_semantic_reader:u16`, `migration_epoch:u64`,
@@ -43,12 +59,72 @@ values are `1=Active`, `2=Joining`, and `3=Removed`; a removed directory is
 terminal. The cluster ID is a nonzero 16-byte identifier supplied as exactly
 32 lowercase hexadecimal characters in configuration.
 
-`CCBK` is `magic:u32`, `version:u16`, `file_count:u32`, then sorted entries of
-`path_len:u16`, UTF-8 path bytes, `data_len:u64`, `crc32c:u32`, and file bytes.
-Version 1 permits exactly `identity.ccid`, `ccdb.toml`, and `raft/wal.0`.
-The archive validates an untorn framed WAL before capture and before restore;
-it is an offline operator copy, not the authority for shared-driver recovery
-or a substitute for a future storage/snapshot checkpoint.
+`CCMS` v2 retains the v1 membership/address layout and appends
+`active_features:u64` before its final CRC-32C. The only currently defined
+bit is `ATOMIC_BATCH=1<<1`; unknown bits fail closed. The decoder retains the
+v1 reader and maps its absent field to zero, while new writers emit v2.
+
+`CCBK` v2 is `magic:u32="CCBK" | version:u16 | source_cluster_id:bytes16 |
+source_index:u64 | source_term:u64 | source_last_leader_time:u64 |
+source_cluster_policy_hash:u64 | source_min_semantic:u16 |
+source_active_features:u64 | checkpoint_len:u64 | checkpoint_crc32c:u32 |
+header_crc32c:u32 | CCSN[checkpoint_len] | bundle_crc32c:u32 |
+magic:u32="CBKE"`. The header and bundle checksums zero only their own
+checksum field. Capture requires the exact CCSN named by a durable CCLR
+snapshot mark; restore validates the inner checkpoint then creates a new
+one-node CCID, Restore-origin Genesis, synthetic `(index=1, term=1)` snapshot,
+and fresh WAL. Source node/config identity is never copied. The legacy v1
+node-clone envelope remains recognizable solely so it can be rejected; a
+fresh-cluster legacy logical importer is not implemented yet.
+
+`CCMF` v1 is an append-only manifest: `magic:u32="CCMF" | version:u16 |
+generation:u64 | header_crc32c:u32`, then independently checksummed bounded
+Snapshot/EditBatch records. `CCMT` v2 is the atomic pointer
+`magic:u32="CCMT" | version:u16 | generation:u64 |
+manifest_header_crc32c:u32 | meta_crc32c:u32`. The codecs validate table
+ranges, footer checksums, monotonic file/watermark edits, and a torn final
+record prefix. They currently produce a host-neutral publication plan; ccdb
+does not yet execute that plan as persistent Storage v2 authority.
+
+`CCSN` v1 is a logical checkpoint: `magic:u32="CCSN" | version:u16 |
+cluster_id:bytes16 | cluster_policy_hash:u64 | index:u64 | term:u64 |
+last_leader_time:u64 | store_sequence:u64 | record_count:u64 |
+header_crc32c:u32`. It then contains bounded records
+`body_len:u32 | body_crc32c:u32 | tag:u8 | body`, followed by
+`total_len:u64 | records_crc32c:u32 | file_crc32c:u32 | magic:u32="CSNE"`.
+The header checksum zeros its final field; the per-record checksum covers the
+tag and body; the records checksum covers the exact record sequence; and the
+file checksum zeros only its own footer field. The canonical records are one
+membership record, one exact policy record, byte-sorted live key/value records
+with MVCC sequence and optional deadline, then `(namespace, client)`-ordered
+live session and tombstone records. An optional tag-6 record preserves a
+committed leadership-transfer intent as `intent_index`, target, deadline,
+finishing flag, and its exact AdminRequest identity; absent identity fields
+must be canonical zeroes. It rejects duplicate, out-of-order,
+expired, noncanonical, wrong-cluster, and checksum-invalid state before the
+core installs it.
+
+The shared Driver sends CCSN in non-empty CCRP `SnapshotChunk` records no
+larger than the Raft chunk limit. It keeps one chunk outstanding per peer and
+retransmits that exact offset until a matching `SnapshotAck`; `Gap` and
+`RestartFromZero` reset the sender only to the acknowledged offset. Receiver
+chunks are written and fsynced to staging before incremental decode, then the
+completed file is renamed and directory-synced. A local `CCLR` snapshot mark
+or an installed-snapshot mark is written and fsynced before the checkpoint is
+recovery authority or the final acknowledgement is sent. Boot validates the
+marked generation, index, term, and CCSN file checksum together; orphaned
+unmarked files are not authority.
+New checkpoint publication is deferred while joint consensus is active and
+while a reachable removed peer has not acknowledged the terminal LeaveJoint.
+The host may still send an older marked checkpoint followed by the retained
+suffix, so catch-up does not compact away an operator workflow identity.
+
+`CCLR` v1 remains a CRC-protected framed Raft durability record. Tag 5 is a
+locally-created snapshot mark and requires the marked position to exist in the
+retained log. Tag 6 is an installed-snapshot mark for a follower whose
+covered prefix may already be absent; it is valid only when the host verifies
+the named checkpoint file and checksum during recovery. Both tags carry
+`index:u64 | term:u64 | generation:u64 | crc32c:u32`.
 
 `CCHL` is the pre-frame peer negotiation record. It carries raw 16-byte
 cluster identity, node id, exact bounded `CCPL` bytes, semantic-version range,
@@ -60,11 +136,17 @@ cluster/policy mismatch, invalid range, unknown required bit, or missing
 required capability before accepting a frame.
 
 `CCRP` is a canonical Raft-message payload and is transported inside `CCPF`.
-Its format version is `1`; its embedded semantic protocol version is currently
-`2` (the version that introduced `read_round`). `CCHL` negotiation, `CCPF`
-transport framing, and `CCRP` encoding are separate version namespaces. The
-simulator now performs `Message → CCRP → CCPF → Network → CCPF → CCRP →
-Message`; malformed frames do not reach Raft.
+Its format version is `1`. Semantic v2 is frozen for ordinary Raft traffic
+(`read_round`), while semantic v3 adds only tags `10=FollowerReadRequest`
+(`request_id:u64 | command_hash:u64`) and `11=FollowerReadGrant`
+(`request_id:u64 | command_hash:u64 | read_index:u64 | read_time:u64`). Both
+ids are nonzero; the hash is FNV-1a-64 of canonical CCKV bytes and is a
+correlation value, not authentication. Tags 10/11 reject v2 frames and a
+connection may send them only when CCHL selected both semantic v3 and feature
+bit `FOLLOWER_READ`. CCHL negotiation, CCPF transport framing, and CCRP
+encoding are separate version namespaces. The simulator now performs
+`Message → CCRP → CCPF → Network → CCPF → CCRP → Message`; malformed frames
+do not reach Raft.
 
 Peer trace events use a fixed nine-byte diagnostic fingerprint rather than a
 Rust display/debug string: `fingerprint_version:u16=1 |
@@ -155,6 +237,15 @@ are CRC-32C over the preceding body.
 - SSTable: `CCST`, format `1`, `file_no:u64`, `entry_count:u32`, then each
   entry as `user_key:bytes`, `sequence:u64`, `kind:u8` (`1=Put`, `2=Delete`),
   and `value:bytes`, followed by the CRC.
+- SSTable v2: independently checksummed prefix-compressed data blocks,
+  an index block, a seven-probe FNV-1a bloom block, and a fixed 42-byte footer.
+  Internal keys sort by user key ascending, sequence descending, then kind;
+  each sixteenth data entry is a restart. Its footer is
+  `index_offset:u64 | index_length:u32 | bloom_offset:u64 | bloom_length:u32 |
+  entry_count:u64 | format_version:u16=2 | footer_crc32c:u32 | "CCST"`.
+  V2 remains a separate reader/writer path while the durable node-store
+  migration and META publication protocol are completed; it never changes a
+  C0 v1 byte or reader.
 - META: `CCMT`, format `1`, `manifest_generation:u64`, followed by the CRC.
 - WAL segment: `CCWL`, format `1`, `segment_sequence:u64`; records carry a
   `length:u32`, `kind:u8`, payload, and CRC, with segment padding and seal

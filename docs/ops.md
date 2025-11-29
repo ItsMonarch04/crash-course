@@ -12,11 +12,12 @@ refuses service.
 Peer sockets exchange the checked `CCHL` hello before bounded `CCPF` frames
 carrying versioned `CCRP` Raft messages. Leadership is an election result, not
 a lowest-node-id probe; before an election, RESP writes and reads return an
-explicit `NOTLEADER` response. The adapter still lacks durable logical
-snapshots and Storage v2, so a restarted follower relies on its retained Raft
-log and later leader replication rather than claiming a complete wipe/reseed
-recovery protocol. Read [limitations](LIMITATIONS.md) before interpreting a
-real-host result beyond that boundary.
+explicit `NOTLEADER` response. The adapter has durable, streamed logical
+checkpoints tied to an fsynced Raft snapshot mark, a checksummed Storage v2
+manifest/store WAL, and ordered Raft prefix reclamation after the checkpoint
+mark and directory sync are durable.
+Read [limitations](LIMITATIONS.md) before interpreting a real-host result
+beyond that boundary.
 
 ## Listener safety
 
@@ -68,9 +69,9 @@ syncs every transition frame. Treat it as sensitive operational data: it
 contains the node's retained WAL, client data, replies, and topology. It also
 captures every synchronous block read in request order, including returned
 bytes, result tag, and service time; replay refuses to consult local block
-storage for those reads. The current WAL-only adapter has no SST read path yet,
-and snapshot images are still not captured, so this does not turn wipe/reseed
-recovery into a supported claim. Its default 128 MiB limit can be changed with
+storage for those reads. Recorder boot images do not embed checkpoint files, so this
+does not turn wipe/reseed recovery into a supported claim. Its default 128 MiB
+limit can be changed with
 `--record-max-bytes N`. Before that limit would be exceeded, it fsyncs a
 `capped` footer and normally continues the node unrecorded; use
 `--record-required` to exit nonzero instead if the receipt must cover the run.
@@ -101,12 +102,61 @@ self-check validates identity/config agreement and a complete, CRC-checked
 Raft WAL genesis, rejects a torn tail or incomplete snapshot staging, and
 advises but never repairs.
 
+## Metrics contract
+
+`GET /metrics` takes one bounded copy of Driver, store, membership, and peer
+state and releases the Driver lock before rendering. The response is capped at
+64 KiB; if the cap would be exceeded it returns only `ccdb_up` and
+`ccdb_metrics_overflow`. The only dynamic labels are numeric `node_id`, the
+bounded manifest `level`, and fixed `resource`/`kind` vocabularies. Keys,
+client/request identifiers, file names, addresses, and error strings are never
+labels.
+
+Names ending in `_total` are monotonically increasing process-lifetime
+counters and reset only when that process restarts. Byte counters count the
+requested or successfully published physical bytes named by the metric;
+`ccdb_block_*` is the SST block-source boundary and `ccdb_file_*` is the
+host-effect file boundary. Bloom positive/negative counters record the actual
+retained-filter decision. Manifest rewrites and compaction
+started/completed/aborted counters advance at their respective store
+transitions. Snapshot created/sent/received/aborted counters count a terminal
+transfer/publication event once per peer transfer id, not chunks or retries.
+Expiry proposals count replicated purge entries; expiry keys count keys only
+after their store durability continuation succeeds.
+
+The following are gauges and may move in either direction:
+
+- `ccdb_store_files{level}` and `ccdb_store_file_bytes{level}` are current
+  physical file count and bytes.
+- `ccdb_footprint_bytes{resource,kind}` exports `current`, process `peak`, and
+  admission `limit` for every byte-valued `NodeFootprint` resource. The
+  companion `ccdb_footprint_items` values and `ccdb_driver_blocked` are current
+  queue/timer state.
+- `ccdb_storage_fault` is zero during healthy service and is set before the
+  fatal storage path. A fatal process may exit before another scrape observes
+  it; the termination receipt remains authoritative.
+- Peer gauges report negotiated semantic version and feature bits, leader-side
+  match index and commit lag (entries), and last successful contact age
+  (seconds). An age of `-1` means this process has not observed a successful
+  contact. Node-id cardinality is bounded by the configured membership policy.
+- `ccdb_up`, node/leader ids, role, commit/applied index, configured peers, and
+  uptime are current process gauges.
+
 ## Fault work
 
 `scripts/demo.sh` is the three-node exercise: it checks acknowledged writes,
-kills the elected leader, and restarts a retained-log node. Wiped-node recovery
-uses ordinary retained-log replication rather than an out-of-band state copy;
-the streamed snapshot lifecycle remains future work.
+kills the elected leader, and restarts a retained-log node. When a follower
+backs up to the log origin, the shared Driver can send a capped stop-and-wait
+CCSN transfer from a durable, marked checkpoint instead of an out-of-band
+state copy.
+`scripts/demo-membership.sh` is the five-process membership gate. By default
+it runs 20 independently port-isolated 3→5 cycles with forced checkpoint
+catch-up, learner promotion, address publication, leader transfer, voter
+removal, terminal-node exit, final probes, and one checked CC-HISTORY per run.
+Set `CC_MEMBERSHIP_RUNS=1..20` only to shorten local diagnosis. The test-only
+`CCDB_SNAPSHOT_AFTER_BYTES` environment variable lowers the checkpoint trigger
+within this lab; production configuration continues to use bounded host
+defaults.
 `scripts/real-faults.sh` adds a sustained
 SET workload, chunked history checking, SIGSTOP/SIGCONT pauses, and a
 byte-level `cc-swarm proxy` on one peer path. `--duration-seconds N` and

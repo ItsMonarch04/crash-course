@@ -5,18 +5,42 @@ educational, deterministic database lab and its guarantees are deliberately
 narrow.
 
 - **The real host is now a strict shared-driver adapter, but it is not a
-  complete storage host.** `ccdb` runs `cc_host::Driver` over
+  complete Storage v2 host.** `ccdb` runs `cc_host::Driver` over
   `cc_cluster::Node`, including election traffic, Raft terms, CCHL/CCPF/CCRP
   peer bytes, and a write-plus-fsync durability continuation. A fatal WAL I/O
-  error terminates the process. It does not yet persist the logical KV/store
-  snapshot or implement Storage v2, streamed snapshot transfer, or wiped-node
-  recovery; the retained-log restart exercise is deliberately weaker than
-  those future claims.
+  error terminates the process. Its v2 SST codec plus CCMF/CCMT codec and
+  host-neutral publication plan are separately verified, but ccdb does not
+  execute that plan yet; there is still no store-WAL authority or prefix
+  reclamation. The shared Driver creates a bounded, record-streamed
+  CCSN checkpoint, fsyncs and atomically publishes it, then fsyncs the
+  matching Raft snapshot mark before the file becomes transfer or recovery
+  authority. It stages/fsyncs each received chunk, decodes it from the staged
+  file, publishes the file, fsyncs an installed-snapshot mark, and only then
+  installs and acknowledges it. Boot accepts only the exact marked file and
+  checksum; an unmarked checkpoint is not recovery authority. Checkpoint
+  trigger, publication, and transfer are implemented, but the missing
+  manifest/store checkpoint edit and safe durable-prefix reclamation mean this
+  is not yet the complete N3/N4 storage lifecycle.
 - We have one Raft group. Write throughput is ultimately bounded by the
   leader's durable-log path; sharding is a future expansion track.
-- There are no follower reads. Leader reads use the quorum-confirmed ReadIndex
-  fixture, but a follower redirects rather than serving a local read. See
-  [consistency](consistency.md).
+- Default reads remain leader reads. `READ FOLLOWER GET|TTL` is available only
+  between peers that negotiate semantic v3 plus `FOLLOWER_READ`; it waits for
+  a leader ReadIndex grant and local apply, and fails closed with `TRYAGAIN`
+  for an unknown/v2/featureless leader or a changed term/configuration.
+  `READ STALE GET` is intentionally separate and tagged with its local applied
+  index/term and read time; it has no bounded-staleness or linearizability
+  claim. See [consistency](consistency.md).
+- `MULTI`/`EXEC` has an all-or-nothing CCKV v3 implementation. Atomic-batch
+  admission is fenced by a replicated feature bit that changes only on commit
+  and currently requires every observed member capability. The full
+  mixed-build rolling-upgrade fence—semantic-v3 log-entry metadata and a
+  per-entry CCID reader-floor barrier—is still incomplete. Do not treat the
+  feature as rolling-upgrade-safe yet.
+- `CC.ADMIN ADDLEARNER <id>`, `PROMOTE <id>`, and `LEAVEJOINT` are live
+  operator controls and append the matching replicated config transition;
+  `ccdb admin add-learner|promote-learner --node-id <id>` follows the current
+  leader. This prototype has no authentication or address-discovery workflow,
+  and promotion may only be requested after the learner has caught up.
 - Group commit creates a latency floor at low concurrency. The page-cache and
   `fsync` model is explained in [writeup 02](writeups/02-fsync-page-cache.md).
 - The LSM store has read amplification as table depth grows. Compaction is
@@ -53,15 +77,18 @@ narrow.
   transition-depth, and state-count bounds printed in its report. A completed
   tiny model is evidence inside that state space, not a proof of unbounded
   Raft.
-- Real-host backups are offline `CCBK` archives of the identity, config, and
-  framed Raft WAL. They are not yet SSTable checkpoints; the command rejects a
-  torn WAL during capture and restore never merges data.
+- Real-host `CCBK` v2 backups contain only the exact CCSN file named by a
+  durable snapshot mark. Restore validates it and writes a fresh one-node
+  CCID/Restore-origin WAL/checkpoint; it never clones source identity. The
+  capture is offline and can therefore be behind the current leader; online
+  linearizable backup, store-manifest validation, and the promised legacy v1
+  logical importer remain incomplete.
 
 - Wiped simulator nodes re-enter through a Join-origin durable prefix and
   ordinary Raft traffic; no leader snapshot is copied directly into a target.
-  The project still lacks the N4 streamed snapshot lifecycle, durable snapshot
-  files, and prefix reclamation, so this is log catch-up rather than a claim
-  of snapshot-transfer support.
+  The host has streamed durable checkpoint transfer, but still lacks the
+  storage-manifest and prefix-reclamation portions of N4, so a wiped-node
+  claim remains narrower than full storage recovery.
 - Permanent non-goals, recorded in [ADR-0008](adr/0008-scope-boundaries.md): a
   second host on an async runtime, an external Jepsen/Elle audit harness,
   keyspace notifications, and an LSM block cache. Each was considered and
