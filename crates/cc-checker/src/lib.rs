@@ -11,7 +11,26 @@ use cc_core::{Dec, DecodeError, Enc, Time, Trace};
 
 pub const CHECKER_VERSION: u16 = 1;
 pub const HISTORY_MAGIC: u32 = u32::from_le_bytes(*b"CCHY");
-pub const HISTORY_VERSION: u16 = 2;
+pub const HISTORY_VERSION: u16 = 3;
+pub const HISTORY_V2_VERSION: u16 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsistencyMode {
+    Strong,
+    StaleLocal,
+    Diagnostic,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiagnosticKind {
+    None,
+    FinalProbe,
+    ReplicaState {
+        replica: u64,
+        committed_index: u64,
+        state_hash: u64,
+    },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationKind {
@@ -72,6 +91,12 @@ pub struct Operation {
     pub complete: Option<Time>,
     pub kind: OperationKind,
     pub outcome: Outcome,
+    /// Replicated expiry attached to the decisive mutation, when present.
+    /// Diagnostic persistence labels require their observation interval to
+    /// lie wholly before this time.
+    pub deadline: Option<Time>,
+    pub consistency: ConsistencyMode,
+    pub diagnostic: DiagnosticKind,
 }
 
 impl Operation {
@@ -85,6 +110,9 @@ impl Operation {
             complete: None,
             kind,
             outcome: Outcome::Timeout,
+            deadline: None,
+            consistency: ConsistencyMode::Strong,
+            diagnostic: DiagnosticKind::None,
         }
     }
 
@@ -104,7 +132,32 @@ impl Operation {
             complete: Some(complete),
             kind,
             outcome,
+            deadline: None,
+            consistency: ConsistencyMode::Strong,
+            diagnostic: DiagnosticKind::None,
         }
+    }
+
+    #[must_use]
+    pub fn final_probe(mut self) -> Self {
+        self.client = 0;
+        self.sequence = 0;
+        self.consistency = ConsistencyMode::Diagnostic;
+        self.diagnostic = DiagnosticKind::FinalProbe;
+        self
+    }
+
+    #[must_use]
+    pub fn replica_probe(mut self, replica: u64, committed_index: u64, state_hash: u64) -> Self {
+        self.client = 0;
+        self.sequence = 0;
+        self.consistency = ConsistencyMode::Diagnostic;
+        self.diagnostic = DiagnosticKind::ReplicaState {
+            replica,
+            committed_index,
+            state_hash,
+        };
+        self
     }
 }
 
@@ -174,8 +227,16 @@ impl HistoryDocument {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, HistoryCodecError> {
+        let version = bytes
+            .get(4..6)
+            .and_then(|value| value.try_into().ok())
+            .map(u16::from_le_bytes)
+            .ok_or(HistoryCodecError::Invalid("history header"))?;
+        if !matches!(version, HISTORY_V2_VERSION | HISTORY_VERSION) {
+            return Err(HistoryCodecError::Invalid("history version"));
+        }
         let mut dec = Dec::new(bytes);
-        dec.header(HISTORY_MAGIC, HISTORY_VERSION)?;
+        dec.header(HISTORY_MAGIC, version)?;
         let build_label = dec.string()?;
         let config_hash = dec.u64()?;
         let retain_open = match dec.u8()? {
@@ -196,7 +257,7 @@ impl HistoryDocument {
         let mut history = History::default();
         let mut ids = BTreeSet::new();
         for _ in 0..count {
-            let operation = decode_operation(&mut dec)?;
+            let operation = decode_operation(&mut dec, version)?;
             if !ids.insert(operation.id) {
                 return Err(HistoryCodecError::DuplicateId(operation.id));
             }
@@ -359,8 +420,34 @@ fn encode_operation(enc: &mut Enc, operation: &Operation) {
         }
     }
     encode_outcome(enc, &operation.outcome);
+    match operation.deadline {
+        Some(deadline) => {
+            enc.u8(1);
+            enc.u64(deadline.as_nanos());
+        }
+        None => enc.u8(0),
+    }
+    enc.u8(match operation.consistency {
+        ConsistencyMode::Strong => 1,
+        ConsistencyMode::StaleLocal => 2,
+        ConsistencyMode::Diagnostic => 3,
+    });
+    match operation.diagnostic {
+        DiagnosticKind::None => enc.u8(0),
+        DiagnosticKind::FinalProbe => enc.u8(1),
+        DiagnosticKind::ReplicaState {
+            replica,
+            committed_index,
+            state_hash,
+        } => {
+            enc.u8(2);
+            enc.u64(replica);
+            enc.u64(committed_index);
+            enc.u64(state_hash);
+        }
+    }
 }
-fn decode_operation(dec: &mut Dec<'_>) -> Result<Operation, HistoryCodecError> {
+fn decode_operation(dec: &mut Dec<'_>, version: u16) -> Result<Operation, HistoryCodecError> {
     let id = dec.u64()?;
     let client = dec.u64()?;
     let sequence = dec.u64()?;
@@ -391,6 +478,32 @@ fn decode_operation(dec: &mut Dec<'_>) -> Result<Operation, HistoryCodecError> {
         _ => return Err(HistoryCodecError::Invalid("operation tag")),
     };
     let outcome = decode_outcome(dec)?;
+    let (deadline, consistency, diagnostic) = if version >= HISTORY_VERSION {
+        let deadline = match dec.u8()? {
+            0 => None,
+            1 => Some(Time::from_nanos(dec.u64()?)),
+            _ => return Err(HistoryCodecError::Invalid("deadline flag")),
+        };
+        let consistency = match dec.u8()? {
+            1 => ConsistencyMode::Strong,
+            2 => ConsistencyMode::StaleLocal,
+            3 => ConsistencyMode::Diagnostic,
+            _ => return Err(HistoryCodecError::Invalid("consistency mode")),
+        };
+        let diagnostic = match dec.u8()? {
+            0 => DiagnosticKind::None,
+            1 => DiagnosticKind::FinalProbe,
+            2 => DiagnosticKind::ReplicaState {
+                replica: dec.u64()?,
+                committed_index: dec.u64()?,
+                state_hash: dec.u64()?,
+            },
+            _ => return Err(HistoryCodecError::Invalid("diagnostic kind")),
+        };
+        (deadline, consistency, diagnostic)
+    } else {
+        (None, ConsistencyMode::Strong, DiagnosticKind::None)
+    };
     Ok(Operation {
         id,
         client,
@@ -399,6 +512,9 @@ fn decode_operation(dec: &mut Dec<'_>) -> Result<Operation, HistoryCodecError> {
         complete,
         kind,
         outcome,
+        deadline,
+        consistency,
+        diagnostic,
     })
 }
 fn opt_bytes(enc: &mut Enc, value: &Option<Vec<u8>>) {
@@ -471,28 +587,23 @@ fn decode_outcome(dec: &mut Dec<'_>) -> Result<Outcome, HistoryCodecError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckerConfig {
     pub max_states: u64,
+    pub witness_budget: u32,
 }
 
 impl Default for CheckerConfig {
     fn default() -> Self {
         Self {
             max_states: 10_000_000,
+            witness_budget: 200,
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verdict {
-    Linearizable {
-        visited: u64,
-    },
-    NotLinearizable {
-        operation_ids: Vec<u64>,
-        visited: u64,
-    },
-    Undecided {
-        visited: u64,
-    },
+    Linearizable { visited: u64 },
+    NotLinearizable { witness: Witness, visited: u64 },
+    Undecided { visited: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -507,7 +618,7 @@ pub struct Witness {
 /// history. A timeout/undecided oracle is never accepted as evidence.
 #[must_use]
 pub fn minimize_witness(history: &History, config: CheckerConfig, budget: u32) -> Option<Witness> {
-    minimize_witness_with_initial(history, BTreeMap::new(), config, budget)
+    minimize_witness_with_initial(history, initial_model(BTreeMap::new()), config, budget)
 }
 
 /// Minimize a failed v2 receipt while retaining the exact initial state image
@@ -519,7 +630,12 @@ pub fn minimize_document_witness(
     config: CheckerConfig,
     budget: u32,
 ) -> Option<Witness> {
-    minimize_witness_with_initial(&document.history, document.initial.clone(), config, budget)
+    minimize_witness_with_initial(
+        &document.history,
+        initial_model(document.initial.clone()),
+        config,
+        budget,
+    )
 }
 
 fn minimize_witness_with_initial(
@@ -624,7 +740,7 @@ fn witness_oracle(
     }
     *calls = calls.saturating_add(1);
     let result = matches!(
-        check_with_initial(
+        check_with_initial_raw(
             &History {
                 operations: operations.to_vec(),
             },
@@ -640,10 +756,31 @@ fn witness_oracle(
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct MemoKey {
     remaining: Vec<usize>,
-    state: Vec<(Vec<u8>, Vec<u8>)>,
+    state: Vec<(Vec<u8>, Vec<u8>, Option<Time>)>,
 }
 
-type Model = BTreeMap<Vec<u8>, Vec<u8>>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelValue {
+    value: Vec<u8>,
+    deadline: Option<Time>,
+}
+
+type Model = BTreeMap<Vec<u8>, ModelValue>;
+
+fn initial_model(initial: BTreeMap<Vec<u8>, Vec<u8>>) -> Model {
+    initial
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                key,
+                ModelValue {
+                    value,
+                    deadline: None,
+                },
+            )
+        })
+        .collect()
+}
 
 enum SearchResult {
     Found,
@@ -677,7 +814,31 @@ pub fn check_window(
     Ok(check_with_initial(history, initial, config))
 }
 
-fn check_with_initial(history: &History, initial: Model, config: CheckerConfig) -> Verdict {
+fn check_with_initial(
+    history: &History,
+    initial: BTreeMap<Vec<u8>, Vec<u8>>,
+    config: CheckerConfig,
+) -> Verdict {
+    let initial = initial_model(initial);
+    let raw = check_with_initial_raw(history, initial.clone(), config);
+    let Verdict::NotLinearizable { visited, .. } = raw else {
+        return raw;
+    };
+    let witness = minimize_witness_with_initial(history, initial, config, config.witness_budget)
+        .unwrap_or_else(|| Witness {
+            operation_ids: history
+                .operations
+                .iter()
+                .map(|operation| operation.id)
+                .collect(),
+            oracle_calls: 0,
+            budget_exhausted: config.witness_budget == 0,
+            one_minimal: false,
+        });
+    Verdict::NotLinearizable { witness, visited }
+}
+
+fn check_with_initial_raw(history: &History, initial: Model, config: CheckerConfig) -> Verdict {
     if history
         .operations
         .iter()
@@ -707,11 +868,11 @@ fn check_with_initial(history: &History, initial: Model, config: CheckerConfig) 
                     undecided = true;
                 }
                 Verdict::NotLinearizable {
-                    operation_ids,
+                    witness,
                     visited: count,
                 } => {
                     return Verdict::NotLinearizable {
-                        operation_ids,
+                        witness,
                         visited: visited.saturating_add(count),
                     };
                 }
@@ -747,11 +908,16 @@ fn check_single(history: &History, initial: Model, config: CheckerConfig) -> Ver
         SearchResult::Found => Verdict::Linearizable { visited },
         SearchResult::Undecided => Verdict::Undecided { visited },
         SearchResult::NotFound => Verdict::NotLinearizable {
-            operation_ids: history
-                .operations
-                .iter()
-                .map(|operation| operation.id)
-                .collect(),
+            witness: Witness {
+                operation_ids: history
+                    .operations
+                    .iter()
+                    .map(|operation| operation.id)
+                    .collect(),
+                oracle_calls: 0,
+                budget_exhausted: false,
+                one_minimal: false,
+            },
             visited,
         },
     }
@@ -777,7 +943,7 @@ fn search(
         remaining: remaining.clone(),
         state: model
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
+            .map(|(key, value)| (key.clone(), value.value.clone(), value.deadline))
             .collect(),
     };
     if !memo.insert(memo_key) {
@@ -806,7 +972,7 @@ fn search(
                 SearchResult::Undecided => saw_undecided = true,
                 SearchResult::NotFound => {}
             }
-            if let Some(next_model) = apply_without_observation(&model, &operation.kind) {
+            if let Some(next_model) = apply_without_observation(&model, operation) {
                 match search(
                     history,
                     next_remaining,
@@ -821,8 +987,7 @@ fn search(
                     SearchResult::NotFound => {}
                 }
             }
-        } else if let Some(next_model) = apply_observed(&model, &operation.kind, &operation.outcome)
-        {
+        } else if let Some(next_model) = apply_observed(&model, operation) {
             match search(
                 history,
                 next_remaining,
@@ -870,30 +1035,66 @@ fn eligible(index: usize, remaining: &[usize], history: &History) -> bool {
         })
 }
 
-fn apply_without_observation(model: &Model, operation: &OperationKind) -> Option<Model> {
-    apply_operation(model, operation).map(|(next, _)| next)
+fn apply_without_observation(model: &Model, operation: &Operation) -> Option<Model> {
+    apply_operation(model, &operation.kind, operation.deadline).map(|(next, _)| next)
 }
 
-fn apply_observed(model: &Model, operation: &OperationKind, observed: &Outcome) -> Option<Model> {
-    if matches!(observed, Outcome::Error) {
+fn apply_observed(model: &Model, operation: &Operation) -> Option<Model> {
+    if matches!(operation.outcome, Outcome::Error) {
         return Some(model.clone());
     }
-    let (next, expected) = apply_operation(model, operation)?;
-    if &expected == observed {
+    if let OperationKind::Get { key } = &operation.kind {
+        let stored = model.get(key);
+        let visible_allowed = stored.is_some_and(|stored| {
+            stored
+                .deadline
+                .is_none_or(|deadline| operation.invoke < deadline)
+        });
+        let absent_allowed = stored.is_none_or(|stored| {
+            stored.deadline.is_some_and(|deadline| {
+                operation
+                    .complete
+                    .is_some_and(|complete| complete >= deadline)
+            })
+        });
+        return match &operation.outcome {
+            Outcome::Value(Some(observed))
+                if visible_allowed && stored.is_some_and(|stored| stored.value == *observed) =>
+            {
+                Some(model.clone())
+            }
+            Outcome::Value(None) if absent_allowed => Some(model.clone()),
+            _ => None,
+        };
+    }
+    let (next, expected) = apply_operation(model, &operation.kind, operation.deadline)?;
+    if expected == operation.outcome {
         Some(next)
     } else {
         None
     }
 }
 
-fn apply_operation(model: &Model, operation: &OperationKind) -> Option<(Model, Outcome)> {
+fn apply_operation(
+    model: &Model,
+    operation: &OperationKind,
+    deadline: Option<Time>,
+) -> Option<(Model, Outcome)> {
     let mut next = model.clone();
     let outcome = match operation {
         OperationKind::Set { key, value } => {
-            next.insert(key.clone(), value.clone());
+            next.insert(
+                key.clone(),
+                ModelValue {
+                    value: value.clone(),
+                    deadline,
+                },
+            );
             Outcome::Ok
         }
-        OperationKind::Get { key } => Outcome::Value(next.get(key).cloned()),
+        OperationKind::Get { key } => {
+            Outcome::Value(next.get(key).map(|value| value.value.clone()))
+        }
         OperationKind::Del { key } => {
             next.remove(key);
             Outcome::Ok
@@ -901,11 +1102,17 @@ fn apply_operation(model: &Model, operation: &OperationKind) -> Option<(Model, O
         OperationKind::Incr { key } => {
             let old = next
                 .get(key)
-                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| std::str::from_utf8(&value.value).ok())
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(0);
             let new = old.checked_add(1)?;
-            next.insert(key.clone(), new.to_string().into_bytes());
+            next.insert(
+                key.clone(),
+                ModelValue {
+                    value: new.to_string().into_bytes(),
+                    deadline: None,
+                },
+            );
             Outcome::Integer(new)
         }
         OperationKind::Cas {
@@ -913,8 +1120,14 @@ fn apply_operation(model: &Model, operation: &OperationKind) -> Option<(Model, O
             expected,
             value,
         } => {
-            if next.get(key) == expected.as_ref() {
-                next.insert(key.clone(), value.clone());
+            if next.get(key).map(|stored| &stored.value) == expected.as_ref() {
+                next.insert(
+                    key.clone(),
+                    ModelValue {
+                        value: value.clone(),
+                        deadline: None,
+                    },
+                );
                 Outcome::Cas(true)
             } else {
                 Outcome::Cas(false)
@@ -924,7 +1137,7 @@ fn apply_operation(model: &Model, operation: &OperationKind) -> Option<(Model, O
             let mut values = next
                 .iter()
                 .filter(|(key, _)| prefix.as_ref().is_none_or(|prefix| key.starts_with(prefix)))
-                .map(|(key, value)| (key.clone(), value.clone()))
+                .map(|(key, value)| (key.clone(), value.value.clone()))
                 .collect::<Vec<_>>();
             values.truncate(*limit);
             Outcome::Scan(values)
@@ -1013,6 +1226,11 @@ pub enum AnomalyClass {
     DirtyRead,
     StaleRead,
     Resurrection,
+    NonMonotonicIncr,
+    DuplicateApply,
+    AckedWriteLost,
+    LostUpdate,
+    ReplicaDivergence,
     Unclassified,
 }
 
@@ -1023,6 +1241,11 @@ impl AnomalyClass {
             Self::DirtyRead => "dirty-read",
             Self::StaleRead => "stale-read",
             Self::Resurrection => "resurrection",
+            Self::NonMonotonicIncr => "non-monotonic-incr",
+            Self::DuplicateApply => "duplicate-apply",
+            Self::AckedWriteLost => "acked-write-lost",
+            Self::LostUpdate => "lost-update",
+            Self::ReplicaDivergence => "replica-divergence",
             Self::Unclassified => "unclassified",
         }
     }
@@ -1036,8 +1259,6 @@ pub struct Anomaly {
 }
 
 /// Classify only facts that are certain from real-time intervals.  The
-/// current history format has no TTL/deadline evidence, so this deliberately
-/// does not label persistence anomalies when an expiry could explain them.
 #[must_use]
 pub fn classify_anomalies(history: &History, initial: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<Anomaly> {
     let mut anomalies = Vec::new();
@@ -1049,18 +1270,15 @@ pub fn classify_anomalies(history: &History, initial: &BTreeMap<Vec<u8>, Vec<u8>
         let Some(read_complete) = read.complete else {
             continue;
         };
+        if read.consistency != ConsistencyMode::Strong || read.diagnostic != DiagnosticKind::None {
+            continue;
+        }
 
         for deleted in &history.operations {
             if !matches!(&deleted.kind, OperationKind::Del { key: deleted_key } if deleted_key == key)
                 || deleted.outcome != Outcome::Ok
                 || !happens_before(deleted, read)
-                || has_intervening_mutation(
-                    history,
-                    key,
-                    deleted.complete,
-                    read_complete,
-                    deleted.id,
-                )
+                || has_intervening_mutation(history, key, deleted.invoke, read_complete, deleted.id)
                 || value.is_none()
             {
                 continue;
@@ -1080,10 +1298,12 @@ pub fn classify_anomalies(history: &History, initial: &BTreeMap<Vec<u8>, Vec<u8>
                 if written.kind.key() != key
                     || !happens_before(written, read)
                     || expected == observed
+                    || !known_value_before(history, initial, key, observed, read)
+                    || !persistence_interval_is_before_deadline(written, read_complete)
                     || has_intervening_mutation(
                         history,
                         key,
-                        written.complete,
+                        written.invoke,
                         read_complete,
                         written.id,
                     )
@@ -1102,7 +1322,7 @@ pub fn classify_anomalies(history: &History, initial: &BTreeMap<Vec<u8>, Vec<u8>
                     successful_write_value(operation).is_some_and(|written| {
                         operation.kind.key() == key
                             && written == observed
-                            && happens_before(operation, read)
+                            && operation.invoke <= read_complete
                     })
                 });
             if !known_prior_value {
@@ -1114,6 +1334,17 @@ pub fn classify_anomalies(history: &History, initial: &BTreeMap<Vec<u8>, Vec<u8>
             }
         }
     }
+    classify_non_monotonic_increments(history, &mut anomalies);
+    classify_final_probe_failures(history, initial, &mut anomalies);
+    classify_lost_updates(history, &mut anomalies);
+    classify_replica_divergence(history, &mut anomalies);
+    anomalies.sort_by(|left, right| {
+        left.class
+            .cmp(&right.class)
+            .then_with(|| left.operation_ids.cmp(&right.operation_ids))
+            .then_with(|| left.predicate.cmp(right.predicate))
+    });
+    anomalies.dedup();
     if anomalies.is_empty() {
         anomalies.push(Anomaly {
             class: AnomalyClass::Unclassified,
@@ -1124,6 +1355,288 @@ pub fn classify_anomalies(history: &History, initial: &BTreeMap<Vec<u8>, Vec<u8>
     anomalies
 }
 
+fn known_value_before(
+    history: &History,
+    initial: &BTreeMap<Vec<u8>, Vec<u8>>,
+    key: &[u8],
+    value: &[u8],
+    read: &Operation,
+) -> bool {
+    initial.get(key).is_some_and(|initial| initial == value)
+        || history.operations.iter().any(|operation| {
+            successful_write_value(operation).is_some_and(|written| {
+                operation.kind.key() == key && written == value && happens_before(operation, read)
+            })
+        })
+}
+
+fn persistence_interval_is_before_deadline(operation: &Operation, end: Time) -> bool {
+    operation.deadline.is_none_or(|deadline| end < deadline)
+}
+
+fn classify_non_monotonic_increments(history: &History, anomalies: &mut Vec<Anomaly>) {
+    for earlier in &history.operations {
+        let (OperationKind::Incr { key }, Outcome::Integer(left)) =
+            (&earlier.kind, &earlier.outcome)
+        else {
+            continue;
+        };
+        for later in &history.operations {
+            let (OperationKind::Incr { key: later_key }, Outcome::Integer(right)) =
+                (&later.kind, &later.outcome)
+            else {
+                continue;
+            };
+            if key == later_key
+                && happens_before(earlier, later)
+                && right < left
+                && !has_intervening_reset(history, key, earlier, later)
+            {
+                anomalies.push(Anomaly {
+                    class: AnomalyClass::NonMonotonicIncr,
+                    operation_ids: vec![earlier.id, later.id],
+                    predicate: "real-time-ordered positive increments returned a decreasing value without an intervening reset",
+                });
+            }
+        }
+    }
+}
+
+fn has_intervening_reset(
+    history: &History,
+    key: &[u8],
+    earlier: &Operation,
+    later: &Operation,
+) -> bool {
+    history.operations.iter().any(|operation| {
+        operation.id != earlier.id
+            && operation.id != later.id
+            && operation.kind.key() == key
+            && matches!(
+                (&operation.kind, &operation.outcome),
+                (
+                    OperationKind::Set { .. } | OperationKind::Del { .. },
+                    Outcome::Ok
+                ) | (OperationKind::Cas { .. }, Outcome::Cas(true))
+            )
+            && operation.invoke < later.invoke
+            && operation
+                .complete
+                .is_some_and(|complete| complete > earlier.complete.unwrap_or(earlier.invoke))
+    })
+}
+
+fn classify_final_probe_failures(
+    history: &History,
+    initial: &BTreeMap<Vec<u8>, Vec<u8>>,
+    anomalies: &mut Vec<Anomaly>,
+) {
+    for probe in &history.operations {
+        let (OperationKind::Get { key }, DiagnosticKind::FinalProbe) =
+            (&probe.kind, &probe.diagnostic)
+        else {
+            continue;
+        };
+        let Some(probe_complete) = probe.complete else {
+            continue;
+        };
+        for mutation in &history.operations {
+            if mutation.kind.key() != key
+                || !is_successful_mutation(mutation)
+                || !happens_before(mutation, probe)
+                || !persistence_interval_is_before_deadline(mutation, probe_complete)
+                || has_intervening_mutation(
+                    history,
+                    key,
+                    mutation.invoke,
+                    probe_complete,
+                    mutation.id,
+                )
+            {
+                continue;
+            }
+            if expected_mutation_observation(mutation)
+                .is_some_and(|expected| !observation_matches(&expected, &probe.outcome))
+            {
+                anomalies.push(Anomaly {
+                    class: AnomalyClass::AckedWriteLost,
+                    operation_ids: vec![mutation.id, probe.id],
+                    predicate: "acknowledged final mutation precedes a quiescent strong final probe returning another state",
+                });
+            }
+        }
+
+        let successful = history
+            .operations
+            .iter()
+            .filter(|operation| operation.kind.key() == key && happens_before(operation, probe))
+            .filter(|operation| is_successful_mutation(operation))
+            .collect::<Vec<_>>();
+        if !successful.is_empty()
+            && successful
+                .iter()
+                .all(|operation| matches!(operation.kind, OperationKind::Incr { .. }))
+        {
+            let unique = successful
+                .iter()
+                .map(|operation| (operation.client, operation.sequence))
+                .collect::<BTreeSet<_>>();
+            if unique.len() < successful.len() {
+                let initial_value = initial
+                    .get(key)
+                    .and_then(|value| parse_numeric_bytes(value))
+                    .unwrap_or(0);
+                let expected =
+                    initial_value.saturating_add(i64::try_from(unique.len()).unwrap_or(i64::MAX));
+                if outcome_numeric(&probe.outcome).is_some_and(|actual| actual > expected) {
+                    let mut ids = successful
+                        .iter()
+                        .map(|operation| operation.id)
+                        .collect::<Vec<_>>();
+                    ids.push(probe.id);
+                    anomalies.push(Anomaly {
+                        class: AnomalyClass::DuplicateApply,
+                        operation_ids: ids,
+                        predicate: "final numeric probe exceeds the sum of unique positive increments for repeated client sequences",
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExpectedObservation {
+    Value(Option<Vec<u8>>),
+    Integer(i64),
+}
+
+fn expected_mutation_observation(operation: &Operation) -> Option<ExpectedObservation> {
+    match (&operation.kind, &operation.outcome) {
+        (OperationKind::Set { value, .. }, Outcome::Ok)
+        | (OperationKind::Cas { value, .. }, Outcome::Cas(true)) => {
+            Some(ExpectedObservation::Value(Some(value.clone())))
+        }
+        (OperationKind::Del { .. }, Outcome::Ok) => Some(ExpectedObservation::Value(None)),
+        (OperationKind::Incr { .. }, Outcome::Integer(value)) => {
+            Some(ExpectedObservation::Integer(*value))
+        }
+        _ => None,
+    }
+}
+
+fn observation_matches(expected: &ExpectedObservation, outcome: &Outcome) -> bool {
+    match (expected, outcome) {
+        (ExpectedObservation::Value(expected), Outcome::Value(actual)) => expected == actual,
+        (ExpectedObservation::Integer(expected), actual) => {
+            outcome_numeric(actual) == Some(*expected)
+        }
+        _ => false,
+    }
+}
+
+fn outcome_numeric(outcome: &Outcome) -> Option<i64> {
+    match outcome {
+        Outcome::Integer(value) => Some(*value),
+        Outcome::Value(Some(value)) => parse_numeric_bytes(value),
+        _ => None,
+    }
+}
+
+fn parse_numeric_bytes(value: &[u8]) -> Option<i64> {
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+fn classify_lost_updates(history: &History, anomalies: &mut Vec<Anomaly>) {
+    for left in &history.operations {
+        let (
+            OperationKind::Cas {
+                key,
+                expected,
+                value,
+            },
+            Outcome::Cas(true),
+        ) = (&left.kind, &left.outcome)
+        else {
+            continue;
+        };
+        for right in &history.operations {
+            let (
+                OperationKind::Cas {
+                    key: right_key,
+                    expected: right_expected,
+                    value: right_value,
+                },
+                Outcome::Cas(true),
+            ) = (&right.kind, &right.outcome)
+            else {
+                continue;
+            };
+            if left.id >= right.id
+                || key != right_key
+                || expected != right_expected
+                || value == right_value
+                || !(happens_before(left, right) || happens_before(right, left))
+            {
+                continue;
+            }
+            for probe in &history.operations {
+                if !matches!(probe.diagnostic, DiagnosticKind::FinalProbe)
+                    || probe.kind.key() != key
+                    || !happens_before(left, probe)
+                    || !happens_before(right, probe)
+                {
+                    continue;
+                }
+                let observed = match &probe.outcome {
+                    Outcome::Value(Some(value)) => value,
+                    _ => continue,
+                };
+                if observed == value || observed == right_value {
+                    anomalies.push(Anomaly {
+                        class: AnomalyClass::LostUpdate,
+                        operation_ids: vec![left.id, right.id, probe.id],
+                        predicate: "two ordered compare-and-set transitions from one predecessor both acknowledged while the final probe contains only one result",
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn classify_replica_divergence(history: &History, anomalies: &mut Vec<Anomaly>) {
+    for (index, left) in history.operations.iter().enumerate() {
+        let DiagnosticKind::ReplicaState {
+            replica,
+            committed_index,
+            state_hash,
+        } = left.diagnostic
+        else {
+            continue;
+        };
+        for right in history.operations.iter().skip(index + 1) {
+            let DiagnosticKind::ReplicaState {
+                replica: right_replica,
+                committed_index: right_index,
+                state_hash: right_hash,
+            } = right.diagnostic
+            else {
+                continue;
+            };
+            if replica != right_replica
+                && committed_index == right_index
+                && state_hash != right_hash
+            {
+                anomalies.push(Anomaly {
+                    class: AnomalyClass::ReplicaDivergence,
+                    operation_ids: vec![left.id, right.id],
+                    predicate: "diagnostic replica probes at one committed index returned different state hashes",
+                });
+            }
+        }
+    }
+}
+
 fn happens_before(left: &Operation, right: &Operation) -> bool {
     left.complete
         .is_some_and(|complete| complete < right.invoke)
@@ -1132,19 +1645,22 @@ fn happens_before(left: &Operation, right: &Operation) -> bool {
 fn has_intervening_mutation(
     history: &History,
     key: &[u8],
-    after: Option<Time>,
-    read_complete: Time,
+    left_invoke: Time,
+    right_complete: Time,
     excluded_id: u64,
 ) -> bool {
-    let Some(after) = after else {
-        return false;
-    };
     history.operations.iter().any(|operation| {
         operation.id != excluded_id
             && operation.kind.key() == key
             && is_successful_mutation(operation)
-            && operation.invoke < read_complete
-            && operation.complete.is_some_and(|complete| complete > after)
+            // Equal endpoints are concurrent under this history's strict
+            // happens-before relation and can therefore linearize between the
+            // two observations.  Exclude a mutation only when real time forces
+            // it wholly before the left operation or wholly after the right.
+            && operation.invoke <= right_complete
+            && operation
+                .complete
+                .is_some_and(|complete| complete >= left_invoke)
     })
 }
 
@@ -1164,6 +1680,199 @@ fn successful_write_value(operation: &Operation) -> Option<&[u8]> {
         (OperationKind::Set { value, .. }, Outcome::Ok) => Some(value),
         (OperationKind::Cas { value, .. }, Outcome::Cas(true)) => Some(value),
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SessionGuarantee {
+    ReadYourWrites,
+    MonotonicReads,
+    MonotonicWrites,
+    WritesFollowReads,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionViolation {
+    pub client: u64,
+    pub guarantee: SessionGuarantee,
+    pub operation_ids: Vec<u64>,
+    pub predicate: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientSessionReport {
+    pub client: u64,
+    pub eligible_for_linearizability_cross_check: bool,
+    pub operation_ids: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionReport {
+    pub clients: Vec<ClientSessionReport>,
+    pub violations: Vec<SessionViolation>,
+}
+
+impl SessionReport {
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.violations.is_empty()
+    }
+}
+
+/// Check client-scoped guarantees without reusing the linearizability search
+/// or model transition code. Diagnostics, stale-local reads, admin/client 0,
+/// timeouts, and unknown outcomes are outside this report's proof domain.
+#[must_use]
+pub fn check_session_guarantees(history: &History) -> SessionReport {
+    let mut by_client = BTreeMap::<u64, Vec<&Operation>>::new();
+    for operation in &history.operations {
+        if operation.client != 0 {
+            by_client
+                .entry(operation.client)
+                .or_default()
+                .push(operation);
+        }
+    }
+    let mut report = SessionReport::default();
+    for (client, mut operations) in by_client {
+        operations.sort_by_key(|operation| (operation.invoke, operation.id));
+        let in_domain = operations.iter().all(|operation| {
+            operation.complete.is_some()
+                && operation.consistency == ConsistencyMode::Strong
+                && operation.diagnostic == DiagnosticKind::None
+                && !matches!(operation.outcome, Outcome::Timeout | Outcome::Error)
+        });
+        let sequential = operations.windows(2).all(|pair| {
+            pair[0]
+                .complete
+                .is_some_and(|complete| complete < pair[1].invoke)
+        });
+        report.clients.push(ClientSessionReport {
+            client,
+            eligible_for_linearizability_cross_check: in_domain && sequential,
+            operation_ids: operations.iter().map(|operation| operation.id).collect(),
+        });
+        if !in_domain || !sequential {
+            continue;
+        }
+        for pair in operations.windows(2) {
+            let earlier = pair[0];
+            let later = pair[1];
+            if earlier.sequence > later.sequence {
+                let guarantee = if matches!(earlier.kind, OperationKind::Get { .. })
+                    && is_successful_mutation(later)
+                {
+                    SessionGuarantee::WritesFollowReads
+                } else {
+                    SessionGuarantee::MonotonicWrites
+                };
+                report.violations.push(SessionViolation {
+                    client,
+                    guarantee,
+                    operation_ids: vec![earlier.id, later.id],
+                    predicate: "a sequential client request sequence regressed",
+                });
+            }
+        }
+        for write in &operations {
+            let Some(expected) = expected_mutation_observation(write) else {
+                continue;
+            };
+            for read in &operations {
+                if !matches!(read.kind, OperationKind::Get { .. })
+                    || read.kind.key() != write.kind.key()
+                    || !happens_before(write, read)
+                    || write.deadline.is_some_and(|deadline| {
+                        read.complete.is_none_or(|complete| complete >= deadline)
+                    })
+                    || has_intervening_mutation(
+                        history,
+                        write.kind.key(),
+                        write.invoke,
+                        read.complete.unwrap_or(read.invoke),
+                        write.id,
+                    )
+                {
+                    continue;
+                }
+                if !observation_matches(&expected, &read.outcome) {
+                    report.violations.push(SessionViolation {
+                        client,
+                        guarantee: SessionGuarantee::ReadYourWrites,
+                        operation_ids: vec![write.id, read.id],
+                        predicate: "a later sequential strong read did not observe the client's quiescent acknowledged write",
+                    });
+                }
+            }
+        }
+        let reads = operations
+            .iter()
+            .copied()
+            .filter(|operation| matches!(operation.kind, OperationKind::Get { .. }))
+            .collect::<Vec<_>>();
+        for pair in reads.windows(2) {
+            let earlier = pair[0];
+            let later = pair[1];
+            if earlier.kind.key() == later.kind.key()
+                && earlier.outcome != later.outcome
+                && !has_possible_expiry_between(history, earlier, later)
+                && !has_intervening_mutation(
+                    history,
+                    earlier.kind.key(),
+                    earlier.invoke,
+                    later.complete.unwrap_or(later.invoke),
+                    earlier.id,
+                )
+            {
+                report.violations.push(SessionViolation {
+                    client,
+                    guarantee: SessionGuarantee::MonotonicReads,
+                    operation_ids: vec![earlier.id, later.id],
+                    predicate: "two sequential strong reads changed without any intervening mutation",
+                });
+            }
+        }
+    }
+    report
+}
+
+fn has_possible_expiry_between(history: &History, left: &Operation, right: &Operation) -> bool {
+    history.operations.iter().any(|operation| {
+        operation.kind.key() == left.kind.key()
+            && operation.deadline.is_some_and(|deadline| {
+                deadline >= left.invoke
+                    && right.complete.is_some_and(|complete| deadline <= complete)
+            })
+    })
+}
+
+/// Release-blocking implication: a linearizable verdict and an eligible
+/// well-formed strong client history cannot contradict the session checker.
+#[must_use]
+pub fn cross_check_linearizable_sessions(history: &History, verdict: &Verdict) -> InvariantReport {
+    if !matches!(verdict, Verdict::Linearizable { .. }) {
+        return InvariantReport::default();
+    }
+    let report = check_session_guarantees(history);
+    let eligible = report
+        .clients
+        .iter()
+        .filter(|client| client.eligible_for_linearizability_cross_check)
+        .map(|client| client.client)
+        .collect::<BTreeSet<_>>();
+    InvariantReport {
+        violations: report
+            .violations
+            .into_iter()
+            .filter(|violation| eligible.contains(&violation.client))
+            .map(|violation| InvariantViolation {
+                name: "linearizable_session_implication",
+                detail: format!(
+                    "client {} {:?} contradiction at {:?}",
+                    violation.client, violation.guarantee, violation.operation_ids
+                ),
+            })
+            .collect(),
     }
 }
 
@@ -1220,7 +1929,8 @@ mod same_instant_tests {
             check(
                 &history,
                 CheckerConfig {
-                    max_states: 100_000
+                    max_states: 100_000,
+                    ..CheckerConfig::default()
                 }
             ),
             Verdict::Linearizable { .. }
@@ -1259,7 +1969,8 @@ mod same_instant_tests {
             check(
                 &history,
                 CheckerConfig {
-                    max_states: 100_000
+                    max_states: 100_000,
+                    ..CheckerConfig::default()
                 }
             ),
             Verdict::NotLinearizable { .. }
@@ -1514,6 +2225,26 @@ mod tests {
     }
 
     #[test]
+    fn trap_history_reads_legacy_v1_fixture() {
+        let text = std::str::from_utf8(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/golden/legacy/cchy-v1.bin"
+        )))
+        .expect("legacy CCHY fixture is text");
+        let history = decode_history_v1_tsv(text).expect("legacy CCHY fixture");
+        assert!(
+            !history.operations.is_empty(),
+            "legacy history must retain operations"
+        );
+        assert!(
+            history
+                .operations
+                .iter()
+                .all(|operation| operation.complete.is_some())
+        );
+    }
+
+    #[test]
     fn trap_chunk_cannot_claim_an_empty_initial_state() {
         let history = History {
             operations: vec![Operation::completed(
@@ -1573,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn trap_witness_is_smaller_than_the_history_and_still_fails() {
+    fn trap_witness_is_smaller_than_the_history() {
         let history = History {
             operations: vec![
                 Operation::completed(
@@ -1617,6 +2348,51 @@ mod tests {
         };
         assert!(matches!(
             check(&reduced, CheckerConfig::default()),
+            Verdict::NotLinearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn trap_witness_still_fails_the_checker() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Set {
+                        key: b"w".to_vec(),
+                        value: b"value".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: b"w".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(None),
+                ),
+            ],
+        };
+        let Verdict::NotLinearizable { witness, .. } = check(&history, CheckerConfig::default())
+        else {
+            panic!("planted history must fail");
+        };
+        let reduced = History {
+            operations: history
+                .operations
+                .iter()
+                .filter(|operation| witness.operation_ids.contains(&operation.id))
+                .cloned()
+                .collect(),
+        };
+        assert!(matches!(
+            check_with_initial_raw(
+                &reduced,
+                initial_model(BTreeMap::new()),
+                CheckerConfig::default(),
+            ),
             Verdict::NotLinearizable { .. }
         ));
     }
@@ -1739,7 +2515,7 @@ mod tests {
     }
 
     #[test]
-    fn trap_resurrection_checker_flags_any_value_not_only_empty_bytes() {
+    fn trap_classifies_resurrection() {
         let history = History {
             operations: vec![
                 Operation::completed(
@@ -1759,10 +2535,11 @@ mod tests {
             ],
         };
         assert!(!check_no_resurrection(&history).is_ok());
+        assert!(anomaly_classes(&history).contains(&AnomalyClass::Resurrection));
     }
 
     #[test]
-    fn trap_anomaly_classifier_uses_only_certain_real_time_order() {
+    fn trap_classifier_does_not_order_concurrent_operations() {
         let resurrection = History {
             operations: vec![
                 Operation::completed(
@@ -1811,7 +2588,7 @@ mod tests {
     }
 
     #[test]
-    fn trap_anomaly_classifier_labels_stale_read_without_intervening_write() {
+    fn trap_classifies_stale_read() {
         let history = History {
             operations: vec![
                 Operation::completed(
@@ -1833,10 +2610,443 @@ mod tests {
                 ),
             ],
         };
+        let initial = [(b"k".to_vec(), b"old".to_vec())].into_iter().collect();
         assert!(
-            classify_anomalies(&history, &BTreeMap::new())
+            classify_anomalies(&history, &initial)
                 .iter()
                 .any(|anomaly| anomaly.class == AnomalyClass::StaleRead)
+        );
+    }
+
+    fn anomaly_classes(history: &History) -> BTreeSet<AnomalyClass> {
+        classify_anomalies(history, &BTreeMap::new())
+            .into_iter()
+            .map(|anomaly| anomaly.class)
+            .collect()
+    }
+
+    #[test]
+    fn trap_classifies_dirty_read() {
+        let history = History {
+            operations: vec![Operation::completed(
+                1,
+                OperationKind::Get { key: b"k".to_vec() },
+                Time::from_nanos(1),
+                Time::from_nanos(2),
+                Outcome::Value(Some(b"never-written".to_vec())),
+            )],
+        };
+        assert!(anomaly_classes(&history).contains(&AnomalyClass::DirtyRead));
+    }
+
+    #[test]
+    fn trap_classifies_non_monotonic_incr() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Incr { key: b"n".to_vec() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Integer(4),
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Incr { key: b"n".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Integer(3),
+                ),
+            ],
+        };
+        assert!(anomaly_classes(&history).contains(&AnomalyClass::NonMonotonicIncr));
+    }
+
+    #[test]
+    fn trap_classifies_duplicate_apply() {
+        let mut first = Operation::completed(
+            1,
+            OperationKind::Incr { key: b"d".to_vec() },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Integer(1),
+        );
+        first.client = 7;
+        first.sequence = 9;
+        let mut retry = first.clone();
+        retry.id = 2;
+        retry.invoke = Time::from_nanos(3);
+        retry.complete = Some(Time::from_nanos(4));
+        let history = History {
+            operations: vec![
+                first,
+                retry,
+                Operation::completed(
+                    3,
+                    OperationKind::Get { key: b"d".to_vec() },
+                    Time::from_nanos(5),
+                    Time::from_nanos(6),
+                    Outcome::Value(Some(b"2".to_vec())),
+                )
+                .final_probe(),
+            ],
+        };
+        assert!(anomaly_classes(&history).contains(&AnomalyClass::DuplicateApply));
+    }
+
+    #[test]
+    fn trap_classifies_acked_write_lost() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Set {
+                        key: b"a".to_vec(),
+                        value: b"kept".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: b"a".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(None),
+                )
+                .final_probe(),
+            ],
+        };
+        assert!(anomaly_classes(&history).contains(&AnomalyClass::AckedWriteLost));
+    }
+
+    #[test]
+    fn trap_classifies_lost_update() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Cas {
+                        key: b"c".to_vec(),
+                        expected: Some(b"base".to_vec()),
+                        value: b"left".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Cas(true),
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Cas {
+                        key: b"c".to_vec(),
+                        expected: Some(b"base".to_vec()),
+                        value: b"right".to_vec(),
+                    },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Cas(true),
+                ),
+                Operation::completed(
+                    3,
+                    OperationKind::Get { key: b"c".to_vec() },
+                    Time::from_nanos(5),
+                    Time::from_nanos(6),
+                    Outcome::Value(Some(b"right".to_vec())),
+                )
+                .final_probe(),
+            ],
+        };
+        assert!(anomaly_classes(&history).contains(&AnomalyClass::LostUpdate));
+    }
+
+    #[test]
+    fn trap_classifies_replica_divergence() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Get { key: Vec::new() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Value(None),
+                )
+                .replica_probe(1, 42, 100),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: Vec::new() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Value(None),
+                )
+                .replica_probe(2, 42, 200),
+            ],
+        };
+        assert!(anomaly_classes(&history).contains(&AnomalyClass::ReplicaDivergence));
+    }
+
+    #[test]
+    fn trap_extended_anomaly_predicates_require_explicit_evidence() {
+        let non_monotonic = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Incr { key: b"n".to_vec() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Integer(4),
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Incr { key: b"n".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Integer(3),
+                ),
+            ],
+        };
+        assert!(anomaly_classes(&non_monotonic).contains(&AnomalyClass::NonMonotonicIncr));
+
+        let mut first = Operation::completed(
+            3,
+            OperationKind::Incr { key: b"d".to_vec() },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Integer(1),
+        );
+        first.client = 7;
+        first.sequence = 9;
+        let mut retry = first.clone();
+        retry.id = 4;
+        retry.invoke = Time::from_nanos(3);
+        retry.complete = Some(Time::from_nanos(4));
+        let duplicate = History {
+            operations: vec![
+                first,
+                retry,
+                Operation::completed(
+                    5,
+                    OperationKind::Get { key: b"d".to_vec() },
+                    Time::from_nanos(5),
+                    Time::from_nanos(6),
+                    Outcome::Value(Some(b"2".to_vec())),
+                )
+                .final_probe(),
+            ],
+        };
+        assert!(anomaly_classes(&duplicate).contains(&AnomalyClass::DuplicateApply));
+
+        let acked_lost = History {
+            operations: vec![
+                Operation::completed(
+                    6,
+                    OperationKind::Set {
+                        key: b"a".to_vec(),
+                        value: b"kept".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                Operation::completed(
+                    7,
+                    OperationKind::Get { key: b"a".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(None),
+                )
+                .final_probe(),
+            ],
+        };
+        assert!(anomaly_classes(&acked_lost).contains(&AnomalyClass::AckedWriteLost));
+
+        let lost_update = History {
+            operations: vec![
+                Operation::completed(
+                    8,
+                    OperationKind::Cas {
+                        key: b"c".to_vec(),
+                        expected: Some(b"base".to_vec()),
+                        value: b"left".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Cas(true),
+                ),
+                Operation::completed(
+                    9,
+                    OperationKind::Cas {
+                        key: b"c".to_vec(),
+                        expected: Some(b"base".to_vec()),
+                        value: b"right".to_vec(),
+                    },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Cas(true),
+                ),
+                Operation::completed(
+                    10,
+                    OperationKind::Get { key: b"c".to_vec() },
+                    Time::from_nanos(5),
+                    Time::from_nanos(6),
+                    Outcome::Value(Some(b"right".to_vec())),
+                )
+                .final_probe(),
+            ],
+        };
+        assert!(anomaly_classes(&lost_update).contains(&AnomalyClass::LostUpdate));
+
+        let divergence = History {
+            operations: vec![
+                Operation::completed(
+                    11,
+                    OperationKind::Get { key: Vec::new() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Value(None),
+                )
+                .replica_probe(1, 42, 100),
+                Operation::completed(
+                    12,
+                    OperationKind::Get { key: Vec::new() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Value(None),
+                )
+                .replica_probe(2, 42, 200),
+            ],
+        };
+        assert!(anomaly_classes(&divergence).contains(&AnomalyClass::ReplicaDivergence));
+    }
+
+    #[test]
+    fn trap_anomaly_near_misses_remain_unclassified() {
+        let ordinary_probe = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Set {
+                        key: b"k".to_vec(),
+                        value: b"v".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: b"k".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(None),
+                ),
+            ],
+        };
+        assert!(!anomaly_classes(&ordinary_probe).contains(&AnomalyClass::AckedWriteLost));
+
+        let mut expiring = ordinary_probe.operations[0].clone();
+        expiring.deadline = Some(Time::from_nanos(3));
+        let expired_probe = History {
+            operations: vec![expiring, ordinary_probe.operations[1].clone().final_probe()],
+        };
+        assert!(!anomaly_classes(&expired_probe).contains(&AnomalyClass::AckedWriteLost));
+
+        let replica_near_miss = History {
+            operations: vec![
+                Operation::completed(
+                    3,
+                    OperationKind::Get { key: Vec::new() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Value(None),
+                )
+                .replica_probe(1, 9, 1),
+                Operation::completed(
+                    4,
+                    OperationKind::Get { key: Vec::new() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Value(None),
+                )
+                .replica_probe(2, 10, 2),
+            ],
+        };
+        assert!(!anomaly_classes(&replica_near_miss).contains(&AnomalyClass::ReplicaDivergence));
+    }
+
+    #[test]
+    fn trap_linearizable_implies_session_guarantees() {
+        let mut write = Operation::completed(
+            1,
+            OperationKind::Set {
+                key: b"session".to_vec(),
+                value: b"value".to_vec(),
+            },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Ok,
+        );
+        write.client = 9;
+        write.sequence = 1;
+        let mut read = Operation::completed(
+            2,
+            OperationKind::Get {
+                key: b"session".to_vec(),
+            },
+            Time::from_nanos(3),
+            Time::from_nanos(4),
+            Outcome::Value(Some(b"value".to_vec())),
+        );
+        read.client = 9;
+        read.sequence = 2;
+        let history = History {
+            operations: vec![write, read],
+        };
+        let verdict = check(&history, CheckerConfig::default());
+        assert!(matches!(verdict, Verdict::Linearizable { .. }));
+        assert!(check_session_guarantees(&history).is_ok());
+        assert!(cross_check_linearizable_sessions(&history, &verdict).is_ok());
+    }
+
+    #[test]
+    fn trap_session_crosscheck_excludes_stale_reads() {
+        let mut write = Operation::completed(
+            1,
+            OperationKind::Set {
+                key: b"mixed".to_vec(),
+                value: b"value".to_vec(),
+            },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Ok,
+        );
+        write.client = 4;
+        write.sequence = 1;
+        let mut stale = Operation::completed(
+            2,
+            OperationKind::Get {
+                key: b"mixed".to_vec(),
+            },
+            Time::from_nanos(3),
+            Time::from_nanos(4),
+            Outcome::Value(None),
+        );
+        stale.client = 4;
+        stale.sequence = 2;
+        stale.consistency = ConsistencyMode::StaleLocal;
+        let history = History {
+            operations: vec![write, stale],
+        };
+        let report = check_session_guarantees(&history);
+        assert!(
+            report
+                .clients
+                .iter()
+                .all(|client| { !client.eligible_for_linearizability_cross_check })
+        );
+        assert!(
+            cross_check_linearizable_sessions(&history, &Verdict::Linearizable { visited: 1 })
+                .is_ok()
         );
     }
 
@@ -1991,7 +3201,13 @@ mod tests {
             ));
         }
         assert!(matches!(
-            check(&history, CheckerConfig { max_states: 1 }),
+            check(
+                &history,
+                CheckerConfig {
+                    max_states: 1,
+                    ..CheckerConfig::default()
+                },
+            ),
             Verdict::Linearizable { .. }
         ));
     }
@@ -2012,7 +3228,13 @@ mod tests {
             ));
         }
         assert!(matches!(
-            check(&history, CheckerConfig { max_states: 1 }),
+            check(
+                &history,
+                CheckerConfig {
+                    max_states: 1,
+                    ..CheckerConfig::default()
+                },
+            ),
             Verdict::Undecided { .. }
         ));
     }
@@ -2113,12 +3335,14 @@ mod tests {
                     if search(history, next_remaining.clone(), model.clone()) {
                         return true;
                     }
-                    if let Some((next, _)) = apply_operation(&model, &operation.kind)
+                    if let Some((next, _)) =
+                        apply_operation(&model, &operation.kind, operation.deadline)
                         && search(history, next_remaining, next)
                     {
                         return true;
                     }
-                } else if let Some((next, expected)) = apply_operation(&model, &operation.kind)
+                } else if let Some((next, expected)) =
+                    apply_operation(&model, &operation.kind, operation.deadline)
                     && expected == operation.outcome
                     && search(history, next_remaining, next)
                 {
@@ -2150,6 +3374,51 @@ mod tests {
         }
         assert!(matches!(
             check(&history, CheckerConfig::default()),
+            Verdict::NotLinearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn trap_ttl_checker_allows_only_a_true_deadline_straddle() {
+        let set = |id| {
+            let mut operation = Operation::completed(
+                id,
+                OperationKind::Set {
+                    key: b"ttl".to_vec(),
+                    value: b"v".to_vec(),
+                },
+                Time::from_nanos(1),
+                Time::from_nanos(2),
+                Outcome::Ok,
+            );
+            operation.deadline = Some(Time::from_nanos(10));
+            operation
+        };
+        let read = |id, invoke, complete, outcome| {
+            Operation::completed(
+                id,
+                OperationKind::Get {
+                    key: b"ttl".to_vec(),
+                },
+                Time::from_nanos(invoke),
+                Time::from_nanos(complete),
+                outcome,
+            )
+        };
+        for outcome in [Outcome::Value(Some(b"v".to_vec())), Outcome::Value(None)] {
+            let history = History {
+                operations: vec![set(1), read(2, 9, 11, outcome)],
+            };
+            assert!(matches!(
+                check(&history, CheckerConfig::default()),
+                Verdict::Linearizable { .. }
+            ));
+        }
+        let after_deadline = History {
+            operations: vec![set(1), read(2, 11, 12, Outcome::Value(Some(b"v".to_vec())))],
+        };
+        assert!(matches!(
+            check(&after_deadline, CheckerConfig::default()),
             Verdict::NotLinearizable { .. }
         ));
     }
