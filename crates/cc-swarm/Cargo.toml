@@ -16,8 +16,10 @@ cc-host = { path = "../cc-host" }
 cc-kv = { path = "../cc-kv" }
 cc-log = { path = "../cc-log" }
 cc-raft = { path = "../cc-raft" }
+cc-resp = { path = "../cc-resp" }
 cc-sim = { path = "../cc-sim" }
 cc-store = { path = "../cc-store" }
+cc-wal = { path = "../cc-wal" }
 
 [[bin]]
 name = "cc-swarm"

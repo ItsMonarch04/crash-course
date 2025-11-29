@@ -4,10 +4,12 @@
 #![forbid(unsafe_code)]
 #![doc = "The real deterministic cluster fixture used by cc-swarm and later theater work."]
 
+mod fuzzing;
 mod ledger;
+pub use fuzzing::{FuzzOutcome, MAX_FUZZ_INPUT_BYTES, fuzz_decode, minimize_case, mutate_case};
 pub use ledger::{
     LEDGER_COLUMNS, LEDGER_HEADER, LedgerError, LedgerKey, LedgerRow, LedgerVerdict, SeedLedger,
-    Shard, ShardError,
+    Shard, ShardError, encode_ledger_row, validate_sharded_coverage,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,15 +17,15 @@ use std::fmt;
 
 use cc_checker::{
     CheckerConfig, History, LivenessReport, Operation, OperationKind, Outcome, Verdict, check,
-    check_liveness,
+    check_liveness, cross_check_linearizable_sessions,
 };
 use cc_cluster::{NodeConfig, NodeError, RecoveredNode};
 use cc_core::{
-    ClientId, ClusterPolicy, Duration, EventKind, HostLimits, NodeId, Seed, Time, TimerId, Trace,
-    Xoshiro256pp, fnv1a,
+    ClientId, ClusterPolicy, Duration, EventKind, NodeId, Seed, Time, TimerId, Trace, Xoshiro256pp,
+    fnv1a,
 };
 use cc_env::{Effect, FileId, Input, IoResult, WireMsg, decode_peer_frame, encode_peer_frame};
-use cc_host::{BootState, Driver, DriverPoll, HostError};
+use cc_host::{BootState, Driver, DriverPoll, HostError, Usage};
 use cc_kv::{KvCommand, KvReply, decode_reply, encode_command};
 use cc_raft::{RaftConfig, Role};
 use cc_sim::{
@@ -32,7 +34,7 @@ use cc_sim::{
     SimConfig, SimDisk, WorkloadActor, WorkloadOperation, canonicalize_fault_plan,
     shrink_fault_plan,
 };
-use cc_store::{MemoryBlockSource, StoreConfig};
+use cc_store::{BlockRead, BlockReadError, BlockSource, StoreConfig, StoreError};
 
 pub const MAX_OPERATIONS_PER_RUN: u64 = 32;
 pub const REACHABILITY_BEACONS: [&str; 6] = [
@@ -93,15 +95,36 @@ enum ClusterEventKind {
         file: FileId,
         id: cc_core::IoId,
     },
+    DiskReadComplete {
+        node: NodeId,
+        file: FileId,
+        at: u64,
+        len: u32,
+        id: cc_core::IoId,
+    },
+    DiskRenameComplete {
+        node: NodeId,
+        from: FileId,
+        to: FileId,
+        id: cc_core::IoId,
+    },
+    DiskSyncDirComplete {
+        node: NodeId,
+        id: cc_core::IoId,
+    },
     DeferredInput {
         node: NodeId,
         input: Input,
+    },
+    DriverServiceComplete {
+        node: NodeId,
     },
     /// Second half of a joint-consensus transition, scheduled by the host once
     /// the joint config has had time to replicate.
     LeaveJoint(NodeId),
 }
 
+#[derive(Clone)]
 struct NodeSlot {
     config: NodeConfig,
     genesis: cc_log::Genesis,
@@ -109,7 +132,6 @@ struct NodeSlot {
     status: cc_sim::NodeStatus,
     clock_offset: Duration,
     disk: SimDisk,
-    blocks: MemoryBlockSource,
     /// End of the verified `cc-log` framed durable stream.  Every simulator
     /// persistence operation appends one canonical CCLR record or record
     /// batch; recovery owns the semantic replay of that prefix.
@@ -118,6 +140,49 @@ struct NodeSlot {
     /// later simulated arrival from calling into that Driver before its
     /// scheduled write/fsync completion is delivered.
     persistence_ready_at: Option<Time>,
+}
+
+/// Simulator counterpart of the real positioned file reader. It observes a
+/// live process's page-cache namespace, while `SimDisk::crash` first discards
+/// all bytes that were not fsynced. Every result, including an error, carries
+/// the deterministic service charged to the initiating operation.
+struct SimBlockSource<'a> {
+    disk: &'a mut SimDisk,
+}
+
+impl BlockSource for SimBlockSource<'_> {
+    fn read_block(
+        &mut self,
+        file: FileId,
+        offset: u64,
+        len: u32,
+    ) -> Result<BlockRead, BlockReadError> {
+        let service = self.disk.service_time(DiskOperation::Read);
+        match self.disk.read(file, offset, len) {
+            Ok(IoResult::Read(bytes)) => Ok(BlockRead { bytes, service }),
+            Ok(_) => Err(BlockReadError {
+                error: StoreError::Corrupt("sim block read result"),
+                service,
+            }),
+            Err(cc_env::IoError::NotFound) => Err(BlockReadError {
+                error: StoreError::MissingTable {
+                    file_no: match file {
+                        FileId::Sst { file_no } => file_no,
+                        _ => 0,
+                    },
+                },
+                service,
+            }),
+            Err(cc_env::IoError::Corrupt(_)) => Err(BlockReadError {
+                error: StoreError::Corrupt("simulated block corruption"),
+                service,
+            }),
+            Err(_) => Err(BlockReadError {
+                error: StoreError::InvalidInput("simulated block read"),
+                service,
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +221,7 @@ impl NodeSlot {
     }
 }
 
+#[derive(Clone)]
 struct PendingOperation {
     operation: Operation,
     client: u64,
@@ -169,11 +235,26 @@ pub struct ClusterRun {
     pub history: History,
     pub verdict: Verdict,
     pub trace_invariants_ok: bool,
+    pub invariant_violations: Vec<String>,
+    pub run_footprint: RunFootprint,
     pub had_leader: bool,
     pub completed_operations: u64,
     pub event_count: u64,
+    pub peak_total_bytes: u64,
     pub final_log_indices: Vec<(u64, u64, u64)>,
     pub liveness_ok: bool,
+}
+
+/// Run-owned resources that cannot truthfully be attributed to one Driver.
+/// Counts and encoded bytes use the same `Usage` shape as node gauges.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RunFootprint {
+    pub network_inflight: Usage,
+    pub fault_replay: Usage,
+    pub scheduled_events: Usage,
+    pub checker_history: Usage,
+    pub failure_artifact_buffer: Usage,
+    pub theater_checkpoints: Usage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,6 +267,7 @@ pub struct ClusterNodeSnapshot {
     pub applied: u64,
     pub durable_bytes: u64,
     pub disk_service_delay_ns: u64,
+    pub clock_offset_ns: u64,
     pub log_tail: Vec<u64>,
     pub voters: Vec<u64>,
     pub joint: bool,
@@ -276,14 +358,18 @@ pub fn semantic_trace_diff(left: &Trace, right: &Trace) -> Option<TraceDifferenc
 /// issue reports, writeups, and museum exhibits.
 #[must_use]
 pub fn sequence_diagram_svg(trace: &Trace) -> String {
-    let node_count = trace
+    const MAX_LIFELINES: u64 = 32;
+    const MAX_EVENTS: usize = 500;
+    const MAX_SVG_BYTES: usize = 2 * 1024 * 1024;
+    let actual_node_count = trace
         .events
         .iter()
         .filter_map(|event| event.node)
         .map(NodeId::get)
         .max()
         .unwrap_or(1);
-    let visible: Vec<_> = trace
+    let node_count = actual_node_count.min(MAX_LIFELINES);
+    let candidates: Vec<_> = trace
         .events
         .iter()
         .filter(|event| {
@@ -297,8 +383,9 @@ pub fn sequence_diagram_svg(trace: &Trace) -> String {
                     | EventKind::ClientTimeout
             )
         })
-        .take(500)
         .collect();
+    let omitted = actual_node_count > node_count || candidates.len() > MAX_EVENTS;
+    let visible = candidates.into_iter().take(MAX_EVENTS).collect::<Vec<_>>();
     let width = 120_u64.saturating_add(node_count.saturating_mul(140));
     let height = 100_usize.saturating_add(visible.len().saturating_mul(24));
     let mut svg = format!(
@@ -310,7 +397,7 @@ pub fn sequence_diagram_svg(trace: &Trace) -> String {
     }
     for (row, event) in visible.iter().enumerate() {
         let y = 58_usize.saturating_add(row.saturating_mul(24));
-        let from = event.node.map_or(1, NodeId::get);
+        let from = event.node.map_or(1, NodeId::get).min(node_count);
         let from_x = 80_u64.saturating_add(from.saturating_sub(1).saturating_mul(140));
         if event.kind == EventKind::NetSend {
             // Transport trace payloads are binary fingerprints, not a display
@@ -319,11 +406,61 @@ pub fn sequence_diagram_svg(trace: &Trace) -> String {
             let to_x = from_x;
             svg.push_str(&format!("<line class=\"msg\" x1=\"{from_x}\" y1=\"{y}\" x2=\"{to_x}\" y2=\"{y}\"/><text x=\"{}\" y=\"{}\" text-anchor=\"middle\">send #{}</text>", (from_x + to_x) / 2, y.saturating_sub(4), event.seq));
         } else {
-            svg.push_str(&format!("<circle class=\"event\" cx=\"{from_x}\" cy=\"{y}\" r=\"4\"/><text x=\"{}\" y=\"{}\">{} #{}</text>", from_x.saturating_add(8), y.saturating_add(4), event.kind.as_str(), event.seq));
+            let payload = svg_event_payload(&event.payload);
+            let suffix = if payload.is_empty() {
+                String::new()
+            } else {
+                format!(" {payload}")
+            };
+            svg.push_str(&format!("<circle class=\"event\" cx=\"{from_x}\" cy=\"{y}\" r=\"4\"/><text x=\"{}\" y=\"{}\">{} #{}{}</text>", from_x.saturating_add(8), y.saturating_add(4), event.kind.as_str(), event.seq, suffix));
         }
     }
+    if omitted {
+        let y = height.saturating_sub(8);
+        svg.push_str(&format!(
+            "<text x=\"12\" y=\"{y}\">… omitted by bounded SVG renderer …</text>"
+        ));
+    }
     svg.push_str("</svg>");
+    if svg.len() > MAX_SVG_BYTES {
+        return String::from(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"640\" height=\"80\"><text x=\"12\" y=\"40\">diagram omitted: output byte cap reached</text></svg>",
+        );
+    }
     svg
+}
+
+fn svg_event_payload(payload: &[u8]) -> String {
+    const MAX_LABEL_BYTES: usize = 64;
+    let mut label = payload
+        .iter()
+        .take(MAX_LABEL_BYTES)
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                char::from(*byte)
+            } else {
+                '�'
+            }
+        })
+        .collect::<String>();
+    if payload.len() > MAX_LABEL_BYTES {
+        label.push('…');
+    }
+    xml_escape(&label)
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '&' => "&amp;".chars().collect::<Vec<_>>(),
+            '<' => "&lt;".chars().collect(),
+            '>' => "&gt;".chars().collect(),
+            '"' => "&quot;".chars().collect(),
+            '\'' => "&apos;".chars().collect(),
+            other => vec![other],
+        })
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -418,15 +555,25 @@ impl ClusterRun {
             Verdict::Undecided { .. } => "undecided",
         };
         let checker_report = verdict_json(&self.verdict);
+        let invariant_violations = self
+            .invariant_violations
+            .iter()
+            .map(|violation| format!("\"{}\"", json_escape(violation)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let run_footprint = run_footprint_json(self.run_footprint);
         format!(
-            "{{\"fixture_version\":1,\"run_spec\":{},\"seed\":\"{}\",\"profile\":\"{}\",\"events\":{},\"completed_operations\":{},\"had_leader\":{},\"trace_invariants_ok\":{},\"liveness_ok\":{},\"verdict\":\"{}\",\"checker_report\":{},\"trace\":{}}}",
-            run_spec_json(&self.spec),
+            "{{\"fixture_version\":1,\"run_spec\":{},\"seed\":\"{}\",\"profile\":\"{}\",\"events\":{},\"completed_operations\":{},\"peak_total_bytes\":{},\"had_leader\":{},\"trace_invariants_ok\":{},\"invariant_violations\":[{}],\"run_footprint\":{},\"liveness_ok\":{},\"verdict\":\"{}\",\"checker_report\":{},\"trace\":{}}}",
+            canonical_run_spec_json(&self.spec),
             self.seed,
             profile.as_str(),
             self.event_count,
             self.completed_operations,
+            self.peak_total_bytes,
             self.had_leader,
             self.trace_invariants_ok,
+            invariant_violations,
+            run_footprint,
             self.liveness_ok,
             verdict,
             checker_report,
@@ -435,7 +582,45 @@ impl ClusterRun {
     }
 }
 
-fn run_spec_json(spec: &RunSpec) -> String {
+fn run_footprint_json(footprint: RunFootprint) -> String {
+    let usage = |usage: Usage| {
+        format!(
+            "{{\"current\":{},\"peak\":{},\"limit\":{}}}",
+            usage.current, usage.peak, usage.limit
+        )
+    };
+    format!(
+        "{{\"network_inflight\":{},\"fault_replay\":{},\"scheduled_events\":{},\"checker_history\":{},\"failure_artifact_buffer\":{},\"theater_checkpoints\":{}}}",
+        usage(footprint.network_inflight),
+        usage(footprint.fault_replay),
+        usage(footprint.scheduled_events),
+        usage(footprint.checker_history),
+        usage(footprint.failure_artifact_buffer),
+        usage(footprint.theater_checkpoints),
+    )
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{:04x}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+#[must_use]
+pub fn canonical_run_spec_json(spec: &RunSpec) -> String {
     let faults = spec
         .plan
         .actions
@@ -449,17 +634,63 @@ fn run_spec_json(spec: &RunSpec) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
+    let disk_profile = spec.disk_profile.as_ref().map_or_else(
+        || String::from("null"),
+        |name| format!("\"{}\"", json_escape(name)),
+    );
+    let disk = spec.config.disk_model;
     format!(
-        "{{\"seed\":\"{}\",\"profile\":\"{}\",\"node_count\":{},\"end_time_ns\":{},\"workload\":{{\"clients\":{},\"ops_per_second\":{},\"keyspace\":{}}},\"faults\":[{}]}}",
+        "{{\"seed\":\"{}\",\"profile\":\"{}\",\"node_count\":{},\"end_time_ns\":{},\"disk_profile\":{},\"disk_model\":{{\"read\":{},\"write\":{},\"fsync\":{},\"rename\":{},\"dirsync\":{}}},\"workload\":{{\"clients\":{},\"ops_per_second\":{},\"keyspace\":{},\"set_ttl_ns\":{}}},\"faults\":[{}]}}",
         spec.seed,
         spec.profile.as_str(),
         spec.config.node_count,
         spec.end_time.as_nanos(),
+        disk_profile,
+        delay_dist_json(disk.read),
+        delay_dist_json(disk.write),
+        delay_dist_json(disk.fsync),
+        delay_dist_json(disk.rename),
+        delay_dist_json(disk.dirsync),
         spec.workload.clients,
         spec.workload.ops_per_second,
         spec.workload.keyspace,
+        spec.workload
+            .set_ttl
+            .map_or_else(|| String::from("null"), |ttl| ttl.as_nanos().to_string()),
         faults
     )
+}
+
+fn delay_dist_json(distribution: cc_core::DelayDist) -> String {
+    match distribution {
+        cc_core::DelayDist::Fixed(value) => {
+            format!("{{\"kind\":\"fixed\",\"ns\":{}}}", value.as_nanos())
+        }
+        cc_core::DelayDist::Uniform { low, high } => format!(
+            "{{\"kind\":\"uniform\",\"low_ns\":{},\"high_ns\":{}}}",
+            low.as_nanos(),
+            high.as_nanos()
+        ),
+        cc_core::DelayDist::TwoPoint {
+            short,
+            long,
+            long_chance,
+        } => format!(
+            "{{\"kind\":\"two-point\",\"short_ns\":{},\"long_ns\":{},\"long_p16\":{}}}",
+            short.as_nanos(),
+            long.as_nanos(),
+            long_chance.numerator()
+        ),
+        cc_core::DelayDist::Empirical { buckets, count } => {
+            let count = usize::from(count.min(16));
+            let values = buckets[..count]
+                .iter()
+                .map(|value| value.as_nanos().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{\"kind\":\"empirical\",\"buckets_ns\":[{values}]}}")
+        }
+    }
 }
 
 fn fault_action_json(action: &FaultAction) -> String {
@@ -590,6 +821,7 @@ fn ccrp_mutation_json(mutation: CcrpMutation) -> String {
 const fn file_id_json(file: FileId) -> (&'static str, u64) {
     match file {
         FileId::Wal { segment } => ("wal", segment),
+        FileId::StoreWal { segment } => ("store-wal", segment),
         FileId::Sst { file_no } => ("sst", file_no),
         FileId::Manifest { generation } => ("manifest", generation),
         FileId::Snapshot { generation } => ("snapshot", generation),
@@ -670,17 +902,18 @@ fn verdict_json(verdict: &Verdict) -> String {
         Verdict::Undecided { visited } => {
             format!("{{\"kind\":\"undecided\",\"visited\":{visited}}}")
         }
-        Verdict::NotLinearizable {
-            operation_ids,
+        Verdict::NotLinearizable { witness, visited } => format!(
+            "{{\"kind\":\"not-linearizable\",\"visited\":{},\"witness\":{{\"operation_ids\":[{}],\"oracle_calls\":{},\"budget_exhausted\":{},\"one_minimal\":{}}}}}",
             visited,
-        } => format!(
-            "{{\"kind\":\"not-linearizable\",\"visited\":{},\"operation_ids\":[{}]}}",
-            visited,
-            operation_ids
+            witness
+                .operation_ids
                 .iter()
                 .map(u64::to_string)
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(","),
+            witness.oracle_calls,
+            witness.budget_exhausted,
+            witness.one_minimal,
         ),
     }
 }
@@ -717,6 +950,7 @@ impl From<RunError> for ClusterError {
 }
 
 /// A deterministic host for the real `cc-cluster::Node` composition.
+#[derive(Clone)]
 pub struct SimCluster {
     spec: RunSpec,
     now: Time,
@@ -733,6 +967,7 @@ pub struct SimCluster {
     frame_faults: BTreeMap<(NodeId, NodeId), Vec<FrameFault>>,
     replay_faults: BTreeMap<(NodeId, NodeId), Vec<ReplayFrameFault>>,
     replay_frames: BTreeMap<(NodeId, NodeId), Vec<u8>>,
+    peak_replay_bytes: u64,
     nodes: BTreeMap<NodeId, NodeSlot>,
     pending: BTreeMap<u64, PendingOperation>,
     actors: BTreeMap<u64, WorkloadActor>,
@@ -757,6 +992,7 @@ impl SimCluster {
                 150_u64.saturating_add(id.get().saturating_sub(1).saturating_mul(35));
             let config = NodeConfig {
                 id: *id,
+                cluster_id,
                 seed: Seed::new(spec.seed.0 ^ id.get().rotate_left(17)),
                 raft: RaftConfig {
                     election_min: Duration::from_millis(election_min),
@@ -765,7 +1001,7 @@ impl SimCluster {
                 },
                 store: StoreConfig::default(),
                 policy: ClusterPolicy::default(),
-                host_limits: HostLimits::default(),
+                host_limits: spec.host_limits,
             };
             let genesis = cc_log::Genesis {
                 origin: cc_log::Origin::Bootstrap,
@@ -780,19 +1016,21 @@ impl SimCluster {
                 node: *id,
                 error: NodeError::Durability,
             })?;
-            let mut disk = SimDisk::new();
+            let mut disk = SimDisk::with_model(spec.config.disk_model, spec.seed, *id);
             disk.write(WAL_FILE, 0, &genesis_bytes)
                 .and_then(|_| disk.fsync(WAL_FILE))
                 .map_err(|_| ClusterError::Node {
                     node: *id,
                     error: NodeError::Durability,
                 })?;
-            let driver = Driver::boot_with_wal_offset(
+            let driver = Driver::boot_with_offsets_and_genesis(
                 config,
                 BootState::Fresh {
                     bootstrap: bootstrap_membership.clone(),
                 },
                 u64::try_from(genesis_bytes.len()).unwrap_or(u64::MAX),
+                0,
+                genesis.clone(),
             )
             .map_err(|error| cluster_host_error(*id, error))?;
             nodes.insert(
@@ -804,7 +1042,6 @@ impl SimCluster {
                     status: cc_sim::NodeStatus::Up,
                     clock_offset: Duration::default(),
                     disk,
-                    blocks: MemoryBlockSource::default(),
                     wal_end: u64::try_from(genesis_bytes.len()).unwrap_or(u64::MAX),
                     persistence_ready_at: None,
                 },
@@ -826,6 +1063,7 @@ impl SimCluster {
             frame_faults: BTreeMap::new(),
             replay_faults: BTreeMap::new(),
             replay_frames: BTreeMap::new(),
+            peak_replay_bytes: 0,
             nodes,
             pending: BTreeMap::new(),
             actors: BTreeMap::new(),
@@ -928,6 +1166,7 @@ impl SimCluster {
                     applied,
                     durable_bytes,
                     disk_service_delay_ns,
+                    clock_offset_ns: slot.clock_offset.as_nanos(),
                     log_tail,
                     voters,
                     joint,
@@ -952,6 +1191,7 @@ impl SimCluster {
                 &self.history,
                 CheckerConfig {
                     max_states: 100_000,
+                    ..CheckerConfig::default()
                 },
             ),
         }
@@ -990,18 +1230,140 @@ impl SimCluster {
 
     fn finish_result(self) -> Result<ClusterRun, ClusterError> {
         let trace = self.recorder.finish();
-        let trace_invariants_ok = cc_checker::check_trace_invariants(&trace).is_ok()
-            && self
-                .nodes
-                .values()
-                .filter_map(|slot| slot.driver.as_ref())
-                .all(|driver| driver.node().raft.invariants().is_ok());
         let verdict = check(
             &self.history,
             CheckerConfig {
                 max_states: 100_000,
+                ..CheckerConfig::default()
             },
         );
+        let mut invariant_violations = cc_checker::check_trace_invariants(&trace)
+            .violations
+            .into_iter()
+            .map(|violation| format!("trace/{}: {}", violation.name, violation.detail))
+            .collect::<Vec<_>>();
+        let mut peak_total_bytes = 0_u64;
+        for (node, slot) in &self.nodes {
+            let Some(driver) = slot.driver.as_ref() else {
+                continue;
+            };
+            invariant_violations.extend(
+                driver
+                    .node()
+                    .raft
+                    .invariants()
+                    .violations
+                    .into_iter()
+                    .map(|violation| {
+                        format!(
+                            "raft/node-{}/{}: {}",
+                            node.get(),
+                            violation.name,
+                            violation.detail
+                        )
+                    }),
+            );
+            let footprint = driver.footprint();
+            for (owner, usage) in [
+                ("log", footprint.log),
+                ("snapshot-staging", footprint.snapshot_staging),
+                ("sessions", footprint.sessions),
+                ("session-tombstones", footprint.session_tombstones),
+                ("pending-reads", footprint.pending_reads),
+                ("pending-client-routes", footprint.pending_client_routes),
+                ("memtables", footprint.memtables),
+                ("sst-metadata", footprint.sst_metadata),
+                ("driver-inputs", footprint.driver_inputs),
+                ("driver-effects", footprint.driver_effects),
+                ("outbound-frames", footprint.outbound_frames),
+                ("checkpoint-builder", footprint.checkpoint_builder),
+                ("compaction-builder", footprint.compaction_builder),
+            ] {
+                peak_total_bytes = peak_total_bytes.saturating_add(usage.peak);
+                if usage.current > usage.limit || usage.peak > usage.limit {
+                    invariant_violations.push(format!(
+                        "footprint/node-{}/{owner}: current={} peak={} limit={}",
+                        node.get(),
+                        usage.current,
+                        usage.peak,
+                        usage.limit
+                    ));
+                }
+            }
+        }
+        let history_bytes = u64::try_from(
+            cc_checker::HistoryDocument {
+                build_label: String::new(),
+                config_hash: 0,
+                initial: BTreeMap::new(),
+                retain_open: true,
+                history: self.history.clone(),
+            }
+            .encode()
+            .len(),
+        )
+        .unwrap_or(u64::MAX);
+        let replay_bytes = self.replay_frames.values().fold(0_u64, |total, frame| {
+            total.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX))
+        });
+        let run_footprint = RunFootprint {
+            network_inflight: Usage {
+                current: self.network.total_inflight_bytes(),
+                peak: self.network.peak_inflight_bytes(),
+                limit: self.spec.host_limits.max_network_inflight_bytes,
+            },
+            fault_replay: Usage {
+                current: replay_bytes,
+                peak: self.peak_replay_bytes,
+                limit: self.spec.host_limits.max_fault_replay_bytes,
+            },
+            scheduled_events: Usage {
+                current: u64::try_from(self.events.len()).unwrap_or(u64::MAX),
+                peak: u64::try_from(self.events.peak_len()).unwrap_or(u64::MAX),
+                limit: self.spec.config.max_events,
+            },
+            checker_history: Usage {
+                current: history_bytes,
+                peak: history_bytes,
+                limit: self.spec.host_limits.max_history_bytes,
+            },
+            failure_artifact_buffer: Usage {
+                current: 0,
+                peak: 0,
+                limit: self.spec.host_limits.max_failure_artifact_bytes,
+            },
+            theater_checkpoints: Usage {
+                current: 0,
+                peak: 0,
+                limit: self.spec.host_limits.max_trace_bytes as u64,
+            },
+        };
+        for (owner, usage) in [
+            ("network-inflight", run_footprint.network_inflight),
+            ("fault-replay", run_footprint.fault_replay),
+            ("scheduled-events", run_footprint.scheduled_events),
+            ("checker-history", run_footprint.checker_history),
+            (
+                "failure-artifact-buffer",
+                run_footprint.failure_artifact_buffer,
+            ),
+            ("theater-checkpoints", run_footprint.theater_checkpoints),
+        ] {
+            peak_total_bytes = peak_total_bytes.saturating_add(usage.peak);
+            if usage.current > usage.limit || usage.peak > usage.limit {
+                invariant_violations.push(format!(
+                    "footprint/run/{owner}: current={} peak={} limit={}",
+                    usage.current, usage.peak, usage.limit
+                ));
+            }
+        }
+        invariant_violations.extend(
+            cross_check_linearizable_sessions(&self.history, &verdict)
+                .violations
+                .into_iter()
+                .map(|violation| format!("session/{}: {}", violation.name, violation.detail)),
+        );
+        let trace_invariants_ok = invariant_violations.is_empty();
         let completed_operations = self
             .history
             .operations
@@ -1035,9 +1397,12 @@ impl SimCluster {
             history: self.history,
             verdict,
             trace_invariants_ok,
+            invariant_violations,
+            run_footprint,
             had_leader: self.had_leader,
             completed_operations,
             event_count: self.processed_events,
+            peak_total_bytes,
             final_log_indices,
             liveness_ok,
         })
@@ -1122,6 +1487,19 @@ impl SimCluster {
             ClusterEventKind::DiskFsyncComplete { node, file, id } => {
                 self.handle_disk_fsync_complete(node, file, id)
             }
+            ClusterEventKind::DiskReadComplete {
+                node,
+                file,
+                at,
+                len,
+                id,
+            } => self.handle_disk_read_complete(node, file, at, len, id),
+            ClusterEventKind::DiskRenameComplete { node, from, to, id } => {
+                self.handle_disk_rename_complete(node, from, to, id)
+            }
+            ClusterEventKind::DiskSyncDirComplete { node, id } => {
+                self.handle_disk_sync_dir_complete(node, id)
+            }
             ClusterEventKind::DeferredInput { node, input } => {
                 if self.is_up(node) {
                     self.drive_node(node, input)
@@ -1129,6 +1507,7 @@ impl SimCluster {
                     Ok(())
                 }
             }
+            ClusterEventKind::DriverServiceComplete { node } => self.complete_driver_service(node),
             ClusterEventKind::LeaveJoint(node) => self.handle_leave_joint(node),
         }
     }
@@ -1311,6 +1690,10 @@ impl SimCluster {
         let mut history_operation = Operation::open(id, kind, self.now);
         history_operation.client = client;
         history_operation.sequence = sequence;
+        history_operation.deadline = match &operation {
+            WorkloadOperation::Set { ttl: Some(ttl), .. } => Some(self.host_time(leader) + *ttl),
+            _ => None,
+        };
         self.pending.insert(
             id,
             PendingOperation {
@@ -1454,11 +1837,13 @@ impl SimCluster {
                 }
             }
             FaultAction::Wipe { node } => {
+                let disk_model = self.spec.config.disk_model;
+                let seed = self.spec.seed;
                 if let Some(slot) = self.nodes.get_mut(&node) {
                     slot.status = cc_sim::NodeStatus::Wiped;
                     slot.driver = None;
                     slot.persistence_ready_at = None;
-                    slot.disk = SimDisk::new();
+                    slot.disk = SimDisk::with_model(disk_model, seed, node);
                     slot.reset_wal();
                 }
                 // A wipe destroys durable state. That is disk loss, and the
@@ -1601,6 +1986,9 @@ impl SimCluster {
     }
 
     fn drive_node(&mut self, id: NodeId, input: Input) -> Result<(), ClusterError> {
+        if !self.is_up(id) {
+            return Ok(());
+        }
         if let Some(ready_at) = self
             .nodes
             .get(&id)
@@ -1613,23 +2001,41 @@ impl SimCluster {
             return Ok(());
         }
         let now = self.host_time(id);
-        let (before_role, poll, effects) = {
+        let (before_role, was_blocked, poll, effects) = {
             let slot = self
                 .nodes
                 .get_mut(&id)
                 .expect("invariant: node slot exists");
-            let driver = slot
-                .driver
-                .as_mut()
-                .expect("invariant: up node has a driver");
+            let NodeSlot { driver, disk, .. } = slot;
+            let driver = driver.as_mut().expect("invariant: up node has a driver");
             let before = driver.role();
+            let was_blocked = driver.footprint().blocked;
+            let mut blocks = SimBlockSource { disk };
             let (poll, effects) = driver
-                .deliver(now, input.clone(), &mut slot.blocks)
+                .deliver(now, input.clone(), &mut blocks)
                 .map_err(|error| cluster_host_error(id, error))?;
-            (before, poll, effects)
+            let _ = driver.footprint();
+            (before, was_blocked, poll, effects)
         };
         if let DriverPoll::BlockedUntil(until) = poll {
-            self.schedule(until, ClusterEventKind::DeferredInput { node: id, input });
+            if was_blocked {
+                let slot = self
+                    .nodes
+                    .get_mut(&id)
+                    .expect("invariant: node slot exists");
+                slot.driver
+                    .as_mut()
+                    .expect("invariant: up node has a driver")
+                    .enqueue(input)
+                    .map_err(|error| cluster_host_error(id, error))?;
+                let _ = slot
+                    .driver
+                    .as_ref()
+                    .expect("invariant: up node has a driver")
+                    .footprint();
+            } else {
+                self.schedule(until, ClusterEventKind::DriverServiceComplete { node: id });
+            }
             return Ok(());
         }
         let after_role = self
@@ -1652,6 +2058,66 @@ impl SimCluster {
         self.consume_effects(id, effects)
     }
 
+    fn complete_driver_service(&mut self, node: NodeId) -> Result<(), ClusterError> {
+        if !self.is_up(node) {
+            return Ok(());
+        }
+        let now = self.host_time(node);
+        let (poll, effects) = {
+            let slot = self
+                .nodes
+                .get_mut(&node)
+                .expect("invariant: node slot exists");
+            let result = slot
+                .driver
+                .as_mut()
+                .expect("invariant: up node has a driver")
+                .release_ready(now)
+                .map_err(|error| cluster_host_error(node, error))?;
+            let _ = slot
+                .driver
+                .as_ref()
+                .expect("invariant: up node has a driver")
+                .footprint();
+            result
+        };
+        if let DriverPoll::BlockedUntil(until) = poll {
+            self.schedule(until, ClusterEventKind::DriverServiceComplete { node });
+            return Ok(());
+        }
+        self.consume_effects(node, effects)?;
+        // Release queued inputs in the Driver's I/O/timer/peer/client order.
+        loop {
+            let (input, poll, effects) = {
+                let slot = self
+                    .nodes
+                    .get_mut(&node)
+                    .expect("invariant: node slot exists");
+                let NodeSlot { driver, disk, .. } = slot;
+                let mut blocks = SimBlockSource { disk };
+                let result = driver
+                    .as_mut()
+                    .expect("invariant: up node has a driver")
+                    .deliver_next_with_input(now, &mut blocks)
+                    .map_err(|error| cluster_host_error(node, error))?;
+                let _ = driver
+                    .as_ref()
+                    .expect("invariant: up node has a driver")
+                    .footprint();
+                result
+            };
+            self.consume_effects(node, effects)?;
+            if let DriverPoll::BlockedUntil(until) = poll {
+                self.schedule(until, ClusterEventKind::DriverServiceComplete { node });
+                break;
+            }
+            if input.is_none() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn consume_effects(
         &mut self,
         source: NodeId,
@@ -1667,6 +2133,11 @@ impl SimCluster {
                     id,
                 } => self.begin_persistence(source, file, at, bytes, id)?,
                 Effect::DiskFsync { file, id } => self.begin_fsync(source, file, id)?,
+                Effect::DiskRead { file, at, len, id } => {
+                    self.begin_read(source, file, at, len, id)?
+                }
+                Effect::DiskRename { from, to, id } => self.begin_rename(source, from, to, id)?,
+                Effect::DiskSyncDir { id } => self.begin_sync_dir(source, id)?,
                 Effect::ClientReply { client, req, reply } => {
                     let reply = decode_reply(&reply).map_err(|_| ClusterError::Node {
                         node: source,
@@ -1711,12 +2182,9 @@ impl SimCluster {
                     EventKind::CheckerNote,
                     event.payload,
                 ),
-                Effect::DiskRead { .. }
-                | Effect::DiskTruncate { .. }
+                Effect::DiskTruncate { .. }
                 | Effect::DiskCreateTemp { .. }
-                | Effect::DiskRename { .. }
-                | Effect::DiskDelete { .. }
-                | Effect::DiskSyncDir { .. } => {
+                | Effect::DiskDelete { .. } => {
                     return Err(ClusterError::Node {
                         node: source,
                         error: NodeError::Environment("unsupported simulator storage effect"),
@@ -1798,6 +2266,10 @@ impl SimCluster {
             }
         }
         self.replay_frames.insert((from, to), frame.clone());
+        let replay_bytes = self.replay_frames.values().fold(0_u64, |total, frame| {
+            total.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX))
+        });
+        self.peak_replay_bytes = self.peak_replay_bytes.max(replay_bytes);
         if !self.is_up(from) || !self.is_up(to) {
             self.record(
                 self.now,
@@ -1873,23 +2345,17 @@ impl SimCluster {
     ) -> Result<(), ClusterError> {
         let write_delay = self
             .nodes
-            .get(&node)
+            .get_mut(&node)
             .map(|slot| slot.disk.service_time(DiskOperation::Write))
             .ok_or(ClusterError::Node {
                 node,
                 error: NodeError::Durability,
             })?;
-        let fsync_delay = self
-            .nodes
-            .get(&node)
-            .map(|slot| slot.disk.service_time(DiskOperation::Fsync))
-            .ok_or(ClusterError::Node {
-                node,
-                error: NodeError::Durability,
-            })?;
         if let Some(slot) = self.nodes.get_mut(&node) {
-            slot.persistence_ready_at = Some(self.now + write_delay + fsync_delay);
-            slot.wal_end = at.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            slot.persistence_ready_at = Some(self.now + write_delay);
+            if file == WAL_FILE {
+                slot.wal_end = at.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            }
         }
         self.record(self.now, Some(node), EventKind::IoIssue, bytes.clone());
         self.schedule(
@@ -1942,15 +2408,85 @@ impl SimCluster {
     ) -> Result<(), ClusterError> {
         let delay = self
             .nodes
-            .get(&node)
+            .get_mut(&node)
             .map(|slot| slot.disk.service_time(DiskOperation::Fsync))
+            .ok_or(ClusterError::Node {
+                node,
+                error: NodeError::Durability,
+            })?;
+        if let Some(slot) = self.nodes.get_mut(&node) {
+            slot.persistence_ready_at = Some(self.now + delay);
+        }
+        self.schedule(
+            self.now + delay,
+            ClusterEventKind::DiskFsyncComplete { node, file, id },
+        );
+        Ok(())
+    }
+
+    fn begin_read(
+        &mut self,
+        node: NodeId,
+        file: FileId,
+        at: u64,
+        len: u32,
+        id: cc_core::IoId,
+    ) -> Result<(), ClusterError> {
+        let delay = self
+            .nodes
+            .get_mut(&node)
+            .map(|slot| slot.disk.service_time(DiskOperation::Read))
             .ok_or(ClusterError::Node {
                 node,
                 error: NodeError::Durability,
             })?;
         self.schedule(
             self.now + delay,
-            ClusterEventKind::DiskFsyncComplete { node, file, id },
+            ClusterEventKind::DiskReadComplete {
+                node,
+                file,
+                at,
+                len,
+                id,
+            },
+        );
+        Ok(())
+    }
+
+    fn begin_rename(
+        &mut self,
+        node: NodeId,
+        from: FileId,
+        to: FileId,
+        id: cc_core::IoId,
+    ) -> Result<(), ClusterError> {
+        let delay = self
+            .nodes
+            .get_mut(&node)
+            .map(|slot| slot.disk.service_time(DiskOperation::Rename))
+            .ok_or(ClusterError::Node {
+                node,
+                error: NodeError::Durability,
+            })?;
+        self.schedule(
+            self.now + delay,
+            ClusterEventKind::DiskRenameComplete { node, from, to, id },
+        );
+        Ok(())
+    }
+
+    fn begin_sync_dir(&mut self, node: NodeId, id: cc_core::IoId) -> Result<(), ClusterError> {
+        let delay = self
+            .nodes
+            .get_mut(&node)
+            .map(|slot| slot.disk.service_time(DiskOperation::SyncDir))
+            .ok_or(ClusterError::Node {
+                node,
+                error: NodeError::Durability,
+            })?;
+        self.schedule(
+            self.now + delay,
+            ClusterEventKind::DiskSyncDirComplete { node, id },
         );
         Ok(())
     }
@@ -1976,6 +2512,78 @@ impl SimCluster {
         }
     }
 
+    fn handle_disk_read_complete(
+        &mut self,
+        node: NodeId,
+        file: FileId,
+        at: u64,
+        len: u32,
+        id: cc_core::IoId,
+    ) -> Result<(), ClusterError> {
+        let result = {
+            let Some(slot) = self.nodes.get_mut(&node) else {
+                return Ok(());
+            };
+            if slot.status != cc_sim::NodeStatus::Up || slot.driver.is_none() {
+                return Ok(());
+            }
+            slot.disk.read(file, at, len)
+        };
+        match result {
+            Ok(result) => self.complete_driver_io(node, id, result),
+            Err(error) => self.complete_driver_io(node, id, IoResult::Failed(error)),
+        }
+    }
+
+    fn handle_disk_rename_complete(
+        &mut self,
+        node: NodeId,
+        from: FileId,
+        to: FileId,
+        id: cc_core::IoId,
+    ) -> Result<(), ClusterError> {
+        let result = {
+            let Some(slot) = self.nodes.get_mut(&node) else {
+                return Ok(());
+            };
+            if slot.status != cc_sim::NodeStatus::Up || slot.driver.is_none() {
+                return Ok(());
+            }
+            let result = slot.disk.rename(from, to);
+            if result.is_ok() && to == WAL_FILE {
+                slot.wal_end = slot
+                    .disk
+                    .visible(WAL_FILE)
+                    .map_or(0, |bytes| bytes.len() as u64);
+            }
+            result
+        };
+        match result {
+            Ok(result) => self.complete_driver_io(node, id, result),
+            Err(error) => self.complete_driver_io(node, id, IoResult::Failed(error)),
+        }
+    }
+
+    fn handle_disk_sync_dir_complete(
+        &mut self,
+        node: NodeId,
+        id: cc_core::IoId,
+    ) -> Result<(), ClusterError> {
+        let result = {
+            let Some(slot) = self.nodes.get_mut(&node) else {
+                return Ok(());
+            };
+            if slot.status != cc_sim::NodeStatus::Up || slot.driver.is_none() {
+                return Ok(());
+            }
+            slot.disk.sync_dir()
+        };
+        match result {
+            Ok(result) => self.complete_driver_io(node, id, result),
+            Err(error) => self.complete_driver_io(node, id, IoResult::Failed(error)),
+        }
+    }
+
     fn complete_driver_io(
         &mut self,
         node: NodeId,
@@ -1984,15 +2592,28 @@ impl SimCluster {
     ) -> Result<(), ClusterError> {
         let was_fsync = matches!(result, IoResult::Fsynced);
         let now = self.host_time(node);
-        let outcome = {
+        let (before_snapshot, outcome, after_snapshot) = {
             let Some(slot) = self.nodes.get_mut(&node) else {
                 return Ok(());
             };
-            let Some(driver) = slot.driver.as_mut() else {
+            let NodeSlot { driver, disk, .. } = slot;
+            let Some(driver) = driver.as_mut() else {
                 return Ok(());
             };
-            driver.deliver(now, Input::IoDone { id, result }, &mut slot.blocks)
+            let before = driver.node().raft.snapshot_base().0;
+            let mut blocks = SimBlockSource { disk };
+            let outcome = driver.deliver(now, Input::IoDone { id, result }, &mut blocks);
+            let after = driver.node().raft.snapshot_base().0;
+            (before, outcome, after)
         };
+        if after_snapshot > before_snapshot {
+            self.record(
+                self.now,
+                Some(node),
+                EventKind::SnapshotInstall,
+                after_snapshot.get().to_le_bytes().to_vec(),
+            );
+        }
         match outcome {
             Ok((DriverPoll::Ready, effects)) => {
                 if was_fsync {
@@ -2005,13 +2626,7 @@ impl SimCluster {
                 self.consume_effects(node, effects)
             }
             Ok((DriverPoll::BlockedUntil(until), _)) => {
-                self.schedule(
-                    until,
-                    ClusterEventKind::DeferredInput {
-                        node,
-                        input: Input::Tick,
-                    },
-                );
+                self.schedule(until, ClusterEventKind::DriverServiceComplete { node });
                 Ok(())
             }
             Err(error) => {
@@ -2049,6 +2664,26 @@ impl SimCluster {
             return Ok(());
         }
         let durable = slot.disk.durable(WAL_FILE).unwrap_or_default().to_vec();
+        let store_wal_file = FileId::StoreWal { segment: 0 };
+        let store_wal_bytes = slot
+            .disk
+            .durable(store_wal_file)
+            .unwrap_or_default()
+            .to_vec();
+        let recovered_store =
+            cc_store::recover_store_wal(&store_wal_bytes).map_err(|_| ClusterError::Node {
+                node: id,
+                error: NodeError::Durability,
+            })?;
+        if recovered_store.torn_tail_truncated {
+            slot.disk
+                .truncate(store_wal_file, recovered_store.bytes_consumed)
+                .and_then(|_| slot.disk.fsync(store_wal_file))
+                .map_err(|_| ClusterError::Node {
+                    node: id,
+                    error: NodeError::Durability,
+                })?;
+        }
         if durable.is_empty() {
             // A wiped disk starts from a sealed Join-origin Genesis. It does
             // not receive an out-of-band state copy: ordinary peer traffic
@@ -2072,12 +2707,18 @@ impl SimCluster {
             let bootstrap = genesis.membership.clone();
             slot.genesis = genesis;
             slot.wal_end = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            let mut driver = Driver::boot_with_wal_offset(
+            let mut driver = Driver::boot_with_offsets_and_genesis(
                 slot.config,
                 BootState::Fresh { bootstrap },
                 slot.wal_end,
+                recovered_store.bytes_consumed,
+                slot.genesis.clone(),
             )
             .map_err(|error| cluster_host_error(id, error))?;
+            driver
+                .node_mut()
+                .recover_durable_applies(&recovered_store)
+                .map_err(|error| ClusterError::Node { node: id, error })?;
             driver.node_mut().raft.rearm_election(now);
             slot.driver = Some(driver);
             slot.persistence_ready_at = None;
@@ -2099,7 +2740,7 @@ impl SimCluster {
             let state = recovered.state;
             slot.wal_end = recovered.bytes_consumed;
             slot.genesis = state.genesis.clone();
-            let mut driver = Driver::boot_with_wal_offset(
+            let mut driver = Driver::boot_with_offsets_and_genesis(
                 slot.config,
                 BootState::Recovered(Box::new(RecoveredNode {
                     hard_state: state.hard_state,
@@ -2111,8 +2752,14 @@ impl SimCluster {
                     durable_applied: (state.base_index, state.base_term),
                 })),
                 slot.wal_end,
+                recovered_store.bytes_consumed,
+                slot.genesis.clone(),
             )
             .map_err(|error| cluster_host_error(id, error))?;
+            driver
+                .node_mut()
+                .recover_durable_applies(&recovered_store)
+                .map_err(|error| ClusterError::Node { node: id, error })?;
             driver.node_mut().raft.rearm_election(now);
             slot.driver = Some(driver);
             slot.persistence_ready_at = None;
@@ -2242,6 +2889,7 @@ pub fn deterministic_cluster_trace_for(seed: Seed, profile: FaultProfile) -> Vec
         max_events: 250_000,
         max_events_per_instant: 10_000,
         node_count: 5,
+        disk_model: cc_sim::DiskModel::universal(),
     };
     let nodes: Vec<NodeId> = (1..=config.node_count).map(NodeId::new).collect();
     let mut spec = RunSpec::standard(seed, profile);
@@ -2313,7 +2961,10 @@ fn link_config(profile: FaultProfile) -> LinkConfig {
             config.drop = cc_core::P16::new(128);
             config.duplicate = cc_core::P16::new(64);
         }
-        FaultProfile::Rough | FaultProfile::Membership | FaultProfile::Corruption => {
+        FaultProfile::Rough
+        | FaultProfile::Membership
+        | FaultProfile::Corruption
+        | FaultProfile::Ttl => {
             config.base_delay = Duration::from_millis(2);
             config.jitter = cc_core::DelayDist::Uniform {
                 low: Duration::default(),
@@ -2322,7 +2973,7 @@ fn link_config(profile: FaultProfile) -> LinkConfig {
             config.drop = cc_core::P16::new(256);
             config.duplicate = cc_core::P16::new(128);
         }
-        FaultProfile::Brutal | FaultProfile::Wipe => {
+        FaultProfile::Brutal | FaultProfile::Wipe | FaultProfile::Starve => {
             config.base_delay = Duration::from_millis(3);
             config.drop = cc_core::P16::new(512);
             config.duplicate = cc_core::P16::new(256);
@@ -2344,10 +2995,10 @@ fn simulated_cluster_id(seed: Seed) -> [u8; 16] {
 fn command_for(operation: &WorkloadOperation) -> KvCommand {
     match operation {
         WorkloadOperation::Get { key } => KvCommand::Get { key: key.clone() },
-        WorkloadOperation::Set { key, value } => KvCommand::Set {
+        WorkloadOperation::Set { key, value, ttl } => KvCommand::Set {
             key: key.clone(),
             value: value.clone(),
-            ttl: None,
+            ttl: *ttl,
         },
         WorkloadOperation::Del { key } => KvCommand::Del { key: key.clone() },
         WorkloadOperation::Incr { key } => KvCommand::Incr {
@@ -2360,7 +3011,7 @@ fn command_for(operation: &WorkloadOperation) -> KvCommand {
 fn operation_kind(operation: &WorkloadOperation) -> OperationKind {
     match operation {
         WorkloadOperation::Get { key } => OperationKind::Get { key: key.clone() },
-        WorkloadOperation::Set { key, value } => OperationKind::Set {
+        WorkloadOperation::Set { key, value, .. } => OperationKind::Set {
             key: key.clone(),
             value: value.clone(),
         },
@@ -2371,7 +3022,7 @@ fn operation_kind(operation: &WorkloadOperation) -> OperationKind {
 
 fn reply_to_outcome(kind: &OperationKind, reply: &KvReply) -> Outcome {
     match (kind, reply) {
-        (_, KvReply::Error(_)) => Outcome::Error,
+        (_, KvReply::Error(_) | KvReply::BatchError { .. }) => Outcome::Error,
         (OperationKind::Set { .. }, KvReply::Ok) => Outcome::Ok,
         (OperationKind::Del { .. }, KvReply::Integer(_)) => Outcome::Ok,
         (OperationKind::Get { .. }, KvReply::Value(value)) => Outcome::Value(value.clone()),
@@ -2382,6 +3033,7 @@ fn reply_to_outcome(kind: &OperationKind, reply: &KvReply) -> Outcome {
         (_, KvReply::Cas(value)) => Outcome::Cas(*value),
         (_, KvReply::Conditional(value)) => Outcome::Cas(*value),
         (_, KvReply::Scan(_)) => Outcome::Error,
+        (_, KvReply::Batch(_)) => Outcome::Error,
     }
 }
 
@@ -2456,6 +3108,29 @@ mod tests {
         assert_eq!(difference.left, "01");
         assert_eq!(difference.right, "02");
         assert!(semantic_trace_diff(&left, &left).is_none());
+    }
+
+    #[test]
+    fn trap_sim_live_read_sees_page_cache_but_restart_sees_durable_bytes() {
+        let file = FileId::Sst { file_no: 7 };
+        let mut disk = SimDisk::new();
+        disk.set_slow_disk(SlowDisk {
+            read_extra: Duration::from_nanos(9),
+            ..SlowDisk::default()
+        });
+        disk.write(file, 0, b"old").expect("old page-cache write");
+        disk.fsync(file).expect("old durable image");
+        disk.write(file, 0, b"new").expect("new page-cache write");
+        let live = SimBlockSource { disk: &mut disk }
+            .read_block(file, 0, 3)
+            .expect("live read");
+        assert_eq!(live.bytes, b"new");
+        assert_eq!(live.service, Duration::from_nanos(9));
+        disk.crash();
+        let recovered = SimBlockSource { disk: &mut disk }
+            .read_block(file, 0, 3)
+            .expect("recovery read");
+        assert_eq!(recovered.bytes, b"old");
     }
 
     #[test]
@@ -2702,6 +3377,244 @@ mod tests {
                 && event.kind == EventKind::IoLost
                 && event.payload == b"corrupt-wal"
         }));
+    }
+
+    #[test]
+    fn trap_enospc_never_loses_acked_writes() {
+        let mut spec = RunSpec::standard(Seed::new(0x8a), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(4_000_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.clients = 0;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .advance(Duration::from_millis(800))
+            .expect("elect leader");
+        cluster
+            .handle_client_issue(
+                91,
+                1,
+                WorkloadOperation::Set {
+                    key: b"durable".to_vec(),
+                    value: b"acknowledged".to_vec(),
+                    ttl: None,
+                },
+            )
+            .expect("first write");
+        cluster
+            .advance(Duration::from_millis(500))
+            .expect("commit first write");
+        assert!(
+            cluster.history.operations.iter().any(|operation| {
+                operation.complete.is_some() && operation.outcome == Outcome::Ok
+            })
+        );
+        let leader = cluster.leader().expect("leader");
+        let faulted = [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+            .into_iter()
+            .find(|node| *node != leader)
+            .expect("follower");
+        cluster
+            .handle_fault(FaultAction::EnospcFrom { node: faulted })
+            .expect("ENOSPC");
+        cluster
+            .handle_client_issue(
+                91,
+                2,
+                WorkloadOperation::Set {
+                    key: b"after-fault".to_vec(),
+                    value: b"value".to_vec(),
+                    ttl: None,
+                },
+            )
+            .expect("write that reaches faulted follower");
+        cluster
+            .advance(Duration::from_millis(700))
+            .expect("contain fault");
+        for slot in cluster
+            .nodes
+            .values()
+            .filter(|slot| slot.status == cc_sim::NodeStatus::Up)
+        {
+            assert_eq!(
+                slot.driver
+                    .as_ref()
+                    .expect("healthy driver")
+                    .node()
+                    .kv
+                    .store
+                    .get(b"durable", None),
+                Some(b"acknowledged".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn trap_storage_fault_serves_no_unproven_read() {
+        let mut spec = RunSpec::standard(Seed::new(0x8b), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(2_000_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.clients = 0;
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .handle_fault(FaultAction::EnospcFrom {
+                node: NodeId::new(1),
+            })
+            .expect("ENOSPC");
+        let request = cc_raft::Message {
+            proto_version: cc_raft::PROTOCOL_VERSION,
+            from: NodeId::new(2),
+            to: NodeId::new(1),
+            term: cc_core::Term::new(1),
+            kind: cc_raft::MessageKind::VoteReq {
+                last_index: cc_core::LogIndex::new(0),
+                last_term: cc_core::Term::new(0),
+            },
+        };
+        let frame = encode_peer_frame(&WireMsg::new(
+            cc_raft::PROTOCOL_VERSION,
+            cc_raft::codec::encode(&request).expect("CCRP"),
+        ))
+        .expect("CCPF");
+        cluster
+            .handle_message(NodeId::new(2), NodeId::new(1), frame)
+            .expect("vote request");
+        cluster.advance(Duration::from_nanos(0)).expect("fail stop");
+        let slot = cluster.nodes.get(&NodeId::new(1)).expect("node");
+        assert_eq!(slot.status, cc_sim::NodeStatus::StorageFault);
+        assert!(slot.driver.is_none());
+        let replies_before = cluster
+            .recorder
+            .trace()
+            .events
+            .iter()
+            .filter(|event| event.node == Some(NodeId::new(1)) && event.kind == EventKind::ClientOk)
+            .count();
+        cluster
+            .drive_node(
+                NodeId::new(1),
+                Input::ClientRequest {
+                    client: ClientId::new(1),
+                    req: cc_core::RequestSeq::new(1),
+                    session: None,
+                    command: encode_command(&KvCommand::Get {
+                        key: b"unproven".to_vec(),
+                    }),
+                },
+            )
+            .expect("faulted node ignores input");
+        let replies_after = cluster
+            .recorder
+            .trace()
+            .events
+            .iter()
+            .filter(|event| event.node == Some(NodeId::new(1)) && event.kind == EventKind::ClientOk)
+            .count();
+        assert_eq!(replies_before, replies_after);
+    }
+
+    #[test]
+    fn trap_wiped_node_rejoins_only_via_snapshot() {
+        let mut spec = RunSpec::standard(Seed::new(0x8c), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(6_000_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.host_limits.max_log_bytes_before_snapshot = 1024;
+        spec.workload = cc_sim::WorkloadSpec {
+            clients: 2,
+            ops_per_second: 30,
+            keyspace: 8,
+            set_ttl: None,
+        };
+        spec.plan = FaultPlan::default();
+        spec.plan.push(FaultAt {
+            at: Time::from_nanos(3_000_000_000),
+            action: FaultAction::Wipe {
+                node: NodeId::new(3),
+            },
+        });
+        spec.plan.push(FaultAt {
+            at: Time::from_nanos(3_100_000_000),
+            action: FaultAction::Restart {
+                node: NodeId::new(3),
+            },
+        });
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .advance(Duration::from_nanos(6_000_000_000))
+            .expect("snapshot recovery run");
+        assert!(cluster.recorder.trace().events.iter().any(|event| {
+            event.node == Some(NodeId::new(3)) && event.kind == EventKind::SnapshotInstall
+        }));
+        assert!(cluster.recorder.trace().events.iter().all(|event| {
+            !(event.node == Some(NodeId::new(3))
+                && event.kind == EventKind::SnapshotInstall
+                && event.payload == b"out-of-band")
+        }));
+        assert!(
+            cluster
+                .snapshot()
+                .nodes
+                .iter()
+                .find(|node| node.id == 3)
+                .is_some_and(|node| node.status == cc_sim::NodeStatus::Up)
+        );
+        for slot in cluster
+            .nodes
+            .values()
+            .filter(|slot| slot.status == cc_sim::NodeStatus::Up)
+        {
+            let final_log_bytes = slot
+                .disk
+                .durable(WAL_FILE)
+                .map_or(0, |bytes| bytes.len() as u64);
+            assert!(
+                final_log_bytes < cluster.spec.host_limits.max_log_bytes_before_snapshot,
+                "published checkpoint must reclaim the physical WAL prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn trap_footprint_returns_to_baseline_after_heal() {
+        let mut spec = RunSpec::standard(Seed::new(0x8d), FaultProfile::Calm);
+        spec.config.end_time = Time::from_nanos(2_500_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.clients = 0;
+        spec.plan = FaultPlan::default();
+        spec.plan.push(FaultAt {
+            at: Time::from_nanos(500_000_000),
+            action: FaultAction::Partition {
+                left: vec![NodeId::new(1)],
+                right: vec![NodeId::new(2), NodeId::new(3)],
+            },
+        });
+        spec.plan.push(FaultAt {
+            at: Time::from_nanos(1_000_000_000),
+            action: FaultAction::Heal,
+        });
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .advance(Duration::from_nanos(2_500_000_000))
+            .expect("healed run");
+        for slot in cluster
+            .nodes
+            .values()
+            .filter_map(|slot| slot.driver.as_ref())
+        {
+            let footprint = slot.footprint();
+            assert_eq!(footprint.driver_inputs.current, 0);
+            assert_eq!(footprint.snapshot_staging.current, 0);
+            for usage in [
+                footprint.log,
+                footprint.sessions,
+                footprint.pending_reads,
+                footprint.pending_client_routes,
+                footprint.driver_inputs,
+                footprint.driver_effects,
+                footprint.outbound_frames,
+            ] {
+                assert!(usage.current <= usage.limit);
+            }
+        }
     }
 
     #[test]
@@ -3024,7 +3937,7 @@ mod tests {
     }
 
     #[test]
-    fn sequence_diagram_is_a_standalone_svg() {
+    fn trap_explain_emits_parseable_svg() {
         let mut trace = Trace::new(Seed::new(1), 0);
         trace.push(
             Time::from_nanos(1),
@@ -3036,6 +3949,37 @@ mod tests {
         assert!(svg.starts_with("<svg"));
         assert!(svg.contains("n1"));
         assert!(svg.contains("class=\"msg\""));
+        assert!(svg.ends_with("</svg>"));
+    }
+
+    #[test]
+    fn trap_explain_xml_escapes_labels() {
+        let mut trace = Trace::new(Seed::new(1), 0);
+        trace.push(
+            Time::from_nanos(1),
+            Some(NodeId::new(1)),
+            EventKind::Fault,
+            br#"<fault source="x">&'"#.to_vec(),
+        );
+        let svg = sequence_diagram_svg(&trace);
+        assert!(svg.contains("&lt;fault source=&quot;x&quot;&gt;&amp;&apos;"));
+        assert!(!svg.contains("<fault"));
+    }
+
+    #[test]
+    fn trap_explain_obeys_output_cap() {
+        let mut trace = Trace::new(Seed::new(1), 0);
+        for index in 0..10_000_u64 {
+            trace.push(
+                Time::from_nanos(index),
+                Some(NodeId::new(index % 80 + 1)),
+                EventKind::Fault,
+                vec![b'x'; 4_096],
+            );
+        }
+        let svg = sequence_diagram_svg(&trace);
+        assert!(svg.len() <= 2 * 1024 * 1024);
+        assert!(svg.contains("omitted"));
         assert!(svg.ends_with("</svg>"));
     }
 
@@ -3249,8 +4193,14 @@ mod tests {
             !recovered.log_tail.is_empty(),
             "durable log survived the crash"
         );
-        assert_eq!(recovered.applied, 0, "volatile applied index was lost");
-        assert_eq!(recovered.commit, 0, "volatile commit index was lost");
+        assert_eq!(
+            recovered.applied, victim.applied,
+            "store-WAL proof restores the exact durable applied index"
+        );
+        assert_eq!(
+            recovered.commit, victim.applied,
+            "recovery serves only the store-proven commit prefix"
+        );
         assert_eq!(
             recovered.role,
             Role::Follower,
@@ -3259,8 +4209,8 @@ mod tests {
         (victim.clone(), recovered.clone())
     }
 
-    /// The crash/pause distinction, pinned. Under pause semantics the restarted
-    /// node keeps its applied index and this fails.
+    /// A crash drops volatile role/routes/timers while N3 restores only the
+    /// state-machine prefix proven by the durable store WAL.
     #[test]
     fn trap_crash_discards_volatile_state() {
         let mut spec = RunSpec::standard(Seed::new(0x61), FaultProfile::Calm);
@@ -3272,8 +4222,9 @@ mod tests {
             .expect("warmup advances");
         let (before, after) = isolate_crash_and_restart(&mut cluster);
         assert!(before.applied > 0, "test requires live volatile state");
-        assert_eq!(after.applied, 0, "crash drops volatile applied state");
-        assert_eq!(after.commit, 0, "crash drops volatile commit state");
+        assert_eq!(after.applied, before.applied);
+        assert_eq!(after.commit, before.applied);
+        assert_eq!(after.role, Role::Follower);
     }
 
     #[test]

@@ -6,40 +6,48 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cc_checker::{
     CheckerConfig, History, HistoryDocument, OperationKind, Outcome, Verdict, check_document,
-    classify_anomalies, decode_history_v1_tsv, export_porcupine_json, minimize_witness,
+    classify_anomalies, decode_history_v1_tsv, export_porcupine_json,
 };
 #[cfg(test)]
 use cc_cluster::{NodeConfig, RaftConfig};
 #[cfg(test)]
-use cc_core::{ClusterPolicy, HostLimits};
-use cc_core::{Duration, Event, EventKind, NodeId, Seed, Time, Trace, fnv1a};
-use cc_env::FileId;
+use cc_core::HostLimits;
+use cc_core::{
+    ClusterPolicy, Duration, Event, EventKind, NodeId, Seed, Time, Trace, Xoshiro256pp, fnv1a,
+};
+use cc_env::{FEATURE_ATOMIC_BATCH, FEATURE_FOLLOWER_READ, FileId, HelloError, PeerHello};
 #[cfg(test)]
 use cc_host::journal::JournalRecord;
 use cc_host::journal::{InputJournal, RecordedBootImage, replay_journal};
 use cc_sim::{
-    CcrpMutation, FaultAction, FaultAt, FaultPlan, FaultProfile, LinkConfig, RecorderLevel,
-    RunSpec, SlowDisk, WorkloadSpec, materialize_fault_plan,
+    CcrpMutation, DiskModel, FaultAction, FaultAt, FaultPlan, FaultProfile, LinkConfig,
+    RecorderLevel, RunSpec, SlowDisk, WorkloadSpec, materialize_fault_plan,
 };
 #[cfg(test)]
 use cc_store::StoreConfig;
 
 use cc_swarm::{
-    ClusterRun, DETERMINISM_PROFILES, LedgerKey, LedgerRow, LedgerVerdict, REACHABILITY_BEACONS,
-    REACHABILITY_BEACONS_HELP, SeedLedger, Shard, deterministic_cluster_trace,
-    deterministic_cluster_trace_for, mutate_fault_plan, reachability_beacons, reproduces_failure,
+    ClusterRun, DETERMINISM_PROFILES, LedgerError, LedgerKey, LedgerRow, LedgerVerdict,
+    REACHABILITY_BEACONS, REACHABILITY_BEACONS_HELP, SeedLedger, Shard, canonical_run_spec_json,
+    deterministic_cluster_trace, deterministic_cluster_trace_for, encode_ledger_row, fuzz_decode,
+    minimize_case, mutate_case, mutate_fault_plan, reachability_beacons, reproduces_failure,
     run_spec, semantic_trace_diff, sequence_diagram_svg, shrink_cluster_plan, trace_coverage,
+    validate_sharded_coverage,
 };
+
+#[path = "../examples/c0_fixtures.rs"]
+#[allow(dead_code)]
+mod golden_fixtures;
 
 struct CampaignWorkerSummary {
     failures: u64,
@@ -75,6 +83,9 @@ fn main() -> io::Result<()> {
         Some("proxy") => run_proxy(&args[1..]),
         Some("search") => run_coverage_search(&args[1..]),
         Some("model-check") => run_model_check(&args[1..]),
+        Some("fuzz") => run_fuzz(&args[1..]),
+        Some("golden") => run_golden(&args[1..]),
+        Some("capability-campaign") => run_capability_campaign(&args[1..]),
         _ => {
             print_help();
             Ok(())
@@ -82,9 +93,119 @@ fn main() -> io::Result<()> {
     }
 }
 
+fn run_capability_campaign(args: &[String]) -> io::Result<()> {
+    let seeds = parse_u64_flag(args, "--seeds").unwrap_or(100_000);
+    if seeds == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--seeds must be nonzero",
+        ));
+    }
+    let policy = ClusterPolicy::default();
+    let policy_bytes = policy.encode();
+    for seed in 0..seeds {
+        let mut rng = Xoshiro256pp::stream(Seed::new(seed), "capability-campaign", 0);
+        let left_id = 1 + rng.u64() % 1_000_000;
+        let mut right_id = 1 + rng.u64() % 1_000_000;
+        if right_id == left_id {
+            right_id = right_id.saturating_add(1);
+        }
+        let mut left = PeerHello {
+            cluster_id: [0x71; 16],
+            node_id: NodeId::new(left_id),
+            cluster_policy: policy_bytes.clone(),
+            semantic_min: 2,
+            semantic_max: 3,
+            supported_features: FEATURE_FOLLOWER_READ | FEATURE_ATOMIC_BATCH,
+            required_features: 0,
+            max_peer_frame: 64 * 1024 + u32::try_from(rng.u64() % 65_536).unwrap_or(0),
+        };
+        let mut right = PeerHello {
+            cluster_id: left.cluster_id,
+            node_id: NodeId::new(right_id),
+            cluster_policy: policy_bytes.clone(),
+            semantic_min: 2,
+            semantic_max: 3,
+            supported_features: FEATURE_FOLLOWER_READ | FEATURE_ATOMIC_BATCH,
+            required_features: 0,
+            max_peer_frame: 64 * 1024 + u32::try_from(rng.u64() % 65_536).unwrap_or(0),
+        };
+        let expected = match seed % 8 {
+            0 | 1 => {
+                right.semantic_max = 2;
+                right.supported_features = FEATURE_FOLLOWER_READ;
+                Ok((
+                    2,
+                    FEATURE_FOLLOWER_READ,
+                    left.max_peer_frame.min(right.max_peer_frame),
+                ))
+            }
+            2 => Ok((
+                3,
+                FEATURE_FOLLOWER_READ | FEATURE_ATOMIC_BATCH,
+                left.max_peer_frame.min(right.max_peer_frame),
+            )),
+            3 => {
+                left.semantic_min = 3;
+                right.semantic_max = 2;
+                Err(HelloError::VersionOverlap)
+            }
+            4 => {
+                left.required_features = FEATURE_ATOMIC_BATCH;
+                right.supported_features = FEATURE_FOLLOWER_READ;
+                Err(HelloError::RequiredFeature(FEATURE_ATOMIC_BATCH))
+            }
+            5 => {
+                right.cluster_id[0] ^= 1;
+                Err(HelloError::ClusterMismatch)
+            }
+            6 => {
+                let mut drift = policy;
+                drift.max_members = drift.max_members.saturating_sub(1);
+                right.cluster_policy = drift.encode();
+                Err(HelloError::PolicyMismatch)
+            }
+            _ => {
+                let encoded = right.encode().map_err(io::Error::other)?;
+                right = PeerHello::decode(&encoded).map_err(io::Error::other)?.0;
+                Ok((
+                    3,
+                    FEATURE_FOLLOWER_READ | FEATURE_ATOMIC_BATCH,
+                    left.max_peer_frame.min(right.max_peer_frame),
+                ))
+            }
+        };
+        let actual = left.negotiate(&right);
+        match (expected, actual) {
+            (Ok((version, features, frame)), Ok(negotiated))
+                if negotiated.semantic_version == version
+                    && negotiated.features == features
+                    && negotiated.max_peer_frame == frame => {}
+            (Err(expected), Err(actual)) if actual == expected => {}
+            (expected, actual) => {
+                return Err(io::Error::other(format!(
+                    "negotiated-capabilities seed={seed} expected={expected:?} actual={actual:?}"
+                )));
+            }
+        }
+    }
+    println!("capability-campaign: PASS profile=negotiated-capabilities seeds={seeds} failures=0");
+    Ok(())
+}
+
+fn run_golden(args: &[String]) -> io::Result<()> {
+    match args {
+        [flag, output] if flag == "--out" => golden_fixtures::emit(output.into()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: cc-swarm golden --out DIR (current versions only)",
+        )),
+    }
+}
+
 fn run_ledger(args: &[String]) -> io::Result<()> {
     match args.first().map(String::as_str) {
-        Some("stats") if args.len() == 2 => {
+        Some("stats") if args.len() >= 2 => {
             let ledger = read_ledger(Path::new(&args[1]))?;
             let mut verdicts = BTreeMap::<&str, u64>::new();
             let mut profiles = BTreeMap::<&str, u64>::new();
@@ -111,6 +232,39 @@ fn run_ledger(args: &[String]) -> io::Result<()> {
                 verdict_text,
                 profile_text
             );
+            if let Some(summary_path) = parse_string_flag(args, "--summary") {
+                let allow_dev = has_flag(args, "--allow-dev");
+                let generator_build = parse_string_flag(args, "--generator-build")
+                    .unwrap_or_else(|| String::from("dev"));
+                let summary = coverage_summary(
+                    Path::new(&args[1]),
+                    &ledger,
+                    &generator_build,
+                    allow_dev,
+                    unix_time_ms()?,
+                )?;
+                write_replace_atomic(Path::new(&summary_path), summary.as_bytes())?;
+                println!("ledger summary={summary_path}");
+                if let Some(badge_path) = parse_string_flag(args, "--badge") {
+                    let rows = ledger
+                        .rows()
+                        .filter(|row| allow_dev || row.key.build_label != "dev")
+                        .count();
+                    let badge = format!(
+                        "{{\"schemaVersion\":1,\"label\":\"campaign seeds\",\"message\":\"{}\",\"summary_hash\":\"{:016x}\",\"generator_build\":\"{}\"}}\n",
+                        rows,
+                        fnv1a(summary.as_bytes()),
+                        json_escape(&generator_build),
+                    );
+                    write_replace_atomic(Path::new(&badge_path), badge.as_bytes())?;
+                    println!("ledger badge={badge_path}");
+                }
+            } else if parse_string_flag(args, "--badge").is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--badge requires --summary so provenance is the only source",
+                ));
+            }
             Ok(())
         }
         Some("merge") => {
@@ -121,14 +275,24 @@ fn run_ledger(args: &[String]) -> io::Result<()> {
                 )
             })?;
             let mut sources = Vec::new();
-            let mut skip_output_value = false;
+            let value_flags = [
+                "--out",
+                "--expect-range",
+                "--expect-shards",
+                "--expect-build",
+                "--expect-config",
+            ];
+            let mut skip_value = false;
             for argument in args.iter().skip(1) {
-                if skip_output_value {
-                    skip_output_value = false;
+                if skip_value {
+                    skip_value = false;
                     continue;
                 }
-                if argument == "--out" {
-                    skip_output_value = true;
+                if value_flags.contains(&argument.as_str()) {
+                    skip_value = true;
+                    continue;
+                }
+                if argument == "--allow-dev" {
                     continue;
                 }
                 sources.push(argument);
@@ -149,7 +313,54 @@ fn run_ledger(args: &[String]) -> io::Result<()> {
                 .iter()
                 .map(|source| read_ledger(Path::new(source)))
                 .collect::<io::Result<Vec<_>>>()?;
-            let merged = SeedLedger::merge(ledgers.iter()).map_err(io::Error::other)?;
+            if !has_flag(args, "--allow-dev")
+                && ledgers
+                    .iter()
+                    .flat_map(SeedLedger::rows)
+                    .any(|row| row.key.build_label == "dev")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ledger merge refuses dev rows without --allow-dev",
+                ));
+            }
+            let expected = (
+                parse_string_flag(args, "--expect-range"),
+                parse_u64_flag(args, "--expect-shards"),
+                parse_string_flag(args, "--expect-build"),
+                parse_string_flag(args, "--expect-config"),
+            );
+            if [
+                expected.0.is_some(),
+                expected.1.is_some(),
+                expected.2.is_some(),
+                expected.3.is_some(),
+            ]
+            .into_iter()
+            .any(|present| present)
+            {
+                let (Some(range), Some(shards), Some(build), Some(config)) = expected else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "coverage merge requires all --expect-* flags",
+                    ));
+                };
+                let (start, end) = parse_seed_range(&range)?;
+                let config = parse_fixed_hex(&config, "--expect-config")?;
+                validate_sharded_coverage(&ledgers, start, end, shards, &build, config)
+                    .map_err(io::Error::other)?;
+            }
+            let merged = match SeedLedger::merge(ledgers.iter()) {
+                Ok(merged) => merged,
+                Err(error @ LedgerError::Conflict { .. }) => {
+                    let conflict_path = format!("{output}.conflicts.tsv");
+                    write_ledger_conflict_artifact(Path::new(&conflict_path), &ledgers, &error)?;
+                    return Err(io::Error::other(format!(
+                        "{error}; preserved conflicting rows in {conflict_path}"
+                    )));
+                }
+                Err(error) => return Err(io::Error::other(error)),
+            };
             write_ledger_atomic(Path::new(&output), &merged.encode())?;
             println!(
                 "ledger merge: rows={} output={output}",
@@ -197,15 +408,235 @@ fn write_ledger_atomic(path: &Path, contents: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn append_ledger_rows(path: &Path, rows: &[LedgerRow]) -> io::Result<()> {
+fn unix_time_ms() -> io::Result<u128> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .map_err(io::Error::other)
+}
+
+fn filename_component(value: &str) -> String {
+    let value = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect::<String>();
+    if value.is_empty() {
+        String::from("run")
+    } else {
+        value
+    }
+}
+
+fn write_create_new_synced(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    File::open(parent)?.sync_all()
+}
+
+fn write_replace_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid output filename"))?;
+    let temporary = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    File::open(parent)?.sync_all()
+}
+
+fn coverage_summary(
+    source: &Path,
+    ledger: &SeedLedger,
+    generator_build: &str,
+    allow_dev: bool,
+    generated_at: u128,
+) -> io::Result<String> {
+    if generator_build.is_empty() || generator_build.contains(['\t', '\n', '\r']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "summary generator build must be one TSV field",
+        ));
+    }
+    let source_text = source.display().to_string();
+    if source_text.contains(['\t', '\n', '\r']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "summary source path must be one TSV field",
+        ));
+    }
+    let rows = ledger
+        .rows()
+        .filter(|row| allow_dev || row.key.build_label != "dev")
+        .collect::<Vec<_>>();
     if rows.is_empty() {
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "summary has no non-dev rows; pass --allow-dev only for debugging",
+        ));
+    }
+    let config_hashes = rows
+        .iter()
+        .map(|row| format!("{:016x}", row.key.config_hash))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut verdicts = BTreeMap::<&str, u64>::new();
+    let mut groups = BTreeMap::<String, Vec<u64>>::new();
+    for row in &rows {
+        *verdicts.entry(row.verdict.as_str()).or_default() += 1;
+        groups
+            .entry(format!(
+                "{}:{:016x}:{}",
+                row.key.build_label,
+                row.key.config_hash,
+                row.key.profile.as_str()
+            ))
+            .or_default()
+            .push(row.key.seed);
+    }
+    let mut ranges = Vec::new();
+    for (group, mut seeds) in groups {
+        seeds.sort_unstable();
+        seeds.dedup();
+        let mut cursor = 0;
+        while cursor < seeds.len() {
+            let start = seeds[cursor];
+            let mut end = start.saturating_add(1);
+            cursor += 1;
+            while cursor < seeds.len() && seeds[cursor] == end {
+                end = end.saturating_add(1);
+                cursor += 1;
+            }
+            ranges.push(format!("{group}:0x{start:016x}..0x{end:016x}"));
+        }
+    }
+    let verdict_counts = verdicts
+        .iter()
+        .map(|(verdict, count)| format!("{verdict}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let source_bytes = fs::read(source)?;
+    Ok(format!(
+        "schema\tgenerator_build\tconfig_hashes\tsource_ledger_hashes\tcovered_seed_ranges\tverdict_counts\tgenerated_at\ncc-summary-v1\t{generator_build}\t{config_hashes}\t{}:{:016x}\t{}\t{verdict_counts}\t{generated_at}\n",
+        source_text,
+        fnv1a(&source_bytes),
+        ranges.join(","),
+    ))
+}
+
+fn parse_seed_range(value: &str) -> io::Result<(u64, u64)> {
+    let (start, end) = value.split_once("..").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--expect-range must be start..end",
+        )
+    })?;
+    let parse = |value: &str| {
+        if let Some(value) = value.strip_prefix("0x") {
+            u64::from_str_radix(value, 16)
+        } else {
+            value.parse::<u64>()
+        }
+    };
+    let start = parse(start)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid range start"))?;
+    let end =
+        parse(end).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid range end"))?;
+    Ok((start, end))
+}
+
+fn parse_fixed_hex(value: &str, field: &str) -> io::Result<u64> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    if value.len() != 16 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{field} must be 16 hexadecimal digits"),
+        ));
+    }
+    u64::from_str_radix(value, 16)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid {field}")))
+}
+
+fn write_ledger_conflict_artifact(
+    path: &Path,
+    ledgers: &[SeedLedger],
+    error: &LedgerError,
+) -> io::Result<()> {
+    let LedgerError::Conflict { key } = error else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conflict artifact requires a conflict key",
+        ));
+    };
+    let mut contents = String::from("# cc-ledger-conflict-v1\n");
+    contents.push_str(cc_swarm::LEDGER_COLUMNS);
+    contents.push('\n');
+    for row in ledgers
+        .iter()
+        .flat_map(SeedLedger::rows)
+        .filter(|row| row.key == *key)
+    {
+        contents.push_str(&encode_ledger_row(row));
+        contents.push('\n');
+    }
+    write_ledger_atomic(path, &contents)
+}
+
+fn append_ledger_rows(path: &Path, rows: &[LedgerRow]) -> io::Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
-    let create = !path.exists();
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    if create {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    file.lock()?;
+    file.rewind()?;
+    let mut existing_bytes = Vec::new();
+    file.read_to_end(&mut existing_bytes)?;
+    let canonical_len = if existing_bytes.is_empty() || existing_bytes.ends_with(b"\n") {
+        existing_bytes.len()
+    } else {
+        existing_bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |offset| offset + 1)
+    };
+    if canonical_len != existing_bytes.len() {
+        file.set_len(u64::try_from(canonical_len).unwrap_or(u64::MAX))?;
+        existing_bytes.truncate(canonical_len);
+    }
+    let mut existing = if existing_bytes.is_empty() {
+        SeedLedger::default()
+    } else {
+        SeedLedger::parse(
+            std::str::from_utf8(&existing_bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        )
+        .map_err(io::Error::other)?
+    };
+    if existing_bytes.is_empty() {
         file.write_all(cc_swarm::LEDGER_HEADER.as_bytes())?;
         file.write_all(b"\n")?;
         file.write_all(cc_swarm::LEDGER_COLUMNS.as_bytes())?;
@@ -213,29 +644,25 @@ fn append_ledger_rows(path: &Path, rows: &[LedgerRow]) -> io::Result<()> {
     }
     let mut canonical = SeedLedger::default();
     for row in rows {
-        canonical.insert(row.clone()).map_err(io::Error::other)?;
+        if existing.insert(row.clone()).map_err(io::Error::other)? {
+            canonical.insert(row.clone()).map_err(io::Error::other)?;
+        }
     }
-    let encoded = canonical.encode();
-    let body = encoded
-        .splitn(3, '\n')
-        .nth(2)
-        .ok_or_else(|| io::Error::other("internal ledger encoding header"))?;
-    file.write_all(body.as_bytes())?;
-    file.sync_all()
+    for (index, row) in canonical.rows().enumerate() {
+        file.write_all(encode_ledger_row(row).as_bytes())?;
+        file.write_all(b"\n")?;
+        if (index + 1).is_multiple_of(1_000) {
+            file.sync_all()?;
+        }
+    }
+    file.sync_all()?;
+    Ok(canonical.rows().count())
 }
 
-fn campaign_config_hash(profile: FaultProfile) -> u64 {
-    let spec = fixture_spec(Seed::new(0), profile, true);
-    let canonical = format!(
-        "profile={};nodes=5;end={};clients={};ops={};keyspace={};plan={:?}",
-        profile.as_str(),
-        spec.end_time.as_nanos(),
-        spec.workload.clients,
-        spec.workload.ops_per_second,
-        spec.workload.keyspace,
-        spec.plan,
-    );
-    fnv1a(canonical.as_bytes())
+fn campaign_config_hash(profile: FaultProfile, disk_profile: Option<&(String, DiskModel)>) -> u64 {
+    let mut spec = fixture_spec(Seed::new(0), profile, true);
+    apply_loaded_disk_profile(&mut spec, disk_profile);
+    fnv1a(canonical_run_spec_json(&spec).as_bytes())
 }
 
 fn run_model_check(args: &[String]) -> io::Result<()> {
@@ -261,6 +688,183 @@ fn run_model_check(args: &[String]) -> io::Result<()> {
         report.max_frontier,
     );
     Ok(())
+}
+
+fn run_fuzz(args: &[String]) -> io::Result<()> {
+    let format = parse_string_flag(args, "--format").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fuzz requires --format <inventory-name>",
+        )
+    })?;
+    let iterations = parse_u64_flag(args, "--iterations").unwrap_or(1_000);
+    let (max_input, allocation_budget, work_budget) = fuzz_inventory_budget(&format)?;
+    if iterations > work_budget {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("iterations {iterations} exceed inventory work budget {work_budget}"),
+        ));
+    }
+    let corpus =
+        parse_string_flag(args, "--corpus").unwrap_or_else(|| format!("fuzz/corpus/{format}"));
+    let corpus_files = collect_corpus_files(Path::new(&corpus))?;
+    if corpus_files.is_empty() || corpus_files.len() > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "corpus must contain 1..=64 .bin files",
+        ));
+    }
+    let mut cases = Vec::with_capacity(corpus_files.len());
+    for path in &corpus_files {
+        let bytes = fs::read(path)?;
+        if bytes.len() > max_input || bytes.len() > allocation_budget {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("corpus case {} exceeds inventory budget", path.display()),
+            ));
+        }
+        let outcome = fuzz_decode(&format, &bytes, allocation_budget);
+        if matches!(
+            outcome,
+            cc_swarm::FuzzOutcome::Panic
+                | cc_swarm::FuzzOutcome::BudgetExceeded
+                | cc_swarm::FuzzOutcome::UnknownFormat
+        ) {
+            return Err(io::Error::other(format!(
+                "corpus replay {} returned {}",
+                path.display(),
+                outcome.signature()
+            )));
+        }
+        cases.push(bytes);
+    }
+    let seed = parse_seed(args, 0);
+    let mut rng = cc_core::Xoshiro256pp::stream(seed, "codec-fuzz", fnv1a(format.as_bytes()));
+    let mut ok = 0_u64;
+    let mut typed_errors = 0_u64;
+    for iteration in 0..iterations {
+        let case = usize::try_from(rng.range_u64(0, cases.len() as u64)).unwrap_or(0);
+        let mutated = mutate_case(&format, &cases[case], &mut rng);
+        match fuzz_decode(&format, &mutated, allocation_budget) {
+            cc_swarm::FuzzOutcome::Ok => ok = ok.saturating_add(1),
+            cc_swarm::FuzzOutcome::TypedError => typed_errors = typed_errors.saturating_add(1),
+            failure => {
+                let signature = failure.signature();
+                let minimized = minimize_case(mutated, |candidate| {
+                    fuzz_decode(&format, candidate, allocation_budget).signature() == signature
+                });
+                let hash = fnv1a(&minimized);
+                let path = format!("fuzz-artifacts/crashes/{format}/{hash:016x}.bin");
+                write_create_new_synced(Path::new(&path), &minimized)?;
+                return Err(io::Error::other(format!(
+                    "fuzz {signature} at iteration {iteration}; minimized artifact={path}"
+                )));
+            }
+        }
+    }
+    if has_flag(args, "--update-corpus") {
+        let proposed = mutate_case(&format, &cases[0], &mut rng);
+        let hash = fnv1a(&proposed);
+        let path = Path::new(&corpus).join(format!("{hash:016x}.bin"));
+        if !path.exists() {
+            write_create_new_synced(&path, &proposed)?;
+            println!("fuzz corpus proposal={}", path.display());
+        }
+        regenerate_fuzz_manifest(Path::new("fuzz/corpus/manifest.tsv"))?;
+    }
+    println!(
+        "fuzz format={format} seed={seed} iterations={iterations} corpus={} ok={ok} typed_error={typed_errors} budget={allocation_budget}",
+        cases.len()
+    );
+    Ok(())
+}
+
+fn fuzz_inventory_budget(format: &str) -> io::Result<(usize, usize, u64)> {
+    let text = fs::read_to_string("fuzz/inventory.tsv")?;
+    let mut lines = text.lines();
+    if lines.next()
+        != Some(
+            "format\towner\tdecoder\tversion\tmax_input_bytes\tmax_declared_count\tallocation_budget_bytes\twork_budget",
+        )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid fuzz inventory header",
+        ));
+    }
+    for (offset, line) in lines.enumerate() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 8 || fields.iter().any(|field| field.is_empty()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid fuzz inventory line {}", offset + 2),
+            ));
+        }
+        if fields[0] == format {
+            let parse_usize = |value: &str| {
+                value.parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid inventory byte budget")
+                })
+            };
+            return Ok((
+                parse_usize(fields[4])?,
+                parse_usize(fields[6])?,
+                fields[7].parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid inventory work budget")
+                })?,
+            ));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("format {format} is absent from fuzz inventory"),
+    ))
+}
+
+fn collect_corpus_files(root: &Path) -> io::Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "bin") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn regenerate_fuzz_manifest(path: &Path) -> io::Result<()> {
+    let inventory = fs::read_to_string("fuzz/inventory.tsv")?;
+    let mut output = String::from("format\tpath\tcontent_hash\texpected\tsignature\tbudget\n");
+    for line in inventory.lines().skip(1) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 8 {
+            continue;
+        }
+        let format = fields[0];
+        let allocation_budget = fields[6].parse::<usize>().map_err(io::Error::other)?;
+        for case in collect_corpus_files(&Path::new("fuzz/corpus").join(format))? {
+            let bytes = fs::read(&case)?;
+            let signature = fuzz_decode(format, &bytes, allocation_budget).signature();
+            output.push_str(&format!(
+                "{format}\t{}\t{:016x}\t{}\t{signature}\t{allocation_budget}\n",
+                case.display(),
+                fnv1a(&bytes),
+                if signature == "ok" {
+                    "ok"
+                } else {
+                    "typed-error"
+                },
+            ));
+        }
+    }
+    write_replace_atomic(path, output.as_bytes())
 }
 
 fn run_coverage_search(args: &[String]) -> io::Result<()> {
@@ -349,6 +953,9 @@ fn run_sequence(args: &[String]) -> io::Result<()> {
         "sequence diagram: wrote {output} events={}",
         run.trace.events.len()
     );
+    for violation in &run.invariant_violations {
+        println!("invariant violation: {violation}");
+    }
     Ok(())
 }
 
@@ -370,9 +977,10 @@ fn run_explain(args: &[String]) -> io::Result<()> {
         .iter()
         .find(|anomaly| anomaly.class.as_str() != "unclassified")
         .unwrap_or_else(|| &anomalies[0]);
-    let witness = matches!(run.verdict, Verdict::NotLinearizable { .. })
-        .then(|| minimize_witness(&run.history, CheckerConfig::default(), 200))
-        .flatten();
+    let witness = match &run.verdict {
+        Verdict::NotLinearizable { witness, .. } => Some(witness.clone()),
+        _ => None,
+    };
     let ids = witness
         .as_ref()
         .map_or_else(Vec::new, |witness| witness.operation_ids.clone());
@@ -440,15 +1048,36 @@ fn run_explain(args: &[String]) -> io::Result<()> {
         .filter(|event| {
             event.time >= first && event.time <= last && event_kinds.contains(&event.kind)
         })
-        .count();
+        .collect::<Vec<_>>();
+    for event in relevant.iter().take(128) {
+        println!(
+            "event={} time={} node={} kind={} payload={}",
+            event.seq,
+            event.time.as_nanos(),
+            event.node.map_or(0, NodeId::get),
+            event.kind.as_str(),
+            trace_payload(&event.payload),
+        );
+    }
+    let relevant_nodes = relevant
+        .iter()
+        .filter_map(|event| event.node)
+        .map(NodeId::get)
+        .collect::<BTreeSet<_>>();
     println!(
-        "hypothesis=The trace contains {relevant} election/commit/apply/config/snapshot/fault events in the witness interval; this is diagnostic evidence, not a root-cause claim."
+        "hypothesis=Terms and nodes {:?} appear in {} election/commit/apply/config/snapshot/fault events in the witness interval; this is diagnostic evidence, not a root-cause claim.",
+        relevant_nodes,
+        relevant.len(),
     );
     if let Some(path) = parse_string_flag(args, "--svg") {
         if let Some(parent) = Path::new(&path).parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, sequence_diagram_svg(&run.trace))?;
+        let mut witness_trace = run.trace.clone();
+        witness_trace
+            .events
+            .retain(|event| event.time >= first && event.time <= last);
+        fs::write(&path, sequence_diagram_svg(&witness_trace))?;
         println!("svg={path}");
     }
     Ok(())
@@ -462,10 +1091,20 @@ fn run_trace(args: &[String]) -> io::Result<()> {
         )
     })?;
     let raw = fs::read(path)?;
-    let trace = if raw.starts_with(b"CCTR") {
-        Trace::decode(&raw).map_err(io::Error::other)?
+    let events = if raw.starts_with(b"CCTR") {
+        decode_trace_display_events(&raw)?
     } else {
         decode_trace_json(std::str::from_utf8(&raw).map_err(io::Error::other)?)?
+            .events
+            .into_iter()
+            .map(|event| TraceDisplayEvent {
+                seq: event.seq,
+                time: event.time,
+                node: event.node,
+                kind: event.kind.as_str().to_owned(),
+                payload: event.payload,
+            })
+            .collect()
     };
     let node = parse_u64_flag(args, "--node").map(NodeId::new);
     let kinds = parse_string_flag(args, "--kind")
@@ -485,12 +1124,14 @@ fn run_trace(args: &[String]) -> io::Result<()> {
     let tail =
         parse_u64_flag(args, "--tail").map(|value| usize::try_from(value).unwrap_or(usize::MAX));
     let mut rows = VecDeque::new();
-    let mut kind_counts = BTreeMap::<&str, u64>::new();
+    let mut row_bytes = 0_usize;
+    const MAX_TAIL_BYTES: usize = 8 * 1024 * 1024;
+    let mut kind_counts = BTreeMap::<String, u64>::new();
     let mut node_counts = BTreeMap::<String, u64>::new();
     let mut instant_counts = BTreeMap::<u64, u64>::new();
-    for event in &trace.events {
+    for event in &events {
         if node.is_some_and(|node| event.node != Some(node))
-            || !kinds.is_empty() && !kinds.contains(event.kind.as_str())
+            || !kinds.is_empty() && !kinds.contains(&event.kind)
             || since.is_some_and(|time| event.time < time)
             || until.is_some_and(|time| event.time > time)
             || needle.as_ref().is_some_and(|needle| {
@@ -502,7 +1143,7 @@ fn run_trace(args: &[String]) -> io::Result<()> {
         {
             continue;
         }
-        *kind_counts.entry(event.kind.as_str()).or_default() += 1;
+        *kind_counts.entry(event.kind.clone()).or_default() += 1;
         *node_counts
             .entry(
                 event
@@ -517,22 +1158,34 @@ fn run_trace(args: &[String]) -> io::Result<()> {
             event
                 .node
                 .map_or_else(|| String::from("-"), |id| id.get().to_string()),
-            event.kind.as_str(),
+            event.kind,
             trace_payload(&event.payload),
         );
         if let Some(limit) = tail {
             if limit != 0 {
+                let bytes = row.len();
+                if bytes > MAX_TAIL_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "one trace row exceeds the tail byte cap",
+                    ));
+                }
                 rows.push_back(row);
-                if rows.len() > limit {
-                    rows.pop_front();
+                row_bytes = row_bytes.saturating_add(bytes);
+                while rows.len() > limit || row_bytes > MAX_TAIL_BYTES {
+                    if let Some(removed) = rows.pop_front() {
+                        row_bytes = row_bytes.saturating_sub(removed.len());
+                    }
                 }
             }
         } else {
-            rows.push_back(row);
+            println!("{row}");
         }
     }
-    for row in rows {
-        println!("{row}");
+    if tail.is_some() {
+        for row in rows {
+            println!("{row}");
+        }
     }
     if has_flag(args, "--stats") {
         let busiest = instant_counts
@@ -557,6 +1210,138 @@ fn run_trace(args: &[String]) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TraceDisplayEvent {
+    seq: u64,
+    time: Time,
+    node: Option<NodeId>,
+    kind: String,
+    payload: Vec<u8>,
+}
+
+fn decode_trace_display_events(bytes: &[u8]) -> io::Result<Vec<TraceDisplayEvent>> {
+    struct Cursor<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+    }
+    impl<'a> Cursor<'a> {
+        fn take(&mut self, length: usize) -> io::Result<&'a [u8]> {
+            let start = self.offset;
+            let end = start.checked_add(length).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("trace at byte offset {start}: length overflow"),
+                )
+            })?;
+            let value = self.bytes.get(start..end).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("trace at byte offset {start}: need {length} bytes"),
+                )
+            })?;
+            self.offset = end;
+            Ok(value)
+        }
+        fn u8(&mut self) -> io::Result<u8> {
+            Ok(self.take(1)?[0])
+        }
+        fn u16(&mut self) -> io::Result<u16> {
+            Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("u16")))
+        }
+        fn u32(&mut self) -> io::Result<u32> {
+            Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("u32")))
+        }
+        fn u64(&mut self) -> io::Result<u64> {
+            Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("u64")))
+        }
+        fn bounded_bytes(&mut self, maximum: usize, field: &str) -> io::Result<Vec<u8>> {
+            let length_offset = self.offset;
+            let length = usize::try_from(self.u32()?).unwrap_or(usize::MAX);
+            if length > maximum || length > self.bytes.len().saturating_sub(self.offset) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "trace at byte offset {length_offset}: {field} length {length} exceeds remaining/budget"
+                    ),
+                ));
+            }
+            Ok(self.take(length)?.to_vec())
+        }
+    }
+
+    let mut cursor = Cursor { bytes, offset: 0 };
+    if cursor.take(4)? != b"CCTR" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trace at byte offset 0: invalid magic",
+        ));
+    }
+    let version_offset = cursor.offset;
+    if cursor.u16()? != cc_core::TRACE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("trace at byte offset {version_offset}: unsupported version"),
+        ));
+    }
+    let _seed = cursor.u64()?;
+    let _config_hash = cursor.u32()?;
+    let build = cursor.bounded_bytes(cc_core::MAX_CODEC_BYTES, "build")?;
+    if std::str::from_utf8(&build).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trace build label is not UTF-8",
+        ));
+    }
+    let count_offset = cursor.offset;
+    let count = usize::try_from(cursor.u32()?).unwrap_or(usize::MAX);
+    const MIN_EVENT_BYTES: usize = 8 + 8 + 1 + 1 + 4;
+    let maximum_count = bytes.len().saturating_sub(cursor.offset) / MIN_EVENT_BYTES;
+    if count > maximum_count || count > cc_core::MAX_CODEC_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "trace at byte offset {count_offset}: event count {count} exceeds remaining/budget"
+            ),
+        ));
+    }
+    let mut events = Vec::with_capacity(count);
+    for _ in 0..count {
+        let seq = cursor.u64()?;
+        let time = Time::from_nanos(cursor.u64()?);
+        let node = match cursor.u8()? {
+            0 => None,
+            1 => Some(NodeId::new(cursor.u64()?)),
+            tag => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "trace at byte offset {}: invalid node tag {tag}",
+                        cursor.offset.saturating_sub(1)
+                    ),
+                ));
+            }
+        };
+        let tag = cursor.u8()?;
+        let kind = EventKind::from_code(tag)
+            .map_or_else(|| format!("unknown-{tag}"), |kind| kind.as_str().to_owned());
+        let payload = cursor.bounded_bytes(cc_core::MAX_CODEC_BYTES, "event payload")?;
+        events.push(TraceDisplayEvent {
+            seq,
+            time,
+            node,
+            kind,
+            payload,
+        });
+    }
+    if cursor.offset != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("trace at byte offset {}: trailing bytes", cursor.offset),
+        ));
+    }
+    Ok(events)
 }
 
 fn operation_key(kind: &OperationKind) -> &[u8] {
@@ -873,7 +1658,9 @@ fn selfcheck_cluster(seed: Seed) -> Result<(), &'static str> {
 fn run_one(args: &[String]) -> io::Result<()> {
     let seed = parse_seed(args, 0);
     let profile = parse_profile(args, FaultProfile::Calm);
-    let spec = fixture_spec(seed, profile, false);
+    let disk_profile = load_disk_profile(args)?;
+    let mut spec = fixture_spec(seed, profile, false);
+    apply_loaded_disk_profile(&mut spec, disk_profile.as_ref());
     let run = run_spec(spec, RecorderLevel::Theater).map_err(io::Error::other)?;
     print_run_summary(seed, profile, &run, "one");
     if has_flag(args, "--export-json") {
@@ -892,12 +1679,14 @@ fn run_one(args: &[String]) -> io::Result<()> {
 }
 
 fn run_campaign(args: &[String]) -> io::Result<()> {
+    let started_unix_ms = unix_time_ms()?;
     let seeds = parse_u64_flag(args, "--seeds").unwrap_or(1);
     let profile = parse_profile(args, FaultProfile::Rough);
     let shard = parse_shard(args)?;
     let jobs = parse_u64_flag(args, "--jobs").unwrap_or(1).max(1);
     let ledger_path = parse_string_flag(args, "--ledger");
     let build_label = parse_string_flag(args, "--build").unwrap_or_else(|| String::from("dev"));
+    let disk_profile = load_disk_profile(args)?;
     if build_label.is_empty() || build_label.contains(['\t', '\n', '\r']) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -912,7 +1701,7 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
             "--resume-failures requires --resume",
         ));
     }
-    let config_hash = campaign_config_hash(profile);
+    let config_hash = campaign_config_hash(profile, disk_profile.as_ref());
     let prior_ledger = match ledger_path.as_deref() {
         Some(path) if Path::new(path).exists() => read_ledger(Path::new(path))?,
         Some(_) => SeedLedger::default(),
@@ -946,6 +1735,7 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
         let next_seed = Arc::clone(&next_seed);
         let prior_rows = Arc::clone(&prior_rows);
         let build_label = build_label.clone();
+        let disk_profile = disk_profile.clone();
         workers.push(thread::spawn(move || -> io::Result<CampaignWorkerSummary> {
             let mut failures = 0_u64;
             let mut history_failures = 0_u64;
@@ -965,11 +1755,10 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
                     continue;
                 }
                 runs = runs.saturating_add(1);
-                let result = run_spec(
-                    fixture_spec(Seed::new(seed), profile, true),
-                    RecorderLevel::Campaign,
-                )
-                .map_err(|error| error.to_string());
+                let mut spec = fixture_spec(Seed::new(seed), profile, true);
+                apply_loaded_disk_profile(&mut spec, disk_profile.as_ref());
+                let result = run_spec(spec, RecorderLevel::Campaign)
+                    .map_err(|error| error.to_string());
                 match result {
                     Ok(run) => {
                         events = events.saturating_add(run.event_count);
@@ -1012,7 +1801,7 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
                             },
                             events: run.event_count,
                             checker_states,
-                            peak_total_bytes: 0,
+                            peak_total_bytes: run.peak_total_bytes,
                             artifact_hash: (failed || history_failed)
                                 .then(|| fnv1a(run.artifact_json(profile).as_bytes())),
                         });
@@ -1097,7 +1886,7 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     println!("reachability beacons={beacon_report} missing={missing}");
-    if let Some(path) = ledger_path {
+    if let Some(path) = ledger_path.as_deref() {
         let mut ledger = prior_ledger;
         let mut appended = Vec::new();
         for row in ledger_rows {
@@ -1105,11 +1894,42 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
                 appended.push(row);
             }
         }
-        append_ledger_rows(Path::new(&path), &appended)?;
+        let appended_count = append_ledger_rows(Path::new(path), &appended)?;
         println!(
             "ledger path={path} appended={} config_hash={config_hash:016x} build={build_label}",
-            appended.len()
+            appended_count
         );
+        let ended_unix_ms = unix_time_ms()?;
+        let ledger_bytes = fs::read(path)?;
+        let receipt_path = parse_string_flag(args, "--receipt").unwrap_or_else(|| {
+            let shard_label = shard.map_or_else(
+                || String::from("all"),
+                |shard| format!("{}-of-{}", shard.index, shard.total),
+            );
+            format!(
+                "campaigns/receipts/{}-{}-{shard_label}-{started_unix_ms}-{}.json",
+                filename_component(&build_label),
+                profile.as_str(),
+                std::process::id(),
+            )
+        });
+        let receipt = format!(
+            "{{\"schema_version\":1,\"source_ledger\":\"{}\",\"source_ledger_hash\":\"{:016x}\",\"build_label\":\"{}\",\"config_hash\":\"{config_hash:016x}\",\"profile\":\"{}\",\"shard\":\"{}\",\"range\":\"0..{seeds}\",\"host\":\"{}-{}\",\"started_unix_ms\":{started_unix_ms},\"ended_unix_ms\":{ended_unix_ms},\"wall_duration_ms\":{},\"runs\":{runs},\"events\":{events},\"runs_per_sec\":{:.6}}}\n",
+            json_escape(path),
+            fnv1a(&ledger_bytes),
+            json_escape(&build_label),
+            profile.as_str(),
+            shard.map_or_else(
+                || String::from("all"),
+                |shard| format!("{}/{}", shard.index, shard.total)
+            ),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            ended_unix_ms.saturating_sub(started_unix_ms),
+            runs as f64 / elapsed,
+        );
+        write_create_new_synced(Path::new(&receipt_path), receipt.as_bytes())?;
+        println!("campaign receipt={receipt_path}");
     }
     if let Some(required) = parse_string_flag(args, "--require-beacon") {
         let Some(position) = REACHABILITY_BEACONS
@@ -1391,6 +2211,7 @@ fn fixture_spec(seed: Seed, profile: FaultProfile, campaign: bool) -> RunSpec {
         clients: 2,
         ops_per_second: 10,
         keyspace: 16,
+        set_ttl: matches!(profile, FaultProfile::Ttl).then_some(Duration::from_millis(125)),
     };
     spec
 }
@@ -1407,6 +2228,9 @@ fn print_run_summary(seed: Seed, profile: FaultProfile, run: &ClusterRun, comman
         run.healthy(),
         verdict_name(&run.verdict)
     );
+    for violation in &run.invariant_violations {
+        println!("invariant violation: {violation}");
+    }
 }
 
 fn extract_seed(text: &str) -> Option<Seed> {
@@ -1446,6 +2270,7 @@ fn extract_run_spec(text: &str, seed: Seed, profile: FaultProfile) -> RunSpec {
     if let Some(keyspace) = extract_number(text, "\"keyspace\":") {
         spec.workload.keyspace = keyspace;
     }
+    spec.workload.set_ttl = extract_number(text, "\"set_ttl_ns\":").map(Duration::from_nanos);
     if let Some(faults) = extract_faults(text) {
         spec.plan = faults;
     }
@@ -1661,6 +2486,96 @@ fn parse_u64_flag(args: &[String], flag: &str) -> Option<u64> {
     parse_string_flag(args, flag).and_then(|value| value.parse().ok())
 }
 
+fn load_disk_profile(args: &[String]) -> io::Result<Option<(String, DiskModel)>> {
+    let Some(name) = parse_string_flag(args, "--disk-profile") else {
+        return Ok(None);
+    };
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--disk-profile must be an ASCII name",
+        ));
+    }
+    let relative = Path::new("sim/profiles/calibrated").join(format!("{name}.toml"));
+    let path = if relative.exists() {
+        relative
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative)
+    };
+    let text = fs::read_to_string(&path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot read calibrated profile {}: {error}", path.display()),
+        )
+    })?;
+    if profile_scalar(&text, "schema") != Some("1")
+        || profile_scalar(&text, "name") != Some(name.as_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "calibrated profile schema/name mismatch",
+        ));
+    }
+    let model = DiskModel {
+        read: profile_distribution(&text, "read_buckets_ns")?,
+        write: profile_distribution(&text, "write_buckets_ns")?,
+        fsync: profile_distribution(&text, "fsync_buckets_ns")?,
+        rename: profile_distribution(&text, "rename_buckets_ns")?,
+        dirsync: profile_distribution(&text, "dirsync_buckets_ns")?,
+    };
+    Ok(Some((name, model)))
+}
+
+fn profile_scalar<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().map(str::trim).find_map(|line| {
+        let (candidate, value) = line.split_once('=')?;
+        (candidate.trim() == key).then(|| value.trim().trim_matches('"'))
+    })
+}
+
+fn profile_distribution(text: &str, key: &str) -> io::Result<cc_core::DelayDist> {
+    let value = profile_scalar(text, key)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "profile lacks disk buckets"))?;
+    let value = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid disk bucket array"))?;
+    let parsed = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid disk bucket"))?;
+    if parsed.is_empty() || parsed.len() > 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "disk bucket count must be 1..=16",
+        ));
+    }
+    let mut buckets = [Duration::from_nanos(0); 16];
+    for (slot, value) in buckets.iter_mut().zip(parsed.iter()) {
+        *slot = Duration::from_nanos(*value);
+    }
+    Ok(cc_core::DelayDist::Empirical {
+        buckets,
+        count: u8::try_from(parsed.len()).expect("bounded bucket count"),
+    })
+}
+
+fn apply_loaded_disk_profile(spec: &mut RunSpec, profile: Option<&(String, DiskModel)>) {
+    if let Some((name, model)) = profile {
+        spec.disk_profile = Some(name.clone());
+        spec.config.disk_model = *model;
+    }
+}
+
 fn parse_string_flag(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|window| window[0] == flag)
@@ -1689,7 +2604,7 @@ fn print_help() {
     println!(concat!(
         "cc-swarm ",
         env!("CARGO_PKG_VERSION"),
-        "\n\nCommands:\n  run --profile rough --seeds N --jobs N [--shard i/N] [--ledger PATH] [--build LABEL] [--resume] [--require-beacon NAME]\n  one --seed 0x... --profile rough [--export-json] [--export-history PATH]\n  ledger stats <ledger.tsv>\n  ledger merge --out <path> <ledger.tsv>...\n  model-check [--max-log N] [--max-term N] [--max-messages N] [--max-depth N] [--max-states N]\n  search --profile rough --iterations N\n  regress\n  shrink --failure PATH\n  diff <artifact-a.json> <artifact-b.json>\n  sequence <artifact.json> [--output diagram.svg]\n  explain --failure <artifact.json> [--svg diagram.svg]\n  trace <trace.cctr|trace.json> [--node ID] [--kind K[,K]] [--since D] [--until D] [--grep HEX_OR_TEXT] [--tail N] [--stats]\n  proxy [--listen ADDR] [--upstream ADDR] [--drop-every N] [--delay-ms N]\n  check-history --file PATH\n  replay --file JOURNAL --assert-effects\n  export-porcupine --file PATH [--output PATH]\n  --selfcheck\n  --determinism\n  --determinism-seeds N"
+        "\n\nCommands:\n  run --profile rough --seeds N --jobs N [--disk-profile NAME] [--shard i/N] [--ledger PATH] [--build LABEL] [--resume] [--require-beacon NAME]\n  capability-campaign --seeds N\n  one --seed 0x... --profile rough [--disk-profile NAME] [--export-json] [--export-history PATH]\n  ledger stats <ledger.tsv>\n  ledger merge --out <path> <ledger.tsv>...\n  model-check [--max-log N] [--max-term N] [--max-messages N] [--max-depth N] [--max-states N]\n  search --profile rough --iterations N\n  regress\n  shrink --failure PATH\n  diff <artifact-a.json> <artifact-b.json>\n  sequence <artifact.json> [--output diagram.svg]\n  explain --failure <artifact.json> [--svg diagram.svg]\n  trace <trace.cctr|trace.json> [--node ID] [--kind K[,K]] [--since D] [--until D] [--grep HEX_OR_TEXT] [--tail N] [--stats]\n  proxy [--listen ADDR] [--upstream ADDR] [--drop-every N] [--delay-ms N]\n  check-history --file PATH\n  replay --file JOURNAL --assert-effects\n  export-porcupine --file PATH [--output PATH]\n  --selfcheck\n  --determinism\n  --determinism-seeds N"
     ));
     println!("\nReachability beacons (for --require-beacon):\n  {REACHABILITY_BEACONS_HELP}");
     println!(
@@ -1702,6 +2617,48 @@ fn print_help() {
 #[cfg(test)]
 mod trace_tests {
     use super::*;
+
+    #[test]
+    fn trap_named_disk_profile_is_canonical_and_does_not_change_defaults() {
+        let args = vec![
+            String::from("--disk-profile"),
+            String::from("reference-local"),
+        ];
+        let loaded = load_disk_profile(&args)
+            .expect("profile")
+            .expect("named profile");
+        let defaults = RunSpec::standard(Seed::new(7), FaultProfile::Calm);
+        let mut first = defaults.clone();
+        let mut second = defaults.clone();
+        apply_loaded_disk_profile(&mut first, Some(&loaded));
+        apply_loaded_disk_profile(&mut second, Some(&loaded));
+        assert_eq!(
+            canonical_run_spec_json(&first),
+            canonical_run_spec_json(&second)
+        );
+        assert_eq!(first.disk_profile.as_deref(), Some("reference-local"));
+        assert_eq!(defaults.disk_profile, None);
+        assert_eq!(defaults.config.disk_model, DiskModel::universal());
+        assert_ne!(
+            canonical_run_spec_json(&first),
+            canonical_run_spec_json(&defaults)
+        );
+    }
+
+    fn binary_trace_with_tag(tag: u8) -> Vec<u8> {
+        let mut enc = cc_core::Enc::new();
+        enc.header(cc_core::TRACE_MAGIC, cc_core::TRACE_VERSION);
+        enc.u64(7);
+        enc.u32(9);
+        enc.string("future");
+        enc.u32(1);
+        enc.u64(0);
+        enc.u64(3);
+        enc.u8(0);
+        enc.u8(tag);
+        enc.bytes(b"future-payload");
+        enc.finish()
+    }
 
     #[test]
     fn trap_trace_reads_current_binary_and_json_exports() {
@@ -1721,6 +2678,37 @@ mod trace_tests {
             trace_payload(b"fault\x00payload"),
             "0x6661756c74007061796c6f6164"
         );
+    }
+
+    #[test]
+    fn trap_trace_reads_legacy_cctr_fixture() {
+        let trace = Trace::decode(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/golden/legacy/cctr-v1.bin"
+        )))
+        .expect("legacy CCTR fixture");
+        assert_eq!(trace.seed, Seed::new(0xcc));
+        assert!(!trace.events.is_empty(), "legacy trace must retain events");
+    }
+
+    #[test]
+    fn trap_trace_unknown_event_is_skippable() {
+        let events = decode_trace_display_events(&binary_trace_with_tag(0xfe))
+            .expect("unknown registry code is still framed and skippable");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "unknown-254");
+        assert_eq!(events[0].payload, b"future-payload");
+    }
+
+    #[test]
+    fn trap_trace_rejects_malformed_length_at_offset() {
+        let mut bytes = binary_trace_with_tag(EventKind::Fault as u8);
+        let length_offset = bytes.len() - b"future-payload".len() - 4;
+        bytes[length_offset..length_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let error = decode_trace_display_events(&bytes).expect_err("declared payload overflow");
+        let message = error.to_string();
+        assert!(message.contains(&format!("byte offset {length_offset}")));
+        assert!(message.contains("event payload length"));
     }
 
     #[test]
@@ -1790,6 +2778,7 @@ mod trace_tests {
         let image = RecordedBootImage {
             config: NodeConfig {
                 id: NodeId::new(1),
+                cluster_id: [7; 16],
                 seed: Seed::new(1),
                 raft: RaftConfig::default(),
                 store: StoreConfig::default(),
@@ -1846,6 +2835,7 @@ mod trace_tests {
         let image = RecordedBootImage {
             config: NodeConfig {
                 id: NodeId::new(1),
+                cluster_id: [8; 16],
                 seed: Seed::new(1),
                 raft: RaftConfig::default(),
                 store: StoreConfig::default(),

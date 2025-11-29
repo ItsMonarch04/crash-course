@@ -21,6 +21,7 @@ pub struct SimConfig {
     pub max_events: u64,
     pub max_events_per_instant: u64,
     pub node_count: u64,
+    pub disk_model: DiskModel,
 }
 
 impl Default for SimConfig {
@@ -30,6 +31,7 @@ impl Default for SimConfig {
             max_events: DEFAULT_MAX_EVENTS,
             max_events_per_instant: DEFAULT_MAX_EVENTS_PER_INSTANT,
             node_count: 5,
+            disk_model: DiskModel::universal(),
         }
     }
 }
@@ -81,9 +83,11 @@ impl<E> PartialOrd for QueueItem<E> {
 /// Shared deterministic scheduler. It orders events by virtual time and then
 /// insertion sequence, so hosts can share exact same-instant FIFO behavior
 /// without retaining private heap implementations.
+#[derive(Clone)]
 pub struct EventQueue<E> {
     queue: BinaryHeap<QueueItem<E>>,
     next_tie_seq: u64,
+    peak_len: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,6 +102,7 @@ impl<E> EventQueue<E> {
         Self {
             queue: BinaryHeap::new(),
             next_tie_seq: 0,
+            peak_len: 0,
         }
     }
 
@@ -108,6 +113,7 @@ impl<E> EventQueue<E> {
             .checked_add(1)
             .expect("invariant: scheduler tie sequence overflow");
         self.queue.push(QueueItem { at, tie_seq, event });
+        self.peak_len = self.peak_len.max(self.queue.len());
     }
 
     #[must_use]
@@ -120,6 +126,21 @@ impl<E> EventQueue<E> {
             at: item.at,
             event: item.event,
         })
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    #[must_use]
+    pub const fn peak_len(&self) -> usize {
+        self.peak_len
     }
 }
 
@@ -136,6 +157,7 @@ pub enum RecorderLevel {
     Theater,
 }
 
+#[derive(Clone)]
 pub struct Recorder {
     level: RecorderLevel,
     trace: Trace,
@@ -371,9 +393,57 @@ pub enum DiskOperation {
     SyncDir,
 }
 
+/// Baseline service distributions for each modeled disk operation. Faults
+/// such as [`SlowDisk`] add to these samples; they never replace the named
+/// environment model or turn latency into an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiskModel {
+    pub read: DelayDist,
+    pub write: DelayDist,
+    pub fsync: DelayDist,
+    pub rename: DelayDist,
+    pub dirsync: DelayDist,
+}
+
+impl DiskModel {
+    /// Small deterministic defaults used by universal tests and examples.
+    #[must_use]
+    pub const fn universal() -> Self {
+        Self {
+            read: DelayDist::Fixed(Duration::from_nanos(0)),
+            write: DelayDist::Fixed(Duration::from_nanos(0)),
+            fsync: DelayDist::Fixed(Duration::from_nanos(0)),
+            rename: DelayDist::Fixed(Duration::from_nanos(0)),
+            dirsync: DelayDist::Fixed(Duration::from_nanos(0)),
+        }
+    }
+
+    #[must_use]
+    pub const fn distribution(self, operation: DiskOperation) -> DelayDist {
+        match operation {
+            DiskOperation::Read => self.read,
+            DiskOperation::Write => self.write,
+            DiskOperation::Fsync => self.fsync,
+            DiskOperation::Rename => self.rename,
+            DiskOperation::SyncDir => self.dirsync,
+        }
+    }
+}
+
+impl Default for DiskModel {
+    fn default() -> Self {
+        Self::universal()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SimFile {
+    /// Page-cache namespace. A rename updates this immediately, just as it is
+    /// visible to a live process before the containing directory is synced.
     id: FileId,
+    /// Directory-durable namespace. Crash recovery exposes this name, not a
+    /// rename that was never followed by `sync_dir`.
+    durable_id: FileId,
     visible: Vec<u8>,
     durable: Vec<u8>,
     /// Checksum recorded by the last successful fsync.  Keeping this
@@ -391,7 +461,7 @@ struct BitRot {
 
 /// A deterministic page-cache disk. Writes are visible before fsync; crash
 /// discards every visible byte not copied to the durable image.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SimDisk {
     files: Vec<SimFile>,
     fault: Option<DiskFault>,
@@ -399,11 +469,13 @@ pub struct SimDisk {
     enospc: bool,
     quota: Option<u64>,
     bitrot: Option<BitRot>,
+    model: DiskModel,
+    service_rng: Xoshiro256pp,
 }
 
 impl SimDisk {
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             files: Vec::new(),
             fault: None,
@@ -417,6 +489,17 @@ impl SimDisk {
             enospc: false,
             quota: None,
             bitrot: None,
+            model: DiskModel::universal(),
+            service_rng: Xoshiro256pp::stream(Seed::new(0), "sim-disk-service", 0),
+        }
+    }
+
+    #[must_use]
+    pub fn with_model(model: DiskModel, seed: Seed, node: NodeId) -> Self {
+        Self {
+            model,
+            service_rng: Xoshiro256pp::stream(seed, "sim-disk-service", node.get()),
+            ..Self::new()
         }
     }
 
@@ -446,14 +529,18 @@ impl SimDisk {
     }
 
     #[must_use]
-    pub const fn service_time(&self, operation: DiskOperation) -> Duration {
-        match operation {
+    pub fn service_time(&mut self, operation: DiskOperation) -> Duration {
+        let extra = match operation {
             DiskOperation::Read => self.slow.read_extra,
             DiskOperation::Write => self.slow.write_extra,
             DiskOperation::Fsync => self.slow.fsync_extra,
             DiskOperation::Rename => self.slow.rename_extra,
             DiskOperation::SyncDir => self.slow.dirsync_extra,
-        }
+        };
+        self.service_rng
+            .sample_delay(self.model.distribution(operation))
+            .checked_add(extra)
+            .unwrap_or(Duration::from_nanos(u64::MAX))
     }
 
     pub fn write(&mut self, file: FileId, at: u64, bytes: &[u8]) -> Result<IoResult, IoError> {
@@ -552,9 +639,73 @@ impl SimDisk {
         Ok(IoResult::Truncated { len: len as u64 })
     }
 
+    /// Complete a host delete effect. Space is released at this transition,
+    /// not when deletion is merely scheduled.
+    pub fn delete(&mut self, file: FileId) -> Result<IoResult, IoError> {
+        let index = self
+            .files
+            .iter()
+            .position(|entry| entry.id == file)
+            .ok_or(IoError::NotFound)?;
+        self.files.remove(index);
+        Ok(IoResult::Fsynced)
+    }
+
+    /// Rename one logical file without copying its page-cache or durable
+    /// image. Hosts pair this with a directory sync before treating a newly
+    /// published snapshot/manifest name as durable.
+    pub fn rename(&mut self, from: FileId, to: FileId) -> Result<IoResult, IoError> {
+        if from == to {
+            return Err(IoError::AlreadyExists);
+        }
+        if let Some(target) = self.files.iter().position(|entry| entry.id == to) {
+            if !matches!(
+                to,
+                FileId::Wal { segment: 0 } | FileId::StoreWal { segment: 0 }
+            ) {
+                return Err(IoError::AlreadyExists);
+            }
+            // A rename-over-fsynced-WAL is the atomic prefix-reclamation
+            // point. Choosing the new complete name as the crash outcome is
+            // one of the two filesystem-permitted results; sync_dir still
+            // orders subsequent deletion/publication effects.
+            self.files.remove(target);
+        }
+        let file = self
+            .files
+            .iter_mut()
+            .find(|entry| entry.id == from)
+            .ok_or(IoError::NotFound)?;
+        file.id = to;
+        if matches!(
+            to,
+            FileId::Wal { segment: 0 } | FileId::StoreWal { segment: 0 }
+        ) {
+            file.durable_id = to;
+        }
+        if let Some(bitrot) = self.bitrot.as_mut()
+            && bitrot.file == from
+        {
+            bitrot.file = to;
+        }
+        Ok(IoResult::Fsynced)
+    }
+
+    pub fn sync_dir(&mut self) -> Result<IoResult, IoError> {
+        if matches!(self.fault, Some(DiskFault::EioNextFsync)) {
+            self.fault = None;
+            return Err(IoError::Eio);
+        }
+        for file in &mut self.files {
+            file.durable_id = file.id;
+        }
+        Ok(IoResult::Fsynced)
+    }
+
     pub fn crash(&mut self) {
         for file in &mut self.files {
             file.visible.clone_from(&file.durable);
+            file.id = file.durable_id;
         }
     }
 
@@ -562,8 +713,16 @@ impl SimDisk {
     pub fn durable(&self, file: FileId) -> Option<&[u8]> {
         self.files
             .iter()
-            .find(|entry| entry.id == file)
+            .find(|entry| entry.durable_id == file)
             .map(|entry| entry.durable.as_slice())
+    }
+
+    #[must_use]
+    pub fn visible(&self, file: FileId) -> Option<&[u8]> {
+        self.files
+            .iter()
+            .find(|entry| entry.id == file)
+            .map(|entry| entry.visible.as_slice())
     }
 
     /// Verify the durable image before a recovery boundary.  Page-cache bytes
@@ -573,7 +732,7 @@ impl SimDisk {
         let file_state = self
             .files
             .iter()
-            .find(|entry| entry.id == file)
+            .find(|entry| entry.durable_id == file)
             .ok_or(IoError::NotFound)?;
         self.verify_file(file_state)
     }
@@ -594,6 +753,7 @@ impl SimDisk {
         }
         self.files.push(SimFile {
             id: file,
+            durable_id: file,
             visible: Vec::new(),
             durable: Vec::new(),
             durable_crc32c: crc32c(&[]),
@@ -603,10 +763,16 @@ impl SimDisk {
             .expect("invariant: file inserted into disk")
     }
 
-    fn visible_bytes(&self) -> u64 {
+    pub fn visible_bytes(&self) -> u64 {
         self.files.iter().fold(0_u64, |total, file| {
             total.saturating_add(u64::try_from(file.visible.len()).unwrap_or(u64::MAX))
         })
+    }
+}
+
+impl Default for SimDisk {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -666,8 +832,10 @@ pub enum NetworkError {
 }
 
 /// Directional unreliable-datagram network model.
+#[derive(Clone)]
 pub struct Network {
     links: BTreeMap<(NodeId, NodeId), LinkState>,
+    peak_inflight_bytes: u64,
 }
 
 impl Network {
@@ -692,7 +860,10 @@ impl Network {
                 }
             }
         }
-        Self { links }
+        Self {
+            links,
+            peak_inflight_bytes: 0,
+        }
     }
 
     pub fn set_blocked(
@@ -757,6 +928,7 @@ impl Network {
         to: NodeId,
         payload: Vec<u8>,
     ) -> Result<Vec<NetworkDecision>, NetworkError> {
+        let total_inflight_before = self.total_inflight_bytes();
         let link = self
             .links
             .get_mut(&(from, to))
@@ -781,6 +953,9 @@ impl Network {
             .expect("invariant: network delay must not overflow virtual time");
         link.inflight += copies;
         link.inflight_bytes = link.inflight_bytes.saturating_add(reserve_bytes);
+        self.peak_inflight_bytes = self
+            .peak_inflight_bytes
+            .max(total_inflight_before.saturating_add(reserve_bytes));
         let mut decisions = vec![NetworkDecision::Delivered(Delivery {
             at: now + delay,
             from,
@@ -823,6 +998,18 @@ impl Network {
             .ok_or(NetworkError::UnknownLink { from, to })?;
         Ok((link.inflight, link.inflight_bytes))
     }
+
+    #[must_use]
+    pub fn total_inflight_bytes(&self) -> u64 {
+        self.links.values().fold(0_u64, |total, link| {
+            total.saturating_add(link.inflight_bytes)
+        })
+    }
+
+    #[must_use]
+    pub const fn peak_inflight_bytes(&self) -> u64 {
+        self.peak_inflight_bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -834,6 +1021,8 @@ pub enum FaultProfile {
     Membership,
     Corruption,
     Wipe,
+    Starve,
+    Ttl,
 }
 
 impl FaultProfile {
@@ -847,6 +1036,8 @@ impl FaultProfile {
             "membership" => Self::Membership,
             "corruption" => Self::Corruption,
             "wipe" => Self::Wipe,
+            "starve" => Self::Starve,
+            "ttl" => Self::Ttl,
             _ => return None,
         })
     }
@@ -861,6 +1052,8 @@ impl FaultProfile {
             Self::Membership => "membership",
             Self::Corruption => "corruption",
             Self::Wipe => "wipe",
+            Self::Starve => "starve",
+            Self::Ttl => "ttl",
         }
     }
 }
@@ -1022,16 +1215,30 @@ pub struct WorkloadSpec {
     pub clients: u64,
     pub ops_per_second: u64,
     pub keyspace: u64,
+    /// Relative expiry attached to generated SETs. A TTL workload uses only
+    /// SET/GET so expiry visibility is isolated from numeric semantics.
+    pub set_ttl: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkloadOperation {
-    Get { key: Vec<u8> },
-    Set { key: Vec<u8>, value: Vec<u8> },
-    Del { key: Vec<u8> },
-    Incr { key: Vec<u8> },
+    Get {
+        key: Vec<u8>,
+    },
+    Set {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    },
+    Del {
+        key: Vec<u8>,
+    },
+    Incr {
+        key: Vec<u8>,
+    },
 }
 
+#[derive(Clone)]
 pub struct WorkloadActor {
     pub client: u64,
     pub next_sequence: u64,
@@ -1054,14 +1261,26 @@ impl WorkloadActor {
     pub fn next_operation(&mut self) -> (u64, WorkloadOperation) {
         let key_number = self.rng.range_u64(0, self.spec.keyspace.max(1));
         let key = format!("key-{key_number}").into_bytes();
-        let operation = match self.rng.range_u64(0, 100) {
-            0..=49 => WorkloadOperation::Get { key },
-            50..=79 => WorkloadOperation::Set {
-                key,
-                value: self.rng.u64().to_le_bytes().to_vec(),
-            },
-            80..=89 => WorkloadOperation::Del { key },
-            _ => WorkloadOperation::Incr { key },
+        let operation = if self.spec.set_ttl.is_some() {
+            match self.rng.range_u64(0, 100) {
+                0..=59 => WorkloadOperation::Get { key },
+                _ => WorkloadOperation::Set {
+                    key,
+                    value: self.rng.u64().to_le_bytes().to_vec(),
+                    ttl: self.spec.set_ttl,
+                },
+            }
+        } else {
+            match self.rng.range_u64(0, 100) {
+                0..=49 => WorkloadOperation::Get { key },
+                50..=79 => WorkloadOperation::Set {
+                    key,
+                    value: self.rng.u64().to_le_bytes().to_vec(),
+                    ttl: None,
+                },
+                80..=89 => WorkloadOperation::Del { key },
+                _ => WorkloadOperation::Incr { key },
+            }
         };
         let sequence = self.next_sequence;
         self.next_sequence += 1;
@@ -1075,6 +1294,7 @@ impl Default for WorkloadSpec {
             clients: 4,
             ops_per_second: 50,
             keyspace: 512,
+            set_ttl: None,
         }
     }
 }
@@ -1087,6 +1307,10 @@ pub struct RunSpec {
     pub plan: FaultPlan,
     pub workload: WorkloadSpec,
     pub end_time: Time,
+    pub host_limits: cc_core::HostLimits,
+    /// Human-facing calibration identity. `None` means universal defaults;
+    /// named profiles are optional and never rewrite those defaults.
+    pub disk_profile: Option<String>,
 }
 
 impl RunSpec {
@@ -1103,6 +1327,8 @@ impl RunSpec {
             plan,
             workload: WorkloadSpec::default(),
             end_time,
+            host_limits: cc_core::HostLimits::default(),
+            disk_profile: None,
         }
     }
 }
@@ -1162,6 +1388,7 @@ pub fn materialize_fault_plan(
                 | FaultProfile::Brutal
                 | FaultProfile::Membership
                 | FaultProfile::Wipe
+                | FaultProfile::Starve
         ) {
             plan.push(FaultAt {
                 at: at_percent(span, 30, &mut rng),
@@ -1219,6 +1446,34 @@ pub fn materialize_fault_plan(
                     write_latency: Duration::from_millis(5),
                 },
             });
+        }
+        if matches!(profile, FaultProfile::Starve) {
+            plan.push(FaultAt {
+                at: at_percent(span, 34, &mut rng),
+                action: FaultAction::SlowDisk {
+                    node: second,
+                    slow: SlowDisk {
+                        read_extra: Duration::from_millis(2),
+                        write_extra: Duration::from_millis(8),
+                        fsync_extra: Duration::from_millis(12),
+                        rename_extra: Duration::from_millis(8),
+                        dirsync_extra: Duration::from_millis(12),
+                    },
+                },
+            });
+            plan.push(FaultAt {
+                at: at_percent(span, 42, &mut rng),
+                action: FaultAction::DiskQuota {
+                    node: second,
+                    bytes: 256 * 1024,
+                },
+            });
+            if seed.0.is_multiple_of(2) {
+                plan.push(FaultAt {
+                    at: at_percent(span, 46, &mut rng),
+                    action: FaultAction::EnospcFrom { node: second },
+                });
+            }
         }
         if matches!(profile, FaultProfile::Corruption) {
             // Install all transport faults before the initial tick. Their
@@ -1547,6 +1802,25 @@ mod tests {
     }
 
     #[test]
+    fn trap_rename_is_not_durable_until_the_directory_is_synced() {
+        let mut disk = SimDisk::new();
+        let staging = FileId::Temp { sequence: 7 };
+        let published = FileId::Snapshot { generation: 4 };
+        disk.write(staging, 0, b"checkpoint").expect("stage write");
+        disk.fsync(staging).expect("stage fsync");
+        disk.rename(staging, published).expect("rename");
+        disk.crash();
+        assert_eq!(disk.durable(staging), Some(b"checkpoint".as_slice()));
+        assert_eq!(disk.durable(published), None);
+
+        disk.rename(staging, published).expect("replay rename");
+        disk.sync_dir().expect("directory sync");
+        disk.crash();
+        assert_eq!(disk.durable(staging), None);
+        assert_eq!(disk.durable(published), Some(b"checkpoint".as_slice()));
+    }
+
+    #[test]
     fn disk_faults_are_one_shot_and_file_local() {
         let mut disk = SimDisk::new();
         let first = cc_env::FileId::Wal { segment: 0 };
@@ -1603,6 +1877,44 @@ mod tests {
     }
 
     #[test]
+    fn calibrated_disk_model_samples_the_current_operation_only() {
+        let mut read_buckets = [Duration::from_nanos(0); 16];
+        read_buckets[..2].copy_from_slice(&[Duration::from_nanos(7), Duration::from_nanos(11)]);
+        let model = DiskModel {
+            read: DelayDist::Empirical {
+                buckets: read_buckets,
+                count: 2,
+            },
+            write: DelayDist::Fixed(Duration::from_nanos(13)),
+            fsync: DelayDist::Fixed(Duration::from_nanos(17)),
+            rename: DelayDist::Fixed(Duration::from_nanos(19)),
+            dirsync: DelayDist::Fixed(Duration::from_nanos(23)),
+        };
+        let mut first = SimDisk::with_model(model, Seed::new(9), NodeId::new(1));
+        let mut second = SimDisk::with_model(model, Seed::new(9), NodeId::new(1));
+        let observed = [
+            first.service_time(DiskOperation::Read),
+            first.service_time(DiskOperation::Write),
+            first.service_time(DiskOperation::Fsync),
+            first.service_time(DiskOperation::Rename),
+            first.service_time(DiskOperation::SyncDir),
+        ];
+        let repeated = [
+            second.service_time(DiskOperation::Read),
+            second.service_time(DiskOperation::Write),
+            second.service_time(DiskOperation::Fsync),
+            second.service_time(DiskOperation::Rename),
+            second.service_time(DiskOperation::SyncDir),
+        ];
+        assert_eq!(observed, repeated, "named profiles remain replayable");
+        assert!(matches!(observed[0].as_nanos(), 7 | 11));
+        assert_eq!(observed[1], Duration::from_nanos(13));
+        assert_eq!(observed[2], Duration::from_nanos(17));
+        assert_eq!(observed[3], Duration::from_nanos(19));
+        assert_eq!(observed[4], Duration::from_nanos(23));
+    }
+
+    #[test]
     fn disk_quota_and_enospc_reject_growth_without_corrupting_existing_bytes() {
         let mut disk = SimDisk::new();
         let file = cc_env::FileId::Wal { segment: 0 };
@@ -1615,6 +1927,64 @@ mod tests {
         disk.set_enospc(true);
         assert_eq!(disk.write(file, 0, b"x"), Err(IoError::Enospc));
         assert_eq!(disk.durable(file), Some(b"aZc".as_slice()));
+    }
+
+    #[test]
+    fn trap_data_directory_quota_counts_live_temp_and_staging_bytes() {
+        let mut disk = SimDisk::new();
+        disk.set_quota(Some(8));
+        let live = cc_env::FileId::Wal { segment: 0 };
+        let temp = cc_env::FileId::Temp { sequence: 1 };
+        disk.write(live, 0, b"live").expect("live bytes");
+        disk.write(temp, 0, b"temp").expect("temporary bytes");
+        assert_eq!(disk.visible_bytes(), 8);
+        assert_eq!(disk.write(temp, 4, b"x"), Err(IoError::Enospc));
+        disk.delete(temp).expect("delete temp");
+        assert_eq!(disk.visible_bytes(), 4);
+        disk.write(live, 4, b"room").expect("released quota");
+    }
+
+    #[test]
+    fn trap_disk_quota_counts_snapshot_staging() {
+        let mut disk = SimDisk::new();
+        disk.set_quota(Some(6));
+        let staging = cc_env::FileId::Temp { sequence: 44 };
+        disk.write(staging, 0, b"chunk1")
+            .expect("first staged chunk");
+        assert_eq!(disk.write(staging, 6, b"2"), Err(IoError::Enospc));
+        assert_eq!(disk.visible(staging), Some(b"chunk1".as_slice()));
+    }
+
+    #[test]
+    fn trap_snapshot_install_is_atomic_across_crash() {
+        let staging = cc_env::FileId::Temp { sequence: 8 };
+        let published = cc_env::FileId::Snapshot { generation: 4 };
+
+        let mut before_publish = SimDisk::new();
+        before_publish
+            .write(staging, 0, b"new-checkpoint")
+            .expect("stage");
+        before_publish.fsync(staging).expect("stage fsync");
+        before_publish.crash();
+        assert_eq!(before_publish.durable(published), None);
+        assert_eq!(
+            before_publish.durable(staging),
+            Some(b"new-checkpoint".as_slice())
+        );
+
+        let mut after_publish = SimDisk::new();
+        after_publish
+            .write(staging, 0, b"new-checkpoint")
+            .expect("stage");
+        after_publish.fsync(staging).expect("stage fsync");
+        after_publish.rename(staging, published).expect("rename");
+        after_publish.sync_dir().expect("directory fsync");
+        after_publish.crash();
+        assert_eq!(
+            after_publish.durable(published),
+            Some(b"new-checkpoint".as_slice())
+        );
+        assert_eq!(after_publish.durable(staging), None);
     }
 
     #[test]
