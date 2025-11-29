@@ -1,4 +1,16 @@
 id	status	requirement	test
+C0.1	implemented	Current CCBK v1 node-clone archives import only through the explicit fresh-identity path	trap_legacy_backup_import_never_reuses_node_identity
+C0.2	implemented	Current CCST and CCMT readers preserve canonical fixture bytes	golden_byte_layout_vectors
+C0.3	implemented	A 2c733f3 node-clone CCBK archive is refused without target mutation	trap_legacy_backup_is_explicitly_refused
+C0.4	implemented	A 2c733f3 CCTR trace remains readable by the current decoder	trap_trace_reads_legacy_cctr_fixture
+C0.5	implemented	A 2c733f3 CC-HISTORY v1 receipt remains readable by the current decoder	trap_history_reads_legacy_v1_fixture
+C0.6	implemented	A 2c733f3 CCWL segment remains recoverable by the current WAL reader	trap_legacy_wal_fixture_is_recoverable
+C0.7	implemented	A 2c733f3 CCST table remains readable by the current store reader	trap_legacy_sst_fixture_is_readable
+C0.8	implemented	Current logical CCBK v2 bytes use the production checkpoint-envelope codec	golden_ccbk_v2
+C0.8	implemented	A 2c733f3 CCMT metadata record still boots the current store reader	trap_legacy_meta_fixture_boots_store
+C0.9	implemented	A 2c733f3 CCKV command remains readable by the current command decoder	trap_legacy_command_fixture_is_readable
+C0.10	implemented	A 2c733f3 CCPF frame remains readable by the current frame decoder	trap_legacy_peer_frame_fixture_is_readable
+C0.11	implemented	A raised CCID reader floor is refused before opening other node state	trap_ccid_refuses_future_reader_before_opening_state
 N0.2.1	implemented	Imported ambient clocks are rejected in deterministic crates	trap_imported_clock_is_detected
 N0.3.1	implemented	Unknown vote responses never form quorum	trap_unknown_vote_response_cannot_form_quorum
 N0.3.2	implemented	Learner responses never commit an entry	trap_learner_append_response_cannot_commit
@@ -74,8 +86,8 @@ N1.5.4	implemented	Shared driver releases a delayed outcome exactly once	trap_dr
 N1.5.5	implemented	Critical host write failure carries I/O and file identity	trap_driver_failed_critical_write_is_a_durability_error
 N1.6.1	implemented	Strict config rejects missing defaults and duplicate identity	trap_strict_config_rejects_defaults_and_duplicate_identity
 N1.6.2	implemented	Cluster IDs have one nonzero lowercase hexadecimal representation	trap_cluster_id_has_one_nonzero_canonical_text_form
-N1.6.3	implemented	CCID rejects mismatched node and cluster identity	trap_ccid_rejects_mismatched_node_or_cluster_identity
-N1.6.4	implemented	CCID rejects corruption and removed-directory reuse	trap_ccid_is_exact_checksum_fenced_and_removed_is_terminal
+N1.6.3	implemented	Join rejects mismatched node or foreign cluster identity	trap_join_rejects_foreign_cluster_data
+N1.6.4	implemented	CCID rejects corruption and removed-directory reuse before listen	trap_removed_membership_forces_terminal_ccid_before_listen
 N1.6.5	implemented	CCID refuses a symlinked data directory before opening state	trap_ccid_refuses_a_symlinked_data_directory_before_opening_state
 N1.6.6	implemented	Pre-N1 command journals are refused without mutation	trap_pre_upgrade_data_dir_is_refused_before_writes
 N1.6.7	implemented	CC.REQUEST only admits one state-changing command	trap_cc_request_rejects_reads_and_multikey_commands
@@ -125,18 +137,28 @@ N2.3.3	implemented	Truncated CCPF frames never reach the Raft decoder	trap_trunc
 N2.3.4	implemented	Rechecksummed malformed CCRP never reaches the state machine	trap_rechecksummed_malformed_ccrp_never_reaches_state_machine
 N2.3.5	implemented	Heal clears sustained frame faults and replay bytes	trap_heal_clears_sustained_link_fault_without_leaking_bytes
 N2.3.6	implemented	Replayed Append frames are idempotent	trap_replayed_append_is_idempotent
-N3.1.1	planned	Store watermark publication is atomic	trap_store_watermark_is_atomic_with_write_batch
-N3.2.1	planned	SST v2 has golden vectors	golden_sst_v2_vectors
+N3.1.1	implemented	Store watermark publication is atomic	trap_store_watermark_is_atomic_with_write_batch
+N3.2.1	implemented	SST v2 has golden vectors	golden_sst_v2_vectors
+N3.2.2	implemented	SST v2 validates block/index/bloom boundaries	trap_block_index_seek_matches_linear_scan
+N3.2.3	implemented	SST v2 rejects noncanonical internal keys	trap_out_of_order_internal_keys_are_rejected
+N3.2.4	implemented	SST v2 keeps an oversized valid entry in one bounded block	trap_oversized_entry_gets_its_own_bounded_block
+N3.2.5	implemented	SST v2 can reject a missing key at its bloom boundary	trap_bloom_negative_avoids_data_read
+N3.3.1	implemented	A synchronous block read charges only the requesting operation	trap_sync_read_delays_its_own_reply
+N3.3.2	implemented	A short block read fails closed	trap_short_block_read_fails_closed
+N3.4.1	implemented	CCMF edits replay atomically and CCMT names their checked generation	manifest_v2_round_trips_atomic_edits_and_meta_pointer
+N3.4.2	implemented	Only a torn final CCMF record is ignored during prefix recovery	trap_manifest_torn_tail_replays_only_complete_edit_prefix
+N3.4.3	implemented	Manifest generation compaction writes one complete next snapshot	trap_manifest_compaction_rewrites_a_complete_next_generation
 N4.1.1	implemented	Host limits reject zero admission caps	trap_host_limits_reject_zero_admission_caps
 N4.1.2	implemented	Driver class queues are bounded and deliver I/O before clients	trap_every_host_queue_has_a_limit
 N4.1.3	implemented	Driver input bytes are reserved before queue admission	trap_driver_queue_byte_limit_is_charged_before_admission
-N4.2.1	planned	Streamed snapshot lifecycle is bounded and resumable	trap_streamed_snapshot_lifecycle_is_bounded
+N4.2.1	implemented	Stop-and-wait streamed snapshot lifecycle is bounded, durably marked, and safely restarts/retries	trap_streamed_snapshot_lifecycle_is_bounded
 N4.3.1	implemented	Driver footprint exposes deterministic current, peak, and limit queue-byte charges	trap_footprint_counts_encoded_queue_bytes
 N4.5.1	implemented	Slow disk delays durability completion before dependent traffic	trap_slow_disk_preserves_election_safety
 N4.5.2	implemented	A crash drops delayed durability continuations	trap_crash_discards_a_delayed_durability_continuation
 N4.5.3	implemented	ENOSPC suppresses a dependent vote reply and enters StorageFault	trap_enospc_fails_closed_before_a_vote_reply
 N4.5.4	implemented	At-rest bit rot is detected during recovery and never served	trap_bitrot_is_detected_not_served
 N4.5.5	implemented	Persistent disk-fault trace specifications preserve their selected fields	persistent_disk_fault_specs_round_trip_all_selected_fields
+N4.6.1	implemented	CCBK v2 restore creates a fresh cluster and node identity	trap_restore_creates_fresh_cluster_identity
 N5.1.1	implemented	Checker emits a deterministic minimal witness	trap_minimal_witness_is_deterministic
 N5.1.2	implemented	An exhausted witness budget never returns a passing subset	trap_witness_budget_never_returns_a_passing_subset
 N5.2.1	implemented	Anomaly classifier uses only certain real-time order	trap_anomaly_classifier_uses_only_certain_real_time_order
@@ -145,14 +167,22 @@ N5.5.1	implemented	Trace reads current binary and JSON export forms	trap_trace_r
 N6.1.1	implemented	Seed ledger records campaign outcomes	trap_seed_ledger_is_append_only
 N6.1.2	implemented	Campaign resume skips only prior successful ledger rows	trap_ledger_resume_only_skips_prior_ok_rows
 N6.2.1	implemented	Shards partition seeds exactly once and validate bounds	trap_shards_partition_each_seed_once_and_validate_bounds
-N7.1.1	planned	Compatibility matrix is enforced	trap_compatibility_matrix_is_enforced
-N8.1.1	planned	Real membership operations use replicated config	trap_real_membership_operations_are_replicated
+N7.1.1	implemented	Compatibility matrix is enforced	trap_compatibility_matrix_is_enforced
+N7.1.2	implemented	Current CCSN golden is decoded by its owning reader	trap_snapshot_ordering
+N7.1.3	implemented	Current SST data-block golden is checksum protected	trap_block_crc_detects_bit_flip
+N7.1.4	implemented	Current RESP golden is parsed without inline fallback	trap_inline_commands_are_rejected
+N7.1.5	implemented	Current store-WAL golden replays after its manifest watermark	trap_store_wal_replays_only_after_manifest_watermark
+N8.1.1	implemented	Real membership operations use replicated config	trap_real_host_effects_match_replay
+N8.1.2	implemented	Learner add and promotion are replicated config transitions	trap_learner_add_and_promotion_are_replicated_config_transitions
 N8.2.1	implemented	Non-loopback listeners require an explicit unsafe opt-in	trap_non_loopback_bind_requires_the_flag
 N8.2.2	implemented	Unsafe listener warning includes the actual bound address	trap_unsafe_warning_names_actual_listener
 N9.1.1	implemented	Every rendered theater control has a contract row and functional controls change observable state	every_control_changes_observable_state
 N9.1.2	implemented	Theater packet loss maps to an effective LinkDegrade P16 value	trap_packet_loss_uses_the_effective_link_p16_value
 N9.1.3	implemented	Theater disk latency maps to effective persistent SlowDisk service time	trap_slow_disk_reports_the_effective_persistent_delay
 N9.2.1	implemented	Timeline markers use stable trace-sequence keys and emit no duplicate-key console error	timeline markers render without duplicate React keys
-N10.1.1	planned	Batch applies atomically or not at all	trap_batch_applies_atomically_or_not_at_all
-N10.2.1	planned	Follower read waits for ReadIndex	trap_follower_read_waits_for_readindex
-N11.1.1	planned	Documentation inventory is coherent	doc_coherence
+N10.1.1	implemented	Batch applies atomically or not at all	trap_batch_applies_atomically_or_not_at_all
+N10.1.2	implemented	Batch command encoding has a fixed v3 vector	golden_cckv_batch_v3
+N10.1.3	implemented	Batch reply encoding uses the v3 envelope	golden_cckr_batch_reply_v3
+N10.1.4	implemented	Batch admission respects immutable policy caps	trap_batch_respects_size_caps_before_proposal
+N10.2.1	implemented	Follower read waits for ReadIndex	trap_follower_read_waits_for_readindex
+N11.1.1	implemented	Documentation inventory is coherent	doc_coherence

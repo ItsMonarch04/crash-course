@@ -1,1 +1,2 @@
 schema	generator_build	config_hashes	source_ledger_hashes	covered_seed_ranges	verdict_counts	generated_at
+cc-summary-v1	workspace-ng6	806bbeb0cb9e43f8	/tmp/cc-ng6-million.C1iQjK/merged.tsv:a58d6f1b854636c1	ng6-million:806bbeb0cb9e43f8:rough:0x0000000000000000..0x00000000000f4240	ok:1000000	1786470969061

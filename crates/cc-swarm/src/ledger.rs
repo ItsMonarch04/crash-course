@@ -131,6 +131,7 @@ pub enum LedgerError {
     Header,
     Line { line: usize, reason: &'static str },
     Conflict { key: LedgerKey },
+    Coverage(String),
 }
 
 impl fmt::Display for LedgerError {
@@ -146,8 +147,91 @@ impl fmt::Display for LedgerError {
                 key.profile.as_str(),
                 key.seed
             ),
+            Self::Coverage(reason) => write!(f, "campaign ledger coverage: {reason}"),
         }
     }
+}
+
+/// Validate an explicit sharded coverage claim. Coverage is proved against
+/// the requested half-open range; it is never inferred from the rows that
+/// happened to arrive.
+pub fn validate_sharded_coverage(
+    ledgers: &[SeedLedger],
+    start: u64,
+    end: u64,
+    shard_count: u64,
+    expected_build: &str,
+    expected_config: u64,
+) -> Result<(), LedgerError> {
+    if start > end {
+        return Err(LedgerError::Coverage(String::from(
+            "range start exceeds end",
+        )));
+    }
+    if shard_count == 0 || ledgers.len() != usize::try_from(shard_count).unwrap_or(usize::MAX) {
+        return Err(LedgerError::Coverage(format!(
+            "expected {shard_count} shard ledgers, received {}",
+            ledgers.len()
+        )));
+    }
+    let mut residue_owners = BTreeMap::<u64, usize>::new();
+    let mut covered = BTreeMap::<u64, usize>::new();
+    for (source, ledger) in ledgers.iter().enumerate() {
+        let mut source_residue = None;
+        for row in ledger.rows() {
+            if row.key.build_label != expected_build {
+                return Err(LedgerError::Coverage(format!(
+                    "wrong build {} for seed 0x{:016x}",
+                    row.key.build_label, row.key.seed
+                )));
+            }
+            if row.key.config_hash != expected_config {
+                return Err(LedgerError::Coverage(format!(
+                    "wrong config {:016x} for seed 0x{:016x}",
+                    row.key.config_hash, row.key.seed
+                )));
+            }
+            if row.key.seed < start || row.key.seed >= end {
+                return Err(LedgerError::Coverage(format!(
+                    "seed 0x{:016x} is outside {start}..{end}",
+                    row.key.seed
+                )));
+            }
+            let residue = row.key.seed % shard_count;
+            match source_residue {
+                Some(prior) if prior != residue => {
+                    return Err(LedgerError::Coverage(format!(
+                        "source {} contains multiple shard residues",
+                        source + 1
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    source_residue = Some(residue);
+                    if residue_owners.insert(residue, source).is_some() {
+                        return Err(LedgerError::Coverage(format!(
+                            "shard residue {residue} appears in multiple sources"
+                        )));
+                    }
+                }
+            }
+            *covered.entry(row.key.seed).or_default() += 1;
+        }
+    }
+    for seed in start..end {
+        match covered.get(&seed).copied().unwrap_or(0) {
+            1 => {}
+            0 => {
+                return Err(LedgerError::Coverage(format!("missing seed 0x{seed:016x}")));
+            }
+            count => {
+                return Err(LedgerError::Coverage(format!(
+                    "seed 0x{seed:016x} covered {count} times"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl std::error::Error for LedgerError {}
@@ -227,7 +311,7 @@ impl SeedLedger {
         result.push_str(LEDGER_COLUMNS);
         result.push('\n');
         for row in self.rows() {
-            result.push_str(&encode_row(row));
+            result.push_str(&encode_ledger_row(row));
             result.push('\n');
         }
         result
@@ -296,7 +380,8 @@ fn parse_decimal(value: &str) -> Option<u64> {
         .flatten()
 }
 
-fn encode_row(row: &LedgerRow) -> String {
+#[must_use]
+pub fn encode_ledger_row(row: &LedgerRow) -> String {
     format!(
         "{}\t{:016x}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\t{}",
         row.key.build_label,
@@ -333,22 +418,31 @@ mod tests {
     }
 
     #[test]
-    fn trap_seed_ledger_is_append_only() {
+    fn trap_ledger_dedupes_identical_rows() {
         let mut ledger = SeedLedger::default();
         assert!(ledger.insert(row(1)).expect("first row"));
         assert!(!ledger.insert(row(1)).expect("identical retry"));
+        assert_eq!(ledger.rows().count(), 1);
+    }
+
+    #[test]
+    fn trap_ledger_conflict_never_selects_verdict() {
+        let mut ledger = SeedLedger::default();
+        assert!(ledger.insert(row(1)).expect("first row"));
         let mut conflict = row(1);
-        conflict.events = 13;
+        conflict.verdict = LedgerVerdict::Invariant;
         assert!(matches!(
             ledger.insert(conflict),
             Err(LedgerError::Conflict { .. })
         ));
-        let encoded = ledger.encode();
-        assert_eq!(SeedLedger::parse(&encoded), Ok(ledger));
+        assert_eq!(
+            ledger.rows().next().expect("retained row").verdict,
+            LedgerVerdict::Ok
+        );
     }
 
     #[test]
-    fn trap_ledger_resume_only_skips_prior_ok_rows() {
+    fn trap_resume_skips_only_prior_ok_by_default() {
         let mut ledger = SeedLedger::default();
         let ok = row(1);
         let key = ok.key.clone();
@@ -362,13 +456,19 @@ mod tests {
     }
 
     #[test]
-    fn trap_ledger_only_discards_an_incomplete_final_line() {
+    fn trap_partial_final_line_is_discarded() {
         let mut ledger = SeedLedger::default();
         ledger.insert(row(1)).expect("first row");
         let mut torn = ledger.encode();
         torn.push_str("build-a\t0000000000000007");
         assert_eq!(SeedLedger::parse(&torn), Ok(ledger.clone()));
-        let corrupt = format!("{}bad\n", ledger.encode());
+    }
+
+    #[test]
+    fn trap_malformed_interior_ledger_row_fails() {
+        let mut ledger = SeedLedger::default();
+        ledger.insert(row(1)).expect("first row");
+        let corrupt = format!("{}bad\ntrailing-partial", ledger.encode());
         assert!(matches!(
             SeedLedger::parse(&corrupt),
             Err(LedgerError::Line { line: 4, .. })
@@ -376,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn trap_shards_partition_each_seed_once_and_validate_bounds() {
+    fn trap_shards_partition_seed_range_exactly() {
         let shards = (0..4)
             .map(|index| Shard::new(index, 4).expect("valid shard"))
             .collect::<Vec<_>>();
@@ -392,5 +492,34 @@ mod tests {
             Shard::new(4, 4),
             Err(ShardError::IndexOutsideTotal { index: 4, total: 4 })
         );
+    }
+
+    #[test]
+    fn trap_wall_time_difference_cannot_create_seed_conflict() {
+        let mut ledger = SeedLedger::default();
+        let first = row(7);
+        let later_on_another_machine = first.clone();
+        assert!(ledger.insert(first).expect("first observation"));
+        assert!(
+            !ledger
+                .insert(later_on_another_machine)
+                .expect("ledger row contains no wall-time or machine field")
+        );
+    }
+
+    #[test]
+    fn trap_merge_rejects_missing_shard() {
+        let mut ledgers = (0..4).map(|_| SeedLedger::default()).collect::<Vec<_>>();
+        for seed in 0..32_u64 {
+            ledgers[usize::try_from(seed % 4).expect("residue")]
+                .insert(row(seed))
+                .expect("shard row");
+        }
+        assert!(validate_sharded_coverage(&ledgers, 0, 32, 4, "build-a", 7).is_ok());
+        ledgers.remove(2);
+        assert!(matches!(
+            validate_sharded_coverage(&ledgers, 0, 32, 4, "build-a", 7),
+            Err(LedgerError::Coverage(_))
+        ));
     }
 }
