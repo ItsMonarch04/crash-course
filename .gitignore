@@ -9,5 +9,6 @@ theater/public/wasm/
 /campaigns/ledger.tsv
 /campaigns/kata-ledger.tsv
 /campaigns/receipts/
+/fuzz-artifacts/
 /ccdb-data/
 bench/results/*.json
