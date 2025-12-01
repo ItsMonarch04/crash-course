@@ -1,0 +1,3 @@
+reader_test=trap_trace_reads_current_binary_and_json_exports
+format=CCTR
+semantic=one deterministic ClientInvoke trace event

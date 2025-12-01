@@ -1,0 +1,3 @@
+reader_test=trap_input_journal_is_prefix_durable
+format=CCIJ
+semantic=header-only interrupted journal prefix

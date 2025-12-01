@@ -1,0 +1,3 @@
+reader_test=trap_store_wal_replays_only_after_manifest_watermark
+format=CCSW
+semantic=one atomic store apply for c0-key

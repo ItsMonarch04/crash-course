@@ -1,0 +1,3 @@
+reader_test=trap_block_crc_detects_bit_flip
+format=CCST-DATA
+semantic=first checksummed SST v2 data block

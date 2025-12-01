@@ -1,0 +1,3 @@
+reader_test=trap_log_recovery_is_idempotent
+format=CCLR
+semantic=truncate suffix beginning at index 1

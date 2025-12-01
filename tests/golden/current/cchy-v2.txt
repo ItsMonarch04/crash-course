@@ -1,0 +1,3 @@
+reader_test=trap_history_v2_round_trips_binary_keys_and_values
+format=CCHY
+semantic=one completed SET c0-key=c0-value operation

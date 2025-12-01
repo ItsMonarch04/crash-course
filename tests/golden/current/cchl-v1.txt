@@ -1,0 +1,3 @@
+reader_test=golden_cchl_vectors
+format=CCHL
+semantic=node 1 protocol-v2 hello for policy-default cluster

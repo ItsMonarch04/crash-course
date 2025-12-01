@@ -1,0 +1,3 @@
+reader_test=trap_equal_watermark_snapshot_pins_are_reference_counted
+format=CCST
+semantic=one Put c0-key=c0-value at sequence 1

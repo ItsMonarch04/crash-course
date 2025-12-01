@@ -1,0 +1,3 @@
+reader_test=golden_sst_v2_vectors
+format=CCST
+semantic=one block-structured v2 table containing c0-key

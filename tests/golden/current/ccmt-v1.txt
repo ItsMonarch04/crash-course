@@ -1,0 +1,3 @@
+reader_test=golden_byte_layout_vectors
+format=CCMT
+semantic=default store metadata record

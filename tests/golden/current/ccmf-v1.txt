@@ -1,0 +1,3 @@
+reader_test=manifest_v2_round_trips_atomic_edits_and_meta_pointer
+format=CCMF
+semantic=manifest generation 1 with watermark index 1

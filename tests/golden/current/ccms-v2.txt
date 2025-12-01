@@ -1,0 +1,3 @@
+reader_test=trap_membership_recovers_from_log_and_snapshot
+format=CCMS
+semantic=stable one-voter membership containing node 1

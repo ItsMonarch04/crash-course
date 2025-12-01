@@ -1,0 +1,3 @@
+reader_test=golden_ccrp_vectors
+format=CCRP
+semantic=node 1 to node 2 PreVoteReq at term 1

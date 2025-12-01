@@ -1,0 +1,3 @@
+reader_test=trap_journal_record_pairs_input_and_effects
+format=CCEO
+semantic=one ClientOk trace effect

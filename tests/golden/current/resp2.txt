@@ -1,0 +1,3 @@
+reader_test=trap_inline_commands_are_rejected
+format=RESP
+semantic=RESP2 array containing PING

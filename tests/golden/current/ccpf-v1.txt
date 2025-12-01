@@ -1,0 +1,3 @@
+reader_test=trap_corrupt_frame_never_reaches_raft_decoder
+format=CCPF
+semantic=one checksum-protected CCRP PreVoteReq frame
