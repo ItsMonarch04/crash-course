@@ -1,0 +1,3 @@
+reader_test=trap_legacy_sst_fixture_is_readable
+format=CCST
+semantic=one Put legacy-c0-key=legacy-c0-value at sequence 1

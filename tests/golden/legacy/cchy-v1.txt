@@ -1,0 +1,3 @@
+reader_test=trap_history_reads_legacy_v1_fixture
+format=CCHY
+semantic=legacy CC-HISTORY v1 text receipt emitted by 2c733f3

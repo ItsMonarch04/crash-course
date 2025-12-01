@@ -1,0 +1,3 @@
+reader_test=trap_legacy_wal_fixture_is_recoverable
+format=CCWL
+semantic=one committed legacy data WAL record legacy-c0-wal

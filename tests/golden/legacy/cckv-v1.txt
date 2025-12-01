@@ -1,0 +1,3 @@
+reader_test=trap_legacy_command_fixture_is_readable
+format=CCKV
+semantic=SET legacy-c0-key legacy-c0-value without TTL

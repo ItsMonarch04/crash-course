@@ -1,0 +1,3 @@
+reader_test=trap_trace_reads_legacy_cctr_fixture
+format=CCTR
+semantic=legacy deterministic trace emitted by 2c733f3

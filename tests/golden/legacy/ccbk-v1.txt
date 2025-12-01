@@ -1,0 +1,3 @@
+reader_test=trap_legacy_backup_is_explicitly_refused
+format=CCBK
+semantic=legacy node-clone archive is refused without target mutation

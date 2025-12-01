@@ -1,0 +1,3 @@
+reader_test=trap_legacy_meta_fixture_boots_store
+format=CCMT
+semantic=default legacy store metadata record
