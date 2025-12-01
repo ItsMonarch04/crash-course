@@ -1,0 +1,9 @@
+producer_commit=2154f1688231ecfc4de7a50a7899a90c327f844b
+producer_version=0.11.14
+cargo_lock_sha256=32dfedd5e0f12e0b289618460933e2a3b2ac65c44f740377648f385374e54bf5
+rustc=rustc 1.91.1 (ed61e7d7e 2025-11-07)
+target=aarch64-apple-darwin
+build_command=cargo build --offline --locked --release -p cc-node
+ccdb_binary_sha256=de59f9e07796d59256ae348208a56d8aced45f5b96af4489e449a5cadb5d3752
+ccdb_version_stdout=tests/golden/compat-base/ccdb-version.txt
+ccdb_version_stdout_sha256=850edfbcd15c16175bcbc7c7a2bcb44d264695280442b573614962c07060a88f

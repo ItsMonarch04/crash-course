@@ -106,6 +106,14 @@ while IFS= read -r documented_format; do
     echo "documented format has no golden manifest row: $documented_format" >&2
     exit 1
   fi
-done < <(sed -n 's/| `\([A-Z][A-Z0-9-]*\)` | [0-9][0-9]* |.*/\1/p' "$repo_root/docs/formats.md")
+done < <(
+  awk -F '|' '
+    $3 ~ /^ `[A-Z][A-Z0-9-]*` $/ && $4 ~ /^ [1-9][0-9]* $/ {
+      value = $3
+      gsub(/^ `|` $/, "", value)
+      print value
+    }
+  ' "$repo_root/docs/formats.md"
+)
 
 echo "golden manifest: PASS rows=$row_count"
