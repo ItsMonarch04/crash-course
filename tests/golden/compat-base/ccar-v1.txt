@@ -1,0 +1,3 @@
+reader_test=golden_cccf_v1_and_ccar_v1
+format=CCAR
+semantic=Applied admin reply at source index 1

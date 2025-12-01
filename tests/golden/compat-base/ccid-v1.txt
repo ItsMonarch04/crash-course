@@ -1,0 +1,3 @@
+reader_test=trap_removed_membership_forces_terminal_ccid_before_listen
+format=CCID
+semantic=active node 1 identity for the fixed C0 cluster id

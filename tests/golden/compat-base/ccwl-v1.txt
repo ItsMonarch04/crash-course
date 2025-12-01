@@ -1,0 +1,3 @@
+reader_test=trap_log_torn_tail_is_prefix_safe
+format=CCWL
+semantic=one committed data WAL record c0-wal

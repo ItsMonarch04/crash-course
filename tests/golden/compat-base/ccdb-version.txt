@@ -1,0 +1,12 @@
+ccdb 0.11.14
+
+Commands:
+  init --cluster NAME --cluster-id HEX32 --nodes N [--base-dir DIR]
+  init --cluster NAME --cluster-id HEX32 --node-id ID --data-dir DIR
+  run --config PATH [--record PATH] [--record-max-bytes N] [--record-required] [--run-for-ms N] [--i-know-this-is-unauthenticated]
+  peer --config PATH --addr ADDR [--retries N]
+  admin --addr ADDR status|members|snapshot
+  admin backup --data-dir DIR --output FILE
+  admin restore --input FILE --data-dir DIR
+  selfcheck --data-dir DIR [--deep]
+  doctor [--data-dir DIR] [--client-addr ADDR] [--peer-addr ADDR]

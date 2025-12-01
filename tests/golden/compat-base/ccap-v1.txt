@@ -1,0 +1,3 @@
+reader_test=trap_plain_route_ids_never_enter_raft_payload
+format=CCAP
+semantic=sessionless application SET envelope at leader time 7

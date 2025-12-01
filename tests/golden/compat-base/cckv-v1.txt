@@ -1,0 +1,3 @@
+reader_test=trap_conditional_set_is_one_replicated_apply
+format=CCKV
+semantic=SET c0-key c0-value without TTL

@@ -1,0 +1,3 @@
+reader_test=golden_cckr_v1_round_trips_and_rejects_corruption
+format=CCKR
+semantic=Value(c0-value) reply

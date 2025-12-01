@@ -1,0 +1,3 @@
+reader_test=trap_legacy_backup_import_never_reuses_node_identity
+format=CCBK
+semantic=compatibility-cut node-clone archive retained for the explicit v1 importer
