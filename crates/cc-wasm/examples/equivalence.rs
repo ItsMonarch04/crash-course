@@ -21,10 +21,10 @@ fn main() {
         }
     }
     let spec = format!("{{\"seed\":\"{seed}\",\"profile\":\"{profile}\"}}");
-    let mut handle = cc_wasm::init(&spec);
+    let mut handle = cc_wasm::init(&spec).expect("equivalence spec is valid");
     let mut state = cc_wasm::state(&handle);
     for _ in 0..120 {
-        state = cc_wasm::step(&mut handle, 500_000_000);
+        state = cc_wasm::step(&mut handle, 500_000_000).expect("equivalence step succeeds");
     }
     print!("{state}");
 }

@@ -57,7 +57,7 @@ if (version && existsSync(path.join(root, "theater/package.json"))) {
 // returning visitors are pinned to a stale `index.html`.
 if (version && existsSync(path.join(root, "theater/public/sw.js"))) {
   const cache = read("theater/public/sw.js").match(
-    new RegExp(`const CACHE = "crash-course-theater-v${semver}"`),
+    new RegExp(`const CACHE = "crash-course-theater-v${semver}-abi2"`),
   )?.[1];
   if (cache !== version) {
     errors.push(`theater/public/sw.js cache ${cache ?? "missing"} != ${version}`);
