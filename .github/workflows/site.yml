@@ -39,6 +39,7 @@ jobs:
       - run: rustup target add wasm32-unknown-unknown
       - run: CARGO_HTTP_MULTIPLEXING=false cargo install wasm-bindgen-cli --version 0.2.105 --locked
       - run: ./scripts/build-wasm.sh
+      - run: git diff --exit-code -- theater/src/wasm/cc_wasm.js theater/src/wasm/cc_wasm.d.ts
       - run: ./scripts/ci/wasm-equivalence.sh
       - run: npm run build
         working-directory: theater

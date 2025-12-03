@@ -35,6 +35,28 @@ function _assertClass(instance, klass) {
         throw new Error(`expected instance of ${klass.name}`);
     }
 }
+
+function takeFromExternrefTable0(idx) {
+    const value = wasm.__wbindgen_externrefs.get(idx);
+    wasm.__externref_table_dealloc(idx);
+    return value;
+}
+/**
+ * Retain one complete in-memory simulator image.  `SimCluster: Clone`
+ * deliberately includes scheduler/RNG/network/disk/driver volatile state;
+ * this is not a replay-from-zero token disguised as a checkpoint.
+ * @param {SimHandle} handle
+ * @returns {bigint}
+ */
+export function checkpoint(handle) {
+    _assertClass(handle, SimHandle);
+    const ret = wasm.checkpoint(handle.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return BigInt.asUintN(64, ret[0]);
+}
+
 /**
  * @param {SimHandle} handle
  * @returns {string}
@@ -54,17 +76,59 @@ export function state(handle) {
 }
 
 /**
+ * @param {SimHandle} handle
+ * @returns {string}
+ */
+export function trace_hash(handle) {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        _assertClass(handle, SimHandle);
+        const ret = wasm.trace_hash(handle.__wbg_ptr);
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Advance one persistent simulator by a virtual-time budget.
  * @param {SimHandle} handle
  * @param {bigint} virtual_ns
  * @returns {string}
  */
 export function step(handle, virtual_ns) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        _assertClass(handle, SimHandle);
+        const ret = wasm.step(handle.__wbg_ptr, virtual_ns);
+        var ptr1 = ret[0];
+        var len1 = ret[1];
+        if (ret[3]) {
+            ptr1 = 0; len1 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred2_0 = ptr1;
+        deferred2_1 = len1;
+        return getStringFromWasm0(ptr1, len1);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * @param {SimHandle} handle
+ * @returns {string}
+ */
+export function history_verdict(handle) {
     let deferred1_0;
     let deferred1_1;
     try {
         _assertClass(handle, SimHandle);
-        const ret = wasm.step(handle.__wbg_ptr, virtual_ns);
+        const ret = wasm.history_verdict(handle.__wbg_ptr);
         deferred1_0 = ret[0];
         deferred1_1 = ret[1];
         return getStringFromWasm0(ret[0], ret[1]);
@@ -134,24 +198,34 @@ export function init(spec_json) {
     const ptr0 = passStringToWasm0(spec_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.init(ptr0, len0);
-    return SimHandle.__wrap(ret);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return SimHandle.__wrap(ret[0]);
 }
 
 /**
  * @param {SimHandle} handle
+ * @param {bigint} checkpoint_id
  * @returns {string}
  */
-export function history_verdict(handle) {
-    let deferred1_0;
-    let deferred1_1;
+export function restore(handle, checkpoint_id) {
+    let deferred2_0;
+    let deferred2_1;
     try {
         _assertClass(handle, SimHandle);
-        const ret = wasm.history_verdict(handle.__wbg_ptr);
-        deferred1_0 = ret[0];
-        deferred1_1 = ret[1];
-        return getStringFromWasm0(ret[0], ret[1]);
+        const ret = wasm.restore(handle.__wbg_ptr, checkpoint_id);
+        var ptr1 = ret[0];
+        var len1 = ret[1];
+        if (ret[3]) {
+            ptr1 = 0; len1 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred2_0 = ptr1;
+        deferred2_1 = len1;
+        return getStringFromWasm0(ptr1, len1);
     } finally {
-        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
     }
 }
 
@@ -164,7 +238,48 @@ export function inject(handle, action_json) {
     _assertClass(handle, SimHandle);
     const ptr0 = passStringToWasm0(action_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    wasm.inject(handle.__wbg_ptr, ptr0, len0);
+    const ret = wasm.inject(handle.__wbg_ptr, ptr0, len0);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
+    }
+}
+
+/**
+ * @param {SimHandle} handle
+ * @param {bigint} cursor
+ * @param {number} max_events
+ * @returns {string}
+ */
+export function trace_page(handle, cursor, max_events) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        _assertClass(handle, SimHandle);
+        const ret = wasm.trace_page(handle.__wbg_ptr, cursor, max_events);
+        var ptr1 = ret[0];
+        var len1 = ret[1];
+        if (ret[3]) {
+            ptr1 = 0; len1 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred2_0 = ptr1;
+        deferred2_1 = len1;
+        return getStringFromWasm0(ptr1, len1);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * @param {SimHandle} handle
+ * @param {bigint} checkpoint_id
+ */
+export function drop_checkpoint(handle, checkpoint_id) {
+    _assertClass(handle, SimHandle);
+    const ret = wasm.drop_checkpoint(handle.__wbg_ptr, checkpoint_id);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
+    }
 }
 
 const SimHandleFinalization = (typeof FinalizationRegistry === 'undefined')
@@ -235,6 +350,11 @@ function __wbg_get_imports() {
     imports.wbg = {};
     imports.wbg.__wbg___wbindgen_throw_b855445ff6a94295 = function(arg0, arg1) {
         throw new Error(getStringFromWasm0(arg0, arg1));
+    };
+    imports.wbg.__wbindgen_cast_2241b6af4c4b2941 = function(arg0, arg1) {
+        // Cast intrinsic for `Ref(String) -> Externref`.
+        const ret = getStringFromWasm0(arg0, arg1);
+        return ret;
     };
     imports.wbg.__wbindgen_init_externref_table = function() {
         const table = wasm.__wbindgen_externrefs;

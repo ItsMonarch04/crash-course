@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2025 Sidakpreet Singh
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const contractPath = `${root}/theater/tests/control-contract.tsv`;
-const sourcePath = `${root}/theater/src/main.tsx`;
+const sourceRoot = `${root}/theater/src`;
 const rows = readFileSync(contractPath, "utf8").trimEnd().split("\n");
 const header = "control\twasm input or host action\texpected observable state\tPlaywright coverage";
 
@@ -27,8 +27,13 @@ for (const row of rows) {
 }
 
 const rendered = new Set();
-const source = readFileSync(sourcePath, "utf8");
-for (const match of source.matchAll(/data-control="([^"]+)"/g)) rendered.add(match[1]);
+const sources = readdirSync(sourceRoot, { recursive: true })
+  .filter((path) => typeof path === "string" && path.endsWith(".tsx"))
+  .sort();
+for (const path of sources) {
+  const source = readFileSync(`${sourceRoot}/${path}`, "utf8");
+  for (const match of source.matchAll(/data-control="([^"]+)"/g)) rendered.add(match[1]);
+}
 
 const missing = [...rendered].filter((control) => !declared.has(control));
 const stale = [...declared].filter((control) => !rendered.has(control));
