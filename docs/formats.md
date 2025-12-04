@@ -43,10 +43,13 @@ replicated transition. Existing tag bytes and fields are unchanged.
 `CCKV` v3 is intentionally narrow: it emits only `tag=18 Batch`, followed by
 `count:u32` and exactly that many canonical v1 CCKV child records encoded as
 `bytes32`. Count is nonzero, policy-bounded, and nested batches are rejected.
-`CCKR` v3 similarly emits only `tag=8 Batch` (`count:u32`, then canonical v1
-CCKR replies as `bytes32`) or `tag=9 BatchError`
-(`failed_index:u32 | error_tag:u8`). A batch error publishes none of its child
-state transitions. Both v3 decoders reject v1-only tags, trailing bytes,
+`CCKR` v3 emits only `tag=7 BatchReply`. Its payload begins with
+`success:u8`. Success is `count:u32` followed by canonical v1 CCKR children as
+`bytes32`. Failure is `has_failing_index:u8 | failing_index:u32 |
+error_cckr:bytes32`; the error child is one canonical v1 CCKR error envelope.
+An indexed error names the first failed subcommand, while a whole-batch limit
+error uses `has=0,index=0`. A batch error publishes none of its child state
+transitions. Both v3 decoders reject non-canonical flags, v1-only tags, trailing bytes,
 nested batch values, invalid checksums, and oversize lengths; their v1 readers
 remain unchanged for compatibility fixtures.
 

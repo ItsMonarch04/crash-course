@@ -5,9 +5,9 @@
 
 use std::io;
 
-use cc_core::{ClusterId, LogIndex, Term, Time, crc32c};
+use cc_core::{ClusterId, LogIndex, MembershipState, NodeId, Term, Time, crc32c};
 
-use crate::decode_ccsn;
+use crate::{CcsnSnapshot, decode_ccsn};
 
 pub const BACKUP_MAGIC: &[u8; 4] = b"CCBK";
 pub const BACKUP_VERSION: u16 = 2;
@@ -222,4 +222,221 @@ pub fn decode_backup_v2(bytes: &[u8]) -> io::Result<BackupV2> {
         checkpoint,
         provenance: BackupProvenance::LogicalCluster,
     })
+}
+
+/// Convert a validated logical backup into the state image for one new
+/// single-node cluster. Source Raft/node identity is never copied; logical
+/// data, TTL deadlines, the semantic floor, and committed feature state are
+/// retained under the new cluster identity.
+pub fn snapshot_for_fresh_cluster(
+    backup: &BackupV2,
+    new_cluster_id: ClusterId,
+    new_node_id: NodeId,
+    restore_time: Time,
+) -> io::Result<CcsnSnapshot> {
+    if new_cluster_id.is_zero()
+        || new_cluster_id == backup.source_cluster_id
+        || new_node_id.get() == 0
+        || restore_time < backup.source_last_leader_time
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fresh-cluster restore identity or time",
+        ));
+    }
+    let mut snapshot = decode_ccsn(
+        &backup.checkpoint,
+        backup.source_cluster_id.bytes(),
+        BACKUP_MAX_CHECKPOINT_BYTES as u64,
+    )
+    .map_err(io::Error::other)?;
+    if snapshot.kv.applied_index != backup.source_index
+        || snapshot.kv.applied_term != backup.source_term
+        || snapshot.kv.last_leader_time != backup.source_last_leader_time
+        || snapshot.cluster_policy.hash() != backup.source_policy_hash
+        || snapshot.membership.active_features != backup.source_active_features
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "backup checkpoint metadata",
+        ));
+    }
+    snapshot.kv.entries.retain(|entry| {
+        entry
+            .deadline
+            .is_none_or(|deadline| deadline > restore_time)
+    });
+    snapshot.sessions = snapshot
+        .sessions
+        .for_fresh_cluster_restore(snapshot.cluster_policy, restore_time)
+        .map_err(io::Error::other)?;
+    let mut membership =
+        MembershipState::new([new_node_id].into_iter().collect()).map_err(io::Error::other)?;
+    membership.active_features = backup.source_active_features;
+    membership.validate().map_err(io::Error::other)?;
+    snapshot.cluster_id = new_cluster_id.bytes();
+    snapshot.membership = membership;
+    snapshot.leadership_transfer = None;
+    snapshot.kv.applied_index = LogIndex::new(1);
+    snapshot.kv.applied_term = Term::new(1);
+    snapshot.kv.last_leader_time = restore_time;
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use cc_core::{ATOMIC_BATCH_FEATURE, ClusterPolicy, MembershipState, Seed};
+    use cc_kv::{KvCommand, KvReply, LogicalKvEntry, LogicalKvSnapshot};
+    use cc_store::StoreConfig;
+
+    use super::*;
+    use crate::{Node, NodeConfig, SessionTable, encode_ccsn};
+
+    fn logical_backup() -> BackupV2 {
+        let source_cluster_id = ClusterId::new([1; 16]);
+        let mut membership = MembershipState::new(
+            [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+                .into_iter()
+                .collect(),
+        )
+        .expect("membership");
+        membership.active_features = ATOMIC_BATCH_FEATURE;
+        let snapshot = CcsnSnapshot {
+            cluster_id: source_cluster_id.bytes(),
+            cluster_policy: ClusterPolicy::default(),
+            membership,
+            kv: LogicalKvSnapshot {
+                entries: vec![
+                    LogicalKvEntry {
+                        key: b"expired".to_vec(),
+                        sequence: 1,
+                        value: b"old".to_vec(),
+                        deadline: Some(Time::from_nanos(4_000_000_000)),
+                    },
+                    LogicalKvEntry {
+                        key: b"kept".to_vec(),
+                        sequence: 2,
+                        value: b"value".to_vec(),
+                        deadline: Some(Time::from_nanos(20_000_000_000)),
+                    },
+                ],
+                store_sequence: 2,
+                applied_index: LogIndex::new(9),
+                applied_term: Term::new(3),
+                last_leader_time: Time::from_nanos(3_000_000_000),
+            },
+            sessions: SessionTable::default(),
+            leadership_transfer: None,
+        };
+        BackupV2 {
+            source_cluster_id,
+            source_index: LogIndex::new(9),
+            source_term: Term::new(3),
+            source_last_leader_time: Time::from_nanos(3_000_000_000),
+            source_policy_hash: ClusterPolicy::default().hash(),
+            source_min_semantic: cc_raft::SEMANTIC_VERSION_V3,
+            source_active_features: ATOMIC_BATCH_FEATURE,
+            checkpoint: encode_ccsn(&snapshot).expect("checkpoint"),
+            provenance: BackupProvenance::LogicalCluster,
+        }
+    }
+
+    #[test]
+    fn trap_restored_cluster_grows_without_identity_clone() {
+        let backup =
+            decode_backup_v2(&encode_backup_v2(&logical_backup()).expect("backup envelope"))
+                .expect("decoded backup");
+        let fresh_id = ClusterId::new([7; 16]);
+        let mut restored = snapshot_for_fresh_cluster(
+            &backup,
+            fresh_id,
+            NodeId::new(7),
+            Time::from_nanos(5_000_000_000),
+        )
+        .expect("fresh snapshot");
+        assert_ne!(restored.cluster_id, backup.source_cluster_id.bytes());
+        assert_eq!(
+            restored.membership.voters,
+            [NodeId::new(7)].into_iter().collect()
+        );
+        assert!(!restored.membership.voters.contains(&NodeId::new(1)));
+
+        for id in 8..=11 {
+            restored.membership.learners.insert(NodeId::new(id));
+        }
+        restored
+            .membership
+            .validate()
+            .expect("five-member learner stage");
+        restored.membership.voters = (7..=11).map(NodeId::new).collect::<BTreeSet<_>>();
+        restored.membership.learners.clear();
+        restored
+            .membership
+            .validate()
+            .expect("five-voter final state");
+    }
+
+    #[test]
+    fn trap_backup_restore_preserves_active_feature_floor() {
+        let backup = logical_backup();
+        let restored = snapshot_for_fresh_cluster(
+            &backup,
+            ClusterId::new([8; 16]),
+            NodeId::new(8),
+            Time::from_nanos(5_000_000_000),
+        )
+        .expect("fresh snapshot");
+        assert_eq!(backup.source_min_semantic, cc_raft::SEMANTIC_VERSION_V3);
+        assert_eq!(restored.membership.active_features, ATOMIC_BATCH_FEATURE);
+    }
+
+    #[test]
+    fn trap_restored_cluster_matches_source_final_probes() {
+        let backup = logical_backup();
+        let cluster_id = ClusterId::new([9; 16]);
+        let snapshot = snapshot_for_fresh_cluster(
+            &backup,
+            cluster_id,
+            NodeId::new(9),
+            Time::from_nanos(5_000_000_000),
+        )
+        .expect("fresh snapshot");
+        let mut node = Node::new(
+            NodeConfig {
+                id: NodeId::new(9),
+                cluster_id: cluster_id.bytes(),
+                seed: Seed::new(9),
+                raft: cc_raft::RaftConfig::default(),
+                store: StoreConfig::default(),
+                policy: ClusterPolicy::default(),
+                host_limits: cc_core::HostLimits::default(),
+            },
+            [NodeId::new(9)].into_iter().collect(),
+        )
+        .expect("node");
+        node.install_decoded_ccsn_snapshot(snapshot)
+            .expect("install restored state");
+        assert_eq!(
+            node.kv.read(
+                KvCommand::Get {
+                    key: b"kept".to_vec()
+                },
+                Time::from_nanos(5_000_000_000),
+            ),
+            Ok(KvReply::Value(Some(b"value".to_vec())))
+        );
+        assert_eq!(
+            node.kv.read(
+                KvCommand::Ttl {
+                    key: b"kept".to_vec()
+                },
+                Time::from_nanos(5_000_000_000),
+            ),
+            Ok(KvReply::Integer(15))
+        );
+        assert_eq!(node.kv.store.get(b"expired", None), None);
+        assert_eq!(node.active_features(), ATOMIC_BATCH_FEATURE);
+    }
 }

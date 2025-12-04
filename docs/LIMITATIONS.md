@@ -4,23 +4,12 @@ This page is part of the product, not an apology. The project is an
 educational, deterministic database lab and its guarantees are deliberately
 narrow.
 
-- **The real host is now a strict shared-driver adapter, but it is not a
-  complete Storage v2 host.** `ccdb` runs `cc_host::Driver` over
-  `cc_cluster::Node`, including election traffic, Raft terms, CCHL/CCPF/CCRP
-  peer bytes, and a write-plus-fsync durability continuation. A fatal WAL I/O
-  error terminates the process. Its v2 SST codec plus CCMF/CCMT codec and
-  host-neutral publication plan are separately verified, but ccdb does not
-  execute that plan yet; there is still no store-WAL authority or prefix
-  reclamation. The shared Driver creates a bounded, record-streamed
-  CCSN checkpoint, fsyncs and atomically publishes it, then fsyncs the
-  matching Raft snapshot mark before the file becomes transfer or recovery
-  authority. It stages/fsyncs each received chunk, decodes it from the staged
-  file, publishes the file, fsyncs an installed-snapshot mark, and only then
-  installs and acknowledges it. Boot accepts only the exact marked file and
-  checksum; an unmarked checkpoint is not recovery authority. Checkpoint
-  trigger, publication, and transfer are implemented, but the missing
-  manifest/store checkpoint edit and safe durable-prefix reclamation mean this
-  is not yet the complete N3/N4 storage lifecycle.
+- `ccdb`, the simulator, and WASM all drive the same `cc_cluster::Node` through
+  `cc_host::Driver`. Storage v2 uses store-WAL authority, file-backed SST
+  reads, manifest publication, streamed checkpoints, installed-snapshot marks,
+  and durable prefix reclamation. Snapshot transfer deliberately resumes from
+  byte zero after a lost acknowledgement; bounded duplicate chunks are safe,
+  but mid-file resume is not implemented.
 - We have one Raft group. Write throughput is ultimately bounded by the
   leader's durable-log path; sharding is a future expansion track.
 - Default reads remain leader reads. `READ FOLLOWER GET|TTL` is available only
@@ -43,14 +32,16 @@ narrow.
   and promotion may only be requested after the learner has caught up.
 - Group commit creates a latency floor at low concurrency. The page-cache and
   `fsync` model is explained in [writeup 02](writeups/02-fsync-page-cache.md).
-- The LSM store has read amplification as table depth grows. Compaction is
-  deterministic and chunked, but restart intervals, per-block CRCs, bloom
-  filters, manifest flip thresholds, and checkpoint pin/release remain
-  explicitly deferred by [ADR-0005](adr/0005-store-format-audit.md).
+- The LSM store has read amplification as table depth grows. Deterministic
+  levelled compaction, per-block/table integrity, bloom/index reads, manifest
+  generations, and checkpoint pins are implemented; there is intentionally no
+  block cache, as recorded in [ADR-0008](adr/0008-scope-boundaries.md).
 - Exactly-once client results are bounded by the session idle TTL. A client
   that disappears longer than the TTL must reconcile its application state.
 - TTLs use leader-stamped logical time. They are not wall-clock leases and
-  their granularity follows the log's application cadence.
+  their granularity follows the log's application cadence. A checker read whose
+  invocation/completion interval truly straddles the deadline may legally
+  observe either side of expiry.
 - There is no authentication, authorization, encryption, TLS, ACL, or secure
   multi-tenant boundary. The real host is for local experiments.
 - The theater simulator is not kernel truth. Its disk and network behavior is
@@ -58,6 +49,8 @@ narrow.
   mistakes, not to replace the model or a production fault lab. The browser
   bridge is the same deterministic fixture compiled to WASM, not a second
   kernel implementation.
+- Theater checkpoints and scrub replay cover only the declared finite event
+  horizon and byte caps; they are not an unbounded execution archive.
 - Each simulated run captures a bounded client history (32 operations) so that
   campaigns stay in the hundreds-of-runs-per-second range. Linearizability
   verdicts are therefore statements about short histories under many seeds, not
@@ -77,18 +70,26 @@ narrow.
   transition-depth, and state-count bounds printed in its report. A completed
   tiny model is evidence inside that state space, not a proof of unbounded
   Raft.
+- A minimized counterexample is a budgeted, one-deletion-minimal witness
+  candidate. The complete history remains authoritative when the minimization
+  budget is exhausted or several independent failures exist.
 - Real-host `CCBK` v2 backups contain only the exact CCSN file named by a
   durable snapshot mark. Restore validates it and writes a fresh one-node
-  CCID/Restore-origin WAL/checkpoint; it never clones source identity. The
-  capture is offline and can therefore be behind the current leader; online
-  linearizable backup, store-manifest validation, and the promised legacy v1
-  logical importer remain incomplete.
-
-- Wiped simulator nodes re-enter through a Join-origin durable prefix and
-  ordinary Raft traffic; no leader snapshot is copied directly into a target.
-  The host has streamed durable checkpoint transfer, but still lacks the
-  storage-manifest and prefix-reclamation portions of N4, so a wiped-node
-  claim remains narrower than full storage recovery.
+  CCID/Restore-origin WAL/checkpoint; it never clones source identity. This is
+  fresh-cluster recovery, not an in-place old-binary downgrade. Legacy v1 is
+  accepted only through the explicit legacy-node importer and never counts as
+  cluster-complete provenance. Offline capture can be behind the current
+  leader; online linearizable backup is not claimed.
+- Storage and semantic reader floors are monotonic. Crossing a floor is an
+  intentionally irreversible in-place compatibility fence; recovery into a
+  fresh compatible cluster remains the escape hatch.
+- User-space queues, histories, snapshots, codecs, and logical state expose
+  exact count/byte caps. Kernel socket memory is not included in that
+  accounting; it is bounded indirectly by connection caps and operating-system
+  limits.
+- Calibration profiles describe one measured environment and publish their
+  residuals. They do not retune universal defaults or predict production
+  latency.
 - Permanent non-goals, recorded in [ADR-0008](adr/0008-scope-boundaries.md): a
   second host on an async runtime, an external Jepsen/Elle audit harness,
   keyspace notifications, and an LSM block cache. Each was considered and

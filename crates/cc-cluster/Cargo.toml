@@ -7,6 +7,10 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+default = []
+kata05 = []
+
 [dependencies]
 cc-core = { path = "../cc-core" }
 cc-env = { path = "../cc-env" }

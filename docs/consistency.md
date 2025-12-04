@@ -42,7 +42,9 @@ connection close drop only the local queue. An empty `EXEC` returns an empty
 array without proposing an entry. There are no interactive transactions, no
 cross-group atomicity, no snapshot isolation, and no `WATCH` optimistic
 concurrency. A plain `MULTI`/`EXEC` exchange has the documented lost-reply
-at-least-once edge; it is not a reconnect-stable `CC.REQUEST` batch envelope.
+at-least-once edge. A one-shot `BATCH` accepts one nested RESP array of
+subcommand arrays; wrapping that exact form as `CC.REQUEST <client> <sequence>
+BATCH <nested-array>` makes the complete batch one reconnect-stable dedup unit.
 
 `READ STALE GET key` is an explicit local observation, returned as
 `["STALE", reply, applied_index, applied_term, read_time, last_contact_ms]`.

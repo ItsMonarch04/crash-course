@@ -11,7 +11,8 @@ use cc_core::{Dec, DecodeError, Enc, Time, Trace};
 
 pub const CHECKER_VERSION: u16 = 1;
 pub const HISTORY_MAGIC: u32 = u32::from_le_bytes(*b"CCHY");
-pub const HISTORY_VERSION: u16 = 3;
+pub const HISTORY_VERSION: u16 = 4;
+pub const HISTORY_V3_VERSION: u16 = 3;
 pub const HISTORY_V2_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +57,9 @@ pub enum OperationKind {
         prefix: Option<Vec<u8>>,
         limit: usize,
     },
+    Batch {
+        commands: Vec<OperationKind>,
+    },
 }
 
 impl OperationKind {
@@ -67,6 +71,7 @@ impl OperationKind {
             | Self::Incr { key }
             | Self::Cas { key, .. } => key,
             Self::Scan { prefix, .. } => prefix.as_deref().unwrap_or_default(),
+            Self::Batch { .. } => &[],
         }
     }
 }
@@ -78,6 +83,7 @@ pub enum Outcome {
     Integer(i64),
     Cas(bool),
     Scan(Vec<(Vec<u8>, Vec<u8>)>),
+    Batch { replies: Vec<Outcome> },
     Error,
     Timeout,
 }
@@ -232,7 +238,10 @@ impl HistoryDocument {
             .and_then(|value| value.try_into().ok())
             .map(u16::from_le_bytes)
             .ok_or(HistoryCodecError::Invalid("history header"))?;
-        if !matches!(version, HISTORY_V2_VERSION | HISTORY_VERSION) {
+        if !matches!(
+            version,
+            HISTORY_V2_VERSION | HISTORY_V3_VERSION | HISTORY_VERSION
+        ) {
             return Err(HistoryCodecError::Invalid("history version"));
         }
         let mut dec = Dec::new(bytes);
@@ -385,7 +394,38 @@ fn encode_operation(enc: &mut Enc, operation: &Operation) {
         }
         None => enc.u8(0),
     }
-    match &operation.kind {
+    encode_operation_kind(enc, &operation.kind);
+    encode_outcome(enc, &operation.outcome);
+    match operation.deadline {
+        Some(deadline) => {
+            enc.u8(1);
+            enc.u64(deadline.as_nanos());
+        }
+        None => enc.u8(0),
+    }
+    enc.u8(match operation.consistency {
+        ConsistencyMode::Strong => 1,
+        ConsistencyMode::StaleLocal => 2,
+        ConsistencyMode::Diagnostic => 3,
+    });
+    match operation.diagnostic {
+        DiagnosticKind::None => enc.u8(0),
+        DiagnosticKind::FinalProbe => enc.u8(1),
+        DiagnosticKind::ReplicaState {
+            replica,
+            committed_index,
+            state_hash,
+        } => {
+            enc.u8(2);
+            enc.u64(replica);
+            enc.u64(committed_index);
+            enc.u64(state_hash);
+        }
+    }
+}
+
+fn encode_operation_kind(enc: &mut Enc, kind: &OperationKind) {
+    match kind {
         OperationKind::Set { key, value } => {
             enc.u8(1);
             enc.bytes(key);
@@ -418,32 +458,12 @@ fn encode_operation(enc: &mut Enc, operation: &Operation) {
             opt_bytes(enc, prefix);
             enc.u32(u32::try_from(*limit).unwrap_or(u32::MAX));
         }
-    }
-    encode_outcome(enc, &operation.outcome);
-    match operation.deadline {
-        Some(deadline) => {
-            enc.u8(1);
-            enc.u64(deadline.as_nanos());
-        }
-        None => enc.u8(0),
-    }
-    enc.u8(match operation.consistency {
-        ConsistencyMode::Strong => 1,
-        ConsistencyMode::StaleLocal => 2,
-        ConsistencyMode::Diagnostic => 3,
-    });
-    match operation.diagnostic {
-        DiagnosticKind::None => enc.u8(0),
-        DiagnosticKind::FinalProbe => enc.u8(1),
-        DiagnosticKind::ReplicaState {
-            replica,
-            committed_index,
-            state_hash,
-        } => {
-            enc.u8(2);
-            enc.u64(replica);
-            enc.u64(committed_index);
-            enc.u64(state_hash);
+        OperationKind::Batch { commands } => {
+            enc.u8(7);
+            enc.u32(u32::try_from(commands.len()).unwrap_or(u32::MAX));
+            for command in commands {
+                encode_operation_kind(enc, command);
+            }
         }
     }
 }
@@ -457,28 +477,9 @@ fn decode_operation(dec: &mut Dec<'_>, version: u16) -> Result<Operation, Histor
         1 => Some(Time::from_nanos(dec.u64()?)),
         _ => return Err(HistoryCodecError::Invalid("completion flag")),
     };
-    let kind = match dec.u8()? {
-        1 => OperationKind::Set {
-            key: dec.bytes()?,
-            value: dec.bytes()?,
-        },
-        2 => OperationKind::Get { key: dec.bytes()? },
-        3 => OperationKind::Del { key: dec.bytes()? },
-        4 => OperationKind::Incr { key: dec.bytes()? },
-        5 => OperationKind::Cas {
-            key: dec.bytes()?,
-            expected: decode_opt_bytes(dec)?,
-            value: dec.bytes()?,
-        },
-        6 => OperationKind::Scan {
-            prefix: decode_opt_bytes(dec)?,
-            limit: usize::try_from(dec.u32()?)
-                .map_err(|_| HistoryCodecError::Invalid("scan limit"))?,
-        },
-        _ => return Err(HistoryCodecError::Invalid("operation tag")),
-    };
+    let kind = decode_operation_kind(dec, version, true)?;
     let outcome = decode_outcome(dec)?;
-    let (deadline, consistency, diagnostic) = if version >= HISTORY_VERSION {
+    let (deadline, consistency, diagnostic) = if version >= HISTORY_V3_VERSION {
         let deadline = match dec.u8()? {
             0 => None,
             1 => Some(Time::from_nanos(dec.u64()?)),
@@ -515,6 +516,41 @@ fn decode_operation(dec: &mut Dec<'_>, version: u16) -> Result<Operation, Histor
         deadline,
         consistency,
         diagnostic,
+    })
+}
+
+fn decode_operation_kind(
+    dec: &mut Dec<'_>,
+    version: u16,
+    allow_batch: bool,
+) -> Result<OperationKind, HistoryCodecError> {
+    Ok(match dec.u8()? {
+        1 => OperationKind::Set {
+            key: dec.bytes()?,
+            value: dec.bytes()?,
+        },
+        2 => OperationKind::Get { key: dec.bytes()? },
+        3 => OperationKind::Del { key: dec.bytes()? },
+        4 => OperationKind::Incr { key: dec.bytes()? },
+        5 => OperationKind::Cas {
+            key: dec.bytes()?,
+            expected: decode_opt_bytes(dec)?,
+            value: dec.bytes()?,
+        },
+        6 => OperationKind::Scan {
+            prefix: decode_opt_bytes(dec)?,
+            limit: usize::try_from(dec.u32()?)
+                .map_err(|_| HistoryCodecError::Invalid("scan limit"))?,
+        },
+        7 if version >= HISTORY_VERSION && allow_batch => {
+            let count = bounded_count(dec, cc_core::MAX_CODEC_BYTES, 4096)?;
+            let mut commands = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                commands.push(decode_operation_kind(dec, version, false)?);
+            }
+            OperationKind::Batch { commands }
+        }
+        _ => return Err(HistoryCodecError::Invalid("operation tag")),
     })
 }
 fn opt_bytes(enc: &mut Enc, value: &Option<Vec<u8>>) {
@@ -556,6 +592,13 @@ fn encode_outcome(enc: &mut Enc, outcome: &Outcome) {
                 enc.bytes(value);
             }
         }
+        Outcome::Batch { replies } => {
+            enc.u8(8);
+            enc.u32(u32::try_from(replies.len()).unwrap_or(u32::MAX));
+            for reply in replies {
+                encode_outcome(enc, reply);
+            }
+        }
         Outcome::Error => enc.u8(6),
         Outcome::Timeout => enc.u8(7),
     }
@@ -580,6 +623,18 @@ fn decode_outcome(dec: &mut Dec<'_>) -> Result<Outcome, HistoryCodecError> {
         }
         6 => Outcome::Error,
         7 => Outcome::Timeout,
+        8 => {
+            let count = bounded_count(dec, cc_core::MAX_CODEC_BYTES, 4096)?;
+            let mut replies = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let reply = decode_outcome(dec)?;
+                if matches!(reply, Outcome::Batch { .. }) {
+                    return Err(HistoryCodecError::Invalid("nested batch outcome"));
+                }
+                replies.push(reply);
+            }
+            Outcome::Batch { replies }
+        }
         _ => return Err(HistoryCodecError::Invalid("outcome tag")),
     })
 }
@@ -604,6 +659,92 @@ pub enum Verdict {
     Linearizable { visited: u64 },
     NotLinearizable { witness: Witness, visited: u64 },
     Undecided { visited: u64 },
+}
+
+/// Trace evidence attached to one explicitly stale local read. The reported
+/// watermark and the traced state watermark are deliberately separate so a
+/// future-state observation cannot validate an older claimed index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleReadEvidence {
+    pub operation_id: u64,
+    pub applied_index: u64,
+    pub applied_term: u64,
+    pub traced_index: u64,
+    pub traced_term: u64,
+    pub read_time: Time,
+    pub value_at_traced_index: Option<Vec<u8>>,
+    pub deadline: Option<Time>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StaleReadVerdict {
+    Valid {
+        checked: usize,
+    },
+    Invalid {
+        operation_id: u64,
+        reason: &'static str,
+    },
+    Undecided {
+        operation_id: u64,
+        reason: &'static str,
+    },
+}
+
+/// Check only the narrow claim made by `READ STALE`: the returned value is
+/// exactly the traced local value at the reported applied watermark after
+/// filtering expiry at the reported read time. No contact-age or wall-time
+/// freshness bound is inferred.
+#[must_use]
+pub fn check_stale_reads(history: &History, evidence: &[StaleReadEvidence]) -> StaleReadVerdict {
+    let mut checked = 0_usize;
+    for operation in history
+        .operations
+        .iter()
+        .filter(|operation| operation.consistency == ConsistencyMode::StaleLocal)
+    {
+        let Some(observation) = evidence
+            .iter()
+            .find(|observation| observation.operation_id == operation.id)
+        else {
+            return StaleReadVerdict::Undecided {
+                operation_id: operation.id,
+                reason: "missing traced state at reported applied index",
+            };
+        };
+        if !matches!(operation.kind, OperationKind::Get { .. })
+            || !matches!(operation.outcome, Outcome::Value(_))
+        {
+            return StaleReadVerdict::Invalid {
+                operation_id: operation.id,
+                reason: "stale evidence is defined only for completed GET values",
+            };
+        }
+        if observation.applied_index != observation.traced_index
+            || observation.applied_term != observation.traced_term
+        {
+            return StaleReadVerdict::Invalid {
+                operation_id: operation.id,
+                reason: "trace watermark differs from the reported applied watermark",
+            };
+        }
+        let visible = if observation
+            .deadline
+            .is_some_and(|deadline| deadline <= observation.read_time)
+        {
+            None
+        } else {
+            observation.value_at_traced_index.clone()
+        };
+        if operation.outcome != Outcome::Value(visible) {
+            return StaleReadVerdict::Invalid {
+                operation_id: operation.id,
+                reason: "reply differs from traced state after TTL filtering",
+            };
+        }
+        checked = checked.saturating_add(1);
+    }
+    StaleReadVerdict::Valid { checked }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -839,11 +980,26 @@ fn check_with_initial(
 }
 
 fn check_with_initial_raw(history: &History, initial: Model, config: CheckerConfig) -> Verdict {
-    if history
-        .operations
-        .iter()
-        .any(|operation| matches!(operation.kind, OperationKind::Scan { .. }))
-    {
+    // Local stale observations and diagnostic probes make different claims;
+    // neither is an operation in the linearizable history.
+    let history = History {
+        operations: history
+            .operations
+            .iter()
+            .filter(|operation| {
+                operation.consistency == ConsistencyMode::Strong
+                    && operation.diagnostic == DiagnosticKind::None
+            })
+            .cloned()
+            .collect(),
+    };
+    let history = &history;
+    if history.operations.iter().any(|operation| {
+        matches!(
+            operation.kind,
+            OperationKind::Scan { .. } | OperationKind::Batch { .. }
+        )
+    }) {
         return check_single(history, initial, config);
     }
     let mut per_key = BTreeMap::<Vec<u8>, History>::new();
@@ -1141,6 +1297,22 @@ fn apply_operation(
                 .collect::<Vec<_>>();
             values.truncate(*limit);
             Outcome::Scan(values)
+        }
+        OperationKind::Batch { commands } => {
+            if commands.is_empty()
+                || commands
+                    .iter()
+                    .any(|command| matches!(command, OperationKind::Batch { .. }))
+            {
+                return None;
+            }
+            let mut replies = Vec::with_capacity(commands.len());
+            for command in commands {
+                let (updated, reply) = apply_operation(&next, command, deadline)?;
+                next = updated;
+                replies.push(reply);
+            }
+            Outcome::Batch { replies }
         }
     };
     Some((next, outcome))
@@ -2054,6 +2226,14 @@ fn operation_value(operation: &OperationKind) -> String {
                 .map_or_else(|| String::from("null"), json_bytes),
             limit
         ),
+        OperationKind::Batch { commands } => format!(
+            "[\"batch\",[{}]]",
+            commands
+                .iter()
+                .map(operation_value)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
     }
 }
 
@@ -2070,6 +2250,14 @@ fn outcome_value(outcome: &Outcome) -> String {
             values
                 .iter()
                 .map(|(key, value)| format!("[{},{}]", json_bytes(key), json_bytes(value)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Outcome::Batch { replies } => format!(
+            "[{}]",
+            replies
+                .iter()
+                .map(outcome_value)
                 .collect::<Vec<_>>()
                 .join(",")
         ),
@@ -2112,6 +2300,91 @@ impl fmt::Display for Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trap_batch_is_one_atomic_checker_transition() {
+        let batch = Operation::completed(
+            1,
+            OperationKind::Batch {
+                commands: vec![
+                    OperationKind::Set {
+                        key: b"a".to_vec(),
+                        value: b"new-a".to_vec(),
+                    },
+                    OperationKind::Set {
+                        key: b"b".to_vec(),
+                        value: b"new-b".to_vec(),
+                    },
+                    OperationKind::Get { key: b"a".to_vec() },
+                ],
+            },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Batch {
+                replies: vec![
+                    Outcome::Ok,
+                    Outcome::Ok,
+                    Outcome::Value(Some(b"new-a".to_vec())),
+                ],
+            },
+        );
+        let document = HistoryDocument {
+            build_label: String::from("batch-checker"),
+            config_hash: 7,
+            initial: BTreeMap::from([
+                (b"a".to_vec(), b"old-a".to_vec()),
+                (b"b".to_vec(), b"old-b".to_vec()),
+            ]),
+            retain_open: true,
+            history: History {
+                operations: vec![batch.clone()],
+            },
+        };
+        assert_eq!(
+            HistoryDocument::decode(&document.encode()).expect("batch history"),
+            document
+        );
+        assert!(matches!(
+            check(
+                &History {
+                    operations: vec![batch]
+                },
+                CheckerConfig::default()
+            ),
+            Verdict::Linearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn trap_failed_batch_cannot_publish_partial_state() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Batch {
+                        commands: vec![OperationKind::Set {
+                            key: b"a".to_vec(),
+                            value: b"published".to_vec(),
+                        }],
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Error,
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: b"a".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(Some(b"published".to_vec())),
+                ),
+            ],
+        };
+        assert!(matches!(
+            check(&history, CheckerConfig::default()),
+            Verdict::NotLinearizable { .. }
+        ));
+    }
     use cc_core::NodeId;
 
     #[test]
@@ -3047,6 +3320,119 @@ mod tests {
         assert!(
             cross_check_linearizable_sessions(&history, &Verdict::Linearizable { visited: 1 })
                 .is_ok()
+        );
+    }
+
+    fn stale_get(id: u64, value: Option<&[u8]>) -> Operation {
+        let mut operation = Operation::completed(
+            id,
+            OperationKind::Get { key: b"k".to_vec() },
+            Time::from_nanos(10),
+            Time::from_nanos(20),
+            Outcome::Value(value.map(<[u8]>::to_vec)),
+        );
+        operation.consistency = ConsistencyMode::StaleLocal;
+        operation
+    }
+
+    #[test]
+    fn trap_stale_read_is_excluded_from_the_linearizable_history() {
+        let history = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Set {
+                        key: b"k".to_vec(),
+                        value: b"new".to_vec(),
+                    },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                stale_get(2, Some(b"old")),
+            ],
+        };
+        assert!(matches!(
+            check(&history, CheckerConfig::default()),
+            Verdict::Linearizable { .. }
+        ));
+    }
+
+    #[test]
+    fn trap_stale_read_matches_reported_applied_index() {
+        let history = History {
+            operations: vec![stale_get(7, Some(b"v"))],
+        };
+        let mut evidence = StaleReadEvidence {
+            operation_id: 7,
+            applied_index: 4,
+            applied_term: 2,
+            traced_index: 4,
+            traced_term: 2,
+            read_time: Time::from_nanos(50),
+            value_at_traced_index: Some(b"v".to_vec()),
+            deadline: None,
+        };
+        assert_eq!(
+            check_stale_reads(&history, &[evidence.clone()]),
+            StaleReadVerdict::Valid { checked: 1 }
+        );
+        evidence.traced_index = 5;
+        assert!(matches!(
+            check_stale_reads(&history, &[evidence]),
+            StaleReadVerdict::Invalid {
+                operation_id: 7,
+                ..
+            }
+        ));
+        assert!(matches!(
+            check_stale_reads(&history, &[]),
+            StaleReadVerdict::Undecided {
+                operation_id: 7,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn trap_stale_read_ttl_uses_reported_read_time() {
+        let history = History {
+            operations: vec![stale_get(7, None)],
+        };
+        let evidence = StaleReadEvidence {
+            operation_id: 7,
+            applied_index: 4,
+            applied_term: 2,
+            traced_index: 4,
+            traced_term: 2,
+            read_time: Time::from_nanos(100),
+            value_at_traced_index: Some(b"expired".to_vec()),
+            deadline: Some(Time::from_nanos(99)),
+        };
+        assert_eq!(
+            check_stale_reads(&history, &[evidence]),
+            StaleReadVerdict::Valid { checked: 1 }
+        );
+    }
+
+    #[test]
+    fn trap_stale_read_makes_no_time_bound() {
+        let history = History {
+            operations: vec![stale_get(7, Some(b"old"))],
+        };
+        let evidence = StaleReadEvidence {
+            operation_id: 7,
+            applied_index: 1,
+            applied_term: 1,
+            traced_index: 1,
+            traced_term: 1,
+            read_time: Time::from_nanos(9_000_000_000_000),
+            value_at_traced_index: Some(b"old".to_vec()),
+            deadline: None,
+        };
+        assert_eq!(
+            check_stale_reads(&history, &[evidence]),
+            StaleReadVerdict::Valid { checked: 1 }
         );
     }
 

@@ -1632,6 +1632,16 @@ pub struct SessionTombstone {
     pub expires_at: Time,
 }
 
+struct AdminApplyContext {
+    policy: ClusterPolicy,
+    key: SessionKey,
+    sequence: u64,
+    canonical_command: Bytes,
+    operation_tag: u8,
+    source_index: LogIndex,
+    at: Time,
+}
+
 impl SessionTable {
     pub fn from_snapshot_parts(
         records: BTreeMap<SessionKey, SessionRecord>,
@@ -1912,6 +1922,9 @@ impl SessionTable {
                 return KvReply::Error(KvError::StaleSequence);
             }
             if sequence == record.max_seq {
+                #[cfg(feature = "kata05")]
+                let same = true;
+                #[cfg(not(feature = "kata05"))]
                 let same = record.canonical_command == canonical_command;
                 let cached_reply = record.cached_reply.clone();
                 if let Some(record) = self.records.get_mut(&key) {
@@ -2020,15 +2033,18 @@ impl SessionTable {
 
     fn apply_admin(
         &mut self,
-        policy: ClusterPolicy,
-        key: SessionKey,
-        sequence: u64,
-        canonical_command: Bytes,
-        operation_tag: u8,
-        source_index: LogIndex,
-        at: Time,
+        context: AdminApplyContext,
         mutate: impl FnOnce() -> Result<(AdminReply, Vec<RaftEffect>), RaftError>,
     ) -> Result<(AdminReply, Vec<RaftEffect>), RaftError> {
+        let AdminApplyContext {
+            policy,
+            key,
+            sequence,
+            canonical_command,
+            operation_tag,
+            source_index,
+            at,
+        } = context;
         let fallback = |result, detail: &[u8]| AdminReply {
             operation_tag,
             result,
@@ -2514,6 +2530,20 @@ impl Node {
         Ok(())
     }
 
+    /// Invalidate the proof attached to one negotiated connection
+    /// generation. Capability is volatile evidence: a closed connection must
+    /// never continue authorizing follower reads or feature activation.
+    pub fn forget_peer_capability(&mut self, peer: NodeId) {
+        self.peer_capabilities.remove(&peer);
+        self.pending_follower_reads
+            .retain(|_, pending| pending.leader != peer);
+        self.pending_follower_grants
+            .retain(|_, pending| pending.follower != peer);
+        if self.pending_follower_grants.is_empty() {
+            self.follower_read_round_active = false;
+        }
+    }
+
     /// Bounded point-in-time copy for host metrics. Membership policy bounds
     /// the map, and node ids are the only labels exposed by the adapter.
     #[must_use]
@@ -2684,7 +2714,7 @@ impl Node {
             .raft
             .log
             .iter()
-            .filter(|entry| entry.kind == cc_raft::EntryKind::Config)
+            .filter(|entry| entry.kind.is_config())
             .filter_map(|entry| {
                 ConfigEnvelope::decode(&entry.payload)
                     .ok()
@@ -3357,7 +3387,7 @@ impl Node {
             .log
             .iter()
             .filter(|entry| {
-                entry.index > self.raft.applied_index && entry.kind == cc_raft::EntryKind::Config
+                entry.index > self.raft.applied_index && entry.kind.is_config()
             })
             .filter_map(|entry| ConfigEnvelope::decode(&entry.payload).ok())
             .find_map(|envelope| envelope.admin_session.map(|(key, _)| key))
@@ -3368,7 +3398,7 @@ impl Node {
             .log
             .iter()
             .filter(|entry| {
-                entry.index > self.raft.applied_index && entry.kind == cc_raft::EntryKind::App
+                entry.index > self.raft.applied_index && entry.kind.is_app()
             })
             .filter_map(|entry| decode_proposal(entry).ok().flatten())
             .filter_map(|envelope| decode_command(&envelope.command).ok())
@@ -3501,7 +3531,7 @@ impl Node {
             let mut finishes_session_expiry_sweep = false;
             let mut expired_keys = 0_u64;
             let entry_kind = match entry.kind {
-                cc_raft::EntryKind::App => {
+                cc_raft::EntryKind::App | cc_raft::EntryKind::AppV3 => {
                     let envelope = decode_proposal(&entry)
                         .map_err(|_| NodeError::MalformedCommittedEntry(entry.index))?
                         .ok_or(NodeError::MalformedCommittedEntry(entry.index))?;
@@ -3510,6 +3540,11 @@ impl Node {
                     }
                     let command = decode_command(&envelope.command)
                         .map_err(|_| NodeError::MalformedCommittedEntry(entry.index))?;
+                    if matches!(entry.kind, cc_raft::EntryKind::AppV3)
+                        != matches!(command, KvCommand::Batch { .. })
+                    {
+                        return Err(NodeError::MalformedCommittedEntry(entry.index));
+                    }
                     finishes_expiry_sweep = matches!(command, KvCommand::PurgeExpired { .. });
                     finishes_session_expiry_sweep =
                         matches!(command, KvCommand::ExpireSessions { .. });
@@ -3576,7 +3611,7 @@ impl Node {
                             .iter()
                             .filter(|candidate| {
                                 candidate.index > working_raft.applied_index
-                                    && candidate.kind == cc_raft::EntryKind::Config
+                                    && candidate.kind.is_config()
                             })
                             .filter_map(|candidate| ConfigEnvelope::decode(&candidate.payload).ok())
                             .find_map(|config| config.admin_session.map(|(key, _)| key));
@@ -3597,9 +3632,17 @@ impl Node {
                         .map(|(client, sequence)| PreparedReply::Kv(client, sequence, result));
                     StoreEntryKind::App
                 }
-                cc_raft::EntryKind::Config => {
+                cc_raft::EntryKind::Config | cc_raft::EntryKind::ConfigV3 => {
                     let envelope = ConfigEnvelope::decode(&entry.payload)
                         .map_err(|_| NodeError::MalformedCommittedEntry(entry.index))?;
+                    if matches!(entry.kind, cc_raft::EntryKind::ConfigV3)
+                        != matches!(
+                            envelope.operation,
+                            ConfigOperation::ActivateFeature { .. }
+                        )
+                    {
+                        return Err(NodeError::MalformedCommittedEntry(entry.index));
+                    }
                     working_kv.mark_applied(entry.index, entry.term, envelope.leader_time);
                     canonical_command.clone_from(&entry.payload);
                     match (envelope.admin_session, &envelope.operation) {
@@ -3655,13 +3698,15 @@ impl Node {
                             .tag();
                             let (admin_reply, effects) = working_sessions
                                 .apply_admin(
-                                    self.config.policy,
-                                    key,
-                                    sequence,
-                                    original,
-                                    operation_tag,
-                                    entry.index,
-                                    envelope.leader_time,
+                                    AdminApplyContext {
+                                        policy: self.config.policy,
+                                        key,
+                                        sequence,
+                                        canonical_command: original,
+                                        operation_tag,
+                                        source_index: entry.index,
+                                        at: envelope.leader_time,
+                                    },
                                     || {
                                         let effects =
                                             working_raft.apply_committed_config(&entry)?;
@@ -3720,21 +3765,23 @@ impl Node {
                             };
                             let (admin_reply, effects) = working_sessions
                                 .apply_admin(
-                                    self.config.policy,
-                                    key,
-                                    sequence,
-                                    original,
-                                    ConfigOperation::BeginLeaderTransfer {
-                                        target: working_raft
-                                            .leadership_transfer_state()
-                                            .map(|state| state.target)
-                                            .ok_or(NodeError::MalformedCommittedEntry(
-                                                entry.index,
-                                            ))?,
-                                    }
-                                    .tag(),
-                                    entry.index,
-                                    envelope.leader_time,
+                                    AdminApplyContext {
+                                        policy: self.config.policy,
+                                        key,
+                                        sequence,
+                                        canonical_command: original,
+                                        operation_tag: ConfigOperation::BeginLeaderTransfer {
+                                            target: working_raft
+                                                .leadership_transfer_state()
+                                                .map(|state| state.target)
+                                                .ok_or(NodeError::MalformedCommittedEntry(
+                                                    entry.index,
+                                                ))?,
+                                        }
+                                        .tag(),
+                                        source_index: entry.index,
+                                        at: envelope.leader_time,
+                                    },
                                     || {
                                         let effects =
                                             working_raft.apply_committed_config(&entry)?;
@@ -3761,13 +3808,15 @@ impl Node {
                             let operation_tag = envelope.operation.tag();
                             let (admin_reply, effects) = working_sessions
                                 .apply_admin(
-                                    self.config.policy,
-                                    key,
-                                    sequence,
-                                    entry.payload.clone(),
-                                    operation_tag,
-                                    entry.index,
-                                    envelope.leader_time,
+                                    AdminApplyContext {
+                                        policy: self.config.policy,
+                                        key,
+                                        sequence,
+                                        canonical_command: entry.payload.clone(),
+                                        operation_tag,
+                                        source_index: entry.index,
+                                        at: envelope.leader_time,
+                                    },
                                     || {
                                         let effects =
                                             working_raft.apply_committed_config(&entry)?;
@@ -4305,7 +4354,7 @@ fn encode_proposal(
 }
 
 fn decode_proposal(entry: &Entry) -> Result<Option<AppEnvelope>, KvError> {
-    if entry.kind != cc_raft::EntryKind::App || entry.payload.is_empty() {
+    if !entry.kind.is_app() || entry.payload.is_empty() {
         return Ok(None);
     }
     let envelope = AppEnvelope::decode(&entry.payload)?;
@@ -4617,6 +4666,163 @@ mod tests {
                 applied_term: Term::new(1),
                 read_time: Time::from_nanos(30),
             })
+        );
+    }
+
+    #[test]
+    fn trap_follower_read_tags_require_negotiated_feature_bit() {
+        let voters = [NodeId::new(1), NodeId::new(2)].into_iter().collect();
+        let mut follower = Node::new(config(2), voters).expect("follower");
+        follower.raft.role = Role::Follower;
+        follower.raft.hard_state.term = Term::new(2);
+        follower.raft.leader_id = Some(NodeId::new(1));
+        follower
+            .observe_peer_capability(NodeId::new(1), SEMANTIC_VERSION_V3, 0)
+            .expect("featureless v3 connection");
+        assert_eq!(
+            follower.request_follower_read(
+                ClientId::new(7),
+                1,
+                KvCommand::Get { key: b"k".to_vec() },
+                Time::from_nanos(1),
+            ),
+            Err(NodeError::Environment("follower read feature unavailable"))
+        );
+        follower
+            .observe_peer_capability(NodeId::new(1), SEMANTIC_VERSION_V3, FOLLOWER_READ_FEATURE)
+            .expect("feature-bearing connection");
+        assert!(
+            follower
+                .request_follower_read(
+                    ClientId::new(7),
+                    2,
+                    KvCommand::Get { key: b"k".to_vec() },
+                    Time::from_nanos(2),
+                )
+                .is_ok()
+        );
+        follower.forget_peer_capability(NodeId::new(1));
+        assert!(follower.pending_follower_reads.is_empty());
+        assert_eq!(
+            follower.request_follower_read(
+                ClientId::new(7),
+                3,
+                KvCommand::Get { key: b"k".to_vec() },
+                Time::from_nanos(3),
+            ),
+            Err(NodeError::Environment("follower read capability unknown"))
+        );
+    }
+
+    #[test]
+    fn trap_follower_read_grant_requires_current_term() {
+        let voters = [NodeId::new(1), NodeId::new(2)].into_iter().collect();
+        let mut follower = Node::new(config(2), voters).expect("follower");
+        follower.raft.role = Role::Follower;
+        follower.raft.hard_state.term = Term::new(2);
+        follower.raft.leader_id = Some(NodeId::new(1));
+        follower
+            .observe_peer_capability(NodeId::new(1), SEMANTIC_VERSION_V3, FOLLOWER_READ_FEATURE)
+            .expect("capability");
+        follower
+            .request_follower_read(
+                ClientId::new(7),
+                9,
+                KvCommand::Get { key: b"k".to_vec() },
+                Time::from_nanos(1),
+            )
+            .expect("request");
+        let hash = follower
+            .pending_follower_reads
+            .get(&(ClientId::new(7), 9))
+            .expect("pending")
+            .command_hash;
+        follower.accept_follower_read_grant(
+            NodeId::new(1),
+            Term::new(1),
+            9,
+            hash,
+            LogIndex::new(0),
+            Time::from_nanos(5),
+        );
+        assert_eq!(
+            follower
+                .pending_follower_reads
+                .get(&(ClientId::new(7), 9))
+                .expect("pending")
+                .grant,
+            None
+        );
+    }
+
+    #[test]
+    fn trap_follower_read_uses_leader_time_for_ttl() {
+        let voters = [NodeId::new(1), NodeId::new(2)].into_iter().collect();
+        let mut follower = Node::new(config(2), voters).expect("follower");
+        follower.raft.role = Role::Follower;
+        follower.raft.hard_state.term = Term::new(2);
+        follower.raft.leader_id = Some(NodeId::new(1));
+        follower.raft.applied_index = LogIndex::new(1);
+        follower.kv.apply_command_only(
+            LogIndex::new(1),
+            Term::new(2),
+            KvCommand::Set {
+                key: b"ttl".to_vec(),
+                value: b"v".to_vec(),
+                ttl: Some(Duration::from_secs(10)),
+            },
+            Time::from_nanos(0),
+        );
+        follower
+            .observe_peer_capability(NodeId::new(1), SEMANTIC_VERSION_V3, FOLLOWER_READ_FEATURE)
+            .expect("capability");
+        follower
+            .request_follower_read(
+                ClientId::new(7),
+                9,
+                KvCommand::Ttl {
+                    key: b"ttl".to_vec(),
+                },
+                Time::from_nanos(99_000_000_000),
+            )
+            .expect("request");
+        let hash = follower
+            .pending_follower_reads
+            .get(&(ClientId::new(7), 9))
+            .expect("pending")
+            .command_hash;
+        follower.accept_follower_read_grant(
+            NodeId::new(1),
+            Term::new(2),
+            9,
+            hash,
+            LogIndex::new(1),
+            Time::from_nanos(5_000_000_000),
+        );
+        assert!(matches!(
+            follower.drain_pending_follower_reads().as_slice(),
+            [NodeEffect::ReadReply {
+                reply: KvReply::Integer(5),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn trap_default_read_is_leader_read() {
+        let voters = [NodeId::new(1), NodeId::new(2)].into_iter().collect();
+        let mut follower = Node::new(config(2), voters).expect("follower");
+        follower.raft.role = Role::Follower;
+        follower.raft.hard_state.term = Term::new(1);
+        follower.raft.leader_id = Some(NodeId::new(1));
+        assert_eq!(
+            follower.on_input(NodeInput::Read {
+                client: ClientId::new(7),
+                sequence: 1,
+                command: KvCommand::Get { key: b"k".to_vec() },
+                at: Time::from_nanos(1),
+            }),
+            Err(NodeError::Raft(RaftError::NotLeader))
         );
     }
 
@@ -5172,6 +5378,7 @@ mod tests {
             .any(|effect| matches!(effect, NodeEffect::ReadReply { client, .. } if *client == ClientId::new(8))));
     }
 
+    #[cfg(not(feature = "kata05"))]
     #[test]
     fn trap_same_sequence_different_command_never_mutates() {
         let mut sessions = SessionTable::default();
@@ -5203,6 +5410,37 @@ mod tests {
         );
         assert_eq!(conflict, KvReply::Error(KvError::SequenceConflict));
         assert_eq!(mutations, 1);
+    }
+
+    #[cfg(feature = "kata05")]
+    #[test]
+    fn trap_kata_05_session_dedup_is_found_within_budget() {
+        let mut sessions = SessionTable::default();
+        let key = SessionKey::new(SessionNamespace::UserRequest as u8, ClientId::new(7))
+            .expect("session key");
+        let first = sessions.apply_user(
+            ClusterPolicy::default(),
+            key,
+            1,
+            b"first".to_vec(),
+            Time::from_nanos(1),
+            || KvReply::Ok,
+        );
+        assert_eq!(first, KvReply::Ok);
+
+        let replay = sessions.apply_user(
+            ClusterPolicy::default(),
+            key,
+            1,
+            b"different".to_vec(),
+            Time::from_nanos(2),
+            || KvReply::Error(KvError::InvalidInput),
+        );
+        assert_eq!(
+            replay,
+            KvReply::Ok,
+            "the synthetic defect accepts a different command as a retry"
+        );
     }
 
     fn expiry_leader(with_deadline: bool) -> Node {
@@ -5568,7 +5806,7 @@ mod tests {
     }
 
     #[test]
-    fn trap_batch_dedup_is_one_atomic_session_unit() {
+    fn trap_batch_dedup_is_one_unit() {
         let voters = [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
             .into_iter()
             .collect();
@@ -5629,7 +5867,7 @@ mod tests {
         assert_eq!(
             decode_reply(&node.sessions.records[&session].cached_reply),
             Ok(KvReply::BatchError {
-                failed_index: 1,
+                failed_index: Some(1),
                 error: KvError::NotNumeric,
             })
         );
@@ -5638,7 +5876,7 @@ mod tests {
     }
 
     #[test]
-    fn trap_batch_respects_size_caps_before_proposal() {
+    fn trap_batch_respects_size_caps() {
         let voters = [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
             .into_iter()
             .collect();
@@ -5658,6 +5896,81 @@ mod tests {
         });
         assert_eq!(result, Err(NodeError::Kv(KvError::TooLarge)));
         assert!(node.raft.log.is_empty());
+    }
+
+    #[test]
+    fn trap_empty_batch_does_not_consume_session_sequence() {
+        let voters = [NodeId::new(1)].into_iter().collect();
+        let mut node = Node::new(config(1), voters).expect("node");
+        restore_atomic_batch_feature(&mut node);
+        node.raft.role = Role::Leader;
+        node.raft.hard_state.term = Term::new(1);
+        let result = node.on_input(NodeInput::ClientRequest {
+            client: ClientId::new(8),
+            sequence: 7,
+            command: KvCommand::Batch {
+                commands: Vec::new(),
+            },
+            leader_time: Time::from_nanos(1),
+        });
+        assert_eq!(result, Err(NodeError::Kv(KvError::InvalidInput)));
+        assert!(node.raft.log.is_empty());
+        let session = SessionKey::new(SessionNamespace::UserRequest as u8, ClientId::new(8))
+            .expect("session");
+        assert!(!node.sessions.records.contains_key(&session));
+    }
+
+    #[test]
+    fn trap_batch_activation_requires_every_learner_capability() {
+        let voters = [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+            .into_iter()
+            .collect();
+        let mut node = Node::new(config(1), voters).expect("node");
+        node.raft.role = Role::Leader;
+        node.raft.hard_state.term = Term::new(1);
+        node.raft.learners.insert(NodeId::new(4));
+        for peer in [2, 3] {
+            node.observe_peer_capability(
+                NodeId::new(peer),
+                SEMANTIC_VERSION_V3,
+                cc_env::FEATURE_ATOMIC_BATCH,
+            )
+            .expect("voter capability");
+        }
+        let session = SessionKey::new(SessionNamespace::AdminRequest as u8, ClientId::new(90))
+            .expect("admin session");
+        let activate = || ConfigOperation::ActivateFeature {
+            feature: cc_core::ATOMIC_BATCH_FEATURE,
+        };
+        assert_eq!(
+            node.admin_request(
+                Time::from_nanos(1),
+                ClientId::new(9),
+                1,
+                session,
+                1,
+                activate(),
+            ),
+            Err(NodeError::FeatureDisabled)
+        );
+        assert!(node.raft.log.is_empty());
+        node.observe_peer_capability(
+            NodeId::new(4),
+            SEMANTIC_VERSION_V3,
+            cc_env::FEATURE_ATOMIC_BATCH,
+        )
+        .expect("learner capability");
+        assert!(
+            node.admin_request(
+                Time::from_nanos(2),
+                ClientId::new(9),
+                2,
+                session,
+                1,
+                activate(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -5782,8 +6095,10 @@ mod tests {
 
     #[test]
     fn trap_full_session_table_still_answers_duplicate() {
-        let mut policy = ClusterPolicy::default();
-        policy.max_sessions = 1;
+        let policy = ClusterPolicy {
+            max_sessions: 1,
+            ..ClusterPolicy::default()
+        };
         let mut sessions = SessionTable::default();
         let key = SessionKey::new(SessionNamespace::UserRequest as u8, ClientId::new(9))
             .expect("session");
@@ -5818,8 +6133,10 @@ mod tests {
 
     #[test]
     fn trap_active_session_is_never_evicted() {
-        let mut policy = ClusterPolicy::default();
-        policy.max_sessions = 1;
+        let policy = ClusterPolicy {
+            max_sessions: 1,
+            ..ClusterPolicy::default()
+        };
         let mut sessions = SessionTable::default();
         let first =
             SessionKey::new(SessionNamespace::UserRequest as u8, ClientId::new(1)).expect("first");
@@ -5853,9 +6170,11 @@ mod tests {
 
     #[test]
     fn trap_session_byte_limit_counts_request_and_reply() {
-        let mut policy = ClusterPolicy::default();
-        policy.max_session_bytes = 7;
-        policy.max_reply_bytes = 4;
+        let policy = ClusterPolicy {
+            max_session_bytes: 7,
+            max_reply_bytes: 4,
+            ..ClusterPolicy::default()
+        };
         let mut sessions = SessionTable::default();
         let key = SessionKey::new(SessionNamespace::UserRequest as u8, ClientId::new(1))
             .expect("session");
@@ -5877,8 +6196,10 @@ mod tests {
 
     #[test]
     fn trap_session_table_is_bounded() {
-        let mut policy = ClusterPolicy::default();
-        policy.max_sessions = 2;
+        let policy = ClusterPolicy {
+            max_sessions: 2,
+            ..ClusterPolicy::default()
+        };
         let mut sessions = SessionTable::default();
         for client in 1..=3 {
             let key = SessionKey::new(SessionNamespace::UserRequest as u8, ClientId::new(client))
@@ -5905,9 +6226,11 @@ mod tests {
 
     #[test]
     fn trap_pending_admin_workflow_session_cannot_expire() {
-        let mut policy = ClusterPolicy::default();
-        policy.session_idle_ns = 10;
-        policy.session_retry_grace_ns = 5;
+        let policy = ClusterPolicy {
+            session_idle_ns: 10,
+            session_retry_grace_ns: 5,
+            ..ClusterPolicy::default()
+        };
         let mut sessions = SessionTable::default();
         let key = SessionKey::new(SessionNamespace::AdminRequest as u8, ClientId::new(11))
             .expect("admin session");
@@ -5936,8 +6259,10 @@ mod tests {
 
     #[test]
     fn trap_expired_membership_request_cannot_restart_transition() {
-        let mut policy = ClusterPolicy::default();
-        policy.session_idle_ns = 10;
+        let policy = ClusterPolicy {
+            session_idle_ns: 10,
+            ..ClusterPolicy::default()
+        };
         let key = SessionKey::new(SessionNamespace::AdminRequest as u8, ClientId::new(12))
             .expect("admin session");
         let command = ConfigEnvelope {
