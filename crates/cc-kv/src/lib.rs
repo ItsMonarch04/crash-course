@@ -206,7 +206,7 @@ pub enum KvReply {
     /// A failed batch publishes nothing; the zero-based index identifies the
     /// subcommand that made the complete transition abort.
     BatchError {
-        failed_index: u32,
+        failed_index: Option<u32>,
         error: KvError,
     },
     Ok,
@@ -775,7 +775,7 @@ impl Kv {
                 Ok(reply) => replies.push(reply),
                 Err(error) => {
                     return Ok(KvReply::BatchError {
-                        failed_index: u32::try_from(index).expect("bounded batch index"),
+                        failed_index: Some(u32::try_from(index).expect("bounded batch index")),
                         error,
                     });
                 }
@@ -784,7 +784,7 @@ impl Kv {
         let reply = KvReply::Batch(replies);
         if encode_reply(&reply).len() as u64 > max_batch_reply_bytes {
             return Ok(KvReply::BatchError {
-                failed_index: 0,
+                failed_index: None,
                 error: KvError::TooLarge,
             });
         }
@@ -1233,7 +1233,8 @@ pub fn encode_reply(reply: &KvReply) -> Vec<u8> {
     );
     match reply {
         KvReply::Batch(replies) => {
-            enc.u8(8);
+            enc.u8(7);
+            enc.u8(1);
             enc.u32(u32::try_from(replies.len()).expect("batch reply count fits u32"));
             for reply in replies {
                 enc.bytes(&encode_reply(reply));
@@ -1243,9 +1244,19 @@ pub fn encode_reply(reply: &KvReply) -> Vec<u8> {
             failed_index,
             error,
         } => {
-            enc.u8(9);
-            enc.u32(*failed_index);
-            enc.u8(error_tag(error));
+            enc.u8(7);
+            enc.u8(0);
+            match failed_index {
+                Some(index) => {
+                    enc.u8(1);
+                    enc.u32(*index);
+                }
+                None => {
+                    enc.u8(0);
+                    enc.u32(0);
+                }
+            }
+            enc.bytes(&encode_reply(&KvReply::Error(error.clone())));
         }
         KvReply::Ok => enc.u8(1),
         KvReply::Value(value) => {
@@ -1298,9 +1309,7 @@ pub fn decode_reply(bytes: &[u8]) -> Result<KvReply, KvError> {
     let mut dec = Dec::new(&bytes[..body_len]);
     let version = decode_version(&mut dec, REPLY_MAGIC)?;
     let tag = dec.u8()?;
-    if (version == SNAPSHOT_VERSION && matches!(tag, 8 | 9))
-        || (version == BATCH_VERSION && !matches!(tag, 8 | 9))
-    {
+    if version == BATCH_VERSION && tag != 7 {
         return Err(KvError::Decode(DecodeError::InvalidTag {
             offset: dec.position().saturating_sub(1),
             tag,
@@ -1328,11 +1337,26 @@ pub fn decode_reply(bytes: &[u8]) -> Result<KvReply, KvError> {
             }
             KvReply::Scan(items)
         }
-        7 => KvReply::Error(error_from_tag(dec.u8()?)?),
-        8 if version == BATCH_VERSION => {
+        7 if version == SNAPSHOT_VERSION => KvReply::Error(error_from_tag(dec.u8()?)?),
+        7 if version == BATCH_VERSION => decode_batch_reply(&mut dec)?,
+        tag => {
+            return Err(KvError::Decode(DecodeError::InvalidTag {
+                offset: dec.position().saturating_sub(1),
+                tag,
+            }));
+        }
+    };
+    dec.finish()?;
+    Ok(reply)
+}
+
+fn decode_batch_reply(dec: &mut Dec<'_>) -> Result<KvReply, KvError> {
+    match dec.u8()? {
+        1 => {
             let count = dec.u32()?;
             let max_by_remaining = dec.remaining() / 4;
-            if usize::try_from(count).unwrap_or(usize::MAX) > MAX_BATCH_COMMANDS
+            if count == 0
+                || usize::try_from(count).unwrap_or(usize::MAX) > MAX_BATCH_COMMANDS
                 || usize::try_from(count).unwrap_or(usize::MAX) > max_by_remaining
             {
                 return Err(KvError::Decode(DecodeError::LengthTooLarge {
@@ -1349,21 +1373,27 @@ pub fn decode_reply(bytes: &[u8]) -> Result<KvReply, KvError> {
                 }
                 replies.push(reply);
             }
-            KvReply::Batch(replies)
+            Ok(KvReply::Batch(replies))
         }
-        9 if version == BATCH_VERSION => KvReply::BatchError {
-            failed_index: dec.u32()?,
-            error: error_from_tag(dec.u8()?)?,
-        },
-        tag => {
-            return Err(KvError::Decode(DecodeError::InvalidTag {
-                offset: dec.position().saturating_sub(1),
-                tag,
-            }));
+        0 => {
+            let has_index = decode_bool(dec)?;
+            let index = dec.u32()?;
+            if (!has_index && index != 0)
+                || (has_index && usize::try_from(index).unwrap_or(usize::MAX) >= MAX_BATCH_COMMANDS)
+            {
+                return Err(KvError::InvalidInput);
+            }
+            let error = match decode_reply(&dec.bytes()?)? {
+                KvReply::Error(error) => error,
+                _ => return Err(KvError::InvalidInput),
+            };
+            Ok(KvReply::BatchError {
+                failed_index: has_index.then_some(index),
+                error,
+            })
         }
-    };
-    dec.finish()?;
-    Ok(reply)
+        _ => Err(KvError::InvalidInput),
+    }
 }
 
 fn decode_version(dec: &mut Dec<'_>, expected_magic: u32) -> Result<u16, KvError> {
@@ -1392,7 +1422,10 @@ pub fn validate_batch(
     max_commands: u32,
     max_bytes: u64,
 ) -> Result<(), KvError> {
-    if commands.is_empty() || commands.len() > usize::try_from(max_commands).unwrap_or(usize::MAX) {
+    if commands.is_empty() {
+        return Err(KvError::InvalidInput);
+    }
+    if commands.len() > usize::try_from(max_commands).unwrap_or(usize::MAX) {
         return Err(KvError::TooLarge);
     }
     // CCKV header, tag, and count are part of the policy charge too. Each
@@ -2022,7 +2055,7 @@ mod tests {
         assert_eq!(
             reply,
             KvReply::BatchError {
-                failed_index: 1,
+                failed_index: Some(1),
                 error: KvError::NotNumeric,
             }
         );
@@ -2032,7 +2065,7 @@ mod tests {
     }
 
     #[test]
-    fn trap_batch_reads_see_prior_subcommands_and_round_trip_as_v3() {
+    fn trap_batch_reads_see_prior_subcommands() {
         let mut kv = kv();
         let command = KvCommand::Batch {
             commands: vec![
@@ -2068,6 +2101,76 @@ mod tests {
     }
 
     #[test]
+    fn trap_batch_failure_reports_the_failing_index() {
+        let mut kv = kv();
+        let at = Time::from_nanos(50);
+        let reply = kv.apply_command_only(
+            LogIndex::new(1),
+            Term::new(1),
+            KvCommand::Batch {
+                commands: vec![
+                    KvCommand::Set {
+                        key: b"n".to_vec(),
+                        value: b"not-numeric".to_vec(),
+                        ttl: None,
+                    },
+                    KvCommand::Get { key: b"n".to_vec() },
+                    KvCommand::Incr {
+                        key: b"n".to_vec(),
+                        delta: 1,
+                    },
+                ],
+            },
+            at,
+        );
+        assert_eq!(
+            reply,
+            KvReply::BatchError {
+                failed_index: Some(2),
+                error: KvError::NotNumeric,
+            }
+        );
+        assert_eq!(kv.store.get(b"n", None), None);
+    }
+
+    #[test]
+    fn trap_batch_ttl_uses_one_timestamp() {
+        let mut kv = kv();
+        let at = Time::from_nanos(5_000_000_000);
+        let reply = kv.apply_command_only(
+            LogIndex::new(1),
+            Term::new(1),
+            KvCommand::Batch {
+                commands: vec![
+                    KvCommand::Set {
+                        key: b"a".to_vec(),
+                        value: b"v".to_vec(),
+                        ttl: Some(Duration::from_secs(3)),
+                    },
+                    KvCommand::Set {
+                        key: b"b".to_vec(),
+                        value: b"v".to_vec(),
+                        ttl: Some(Duration::from_secs(3)),
+                    },
+                    KvCommand::Ttl { key: b"a".to_vec() },
+                    KvCommand::Ttl { key: b"b".to_vec() },
+                ],
+            },
+            at,
+        );
+        assert_eq!(
+            reply,
+            KvReply::Batch(vec![
+                KvReply::Ok,
+                KvReply::Ok,
+                KvReply::Integer(3),
+                KvReply::Integer(3),
+            ])
+        );
+        assert_eq!(kv.ttl.get(b"a".as_slice()), kv.ttl.get(b"b".as_slice()));
+    }
+
+    #[test]
     fn golden_cckv_batch_v3() {
         let command = KvCommand::Batch {
             commands: vec![
@@ -2095,14 +2198,42 @@ mod tests {
     fn golden_cckr_batch_reply_v3() {
         let reply = KvReply::Batch(vec![KvReply::Ok, KvReply::Integer(7)]);
         let bytes = encode_reply(&reply);
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            "43434b5203000701020000000b00000043434b520100010ca81a2c1300000043434b520100030700000000000000e990ebdbc43ba1c2"
+        );
         assert_eq!(&bytes[..4], b"CCKR");
         assert_eq!(&bytes[4..6], &BATCH_VERSION.to_le_bytes());
-        assert_eq!(bytes[6], 8);
+        assert_eq!(bytes[6], 7);
         assert_eq!(decode_reply(&bytes), Ok(reply));
     }
 
     #[test]
-    fn trap_nested_and_oversized_batches_are_rejected_before_publish() {
+    fn trap_batch_reply_flags_are_canonical() {
+        let mut invalid_success = encode_reply(&KvReply::Batch(vec![KvReply::Ok]));
+        invalid_success[7] = 2;
+        let crc = cc_core::crc32c_zeroed_tail(&invalid_success);
+        let tail = invalid_success.len() - 4;
+        invalid_success[tail..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode_reply(&invalid_success), Err(KvError::InvalidInput));
+
+        let mut hidden_index = encode_reply(&KvReply::BatchError {
+            failed_index: None,
+            error: KvError::TooLarge,
+        });
+        hidden_index[9..13].copy_from_slice(&1_u32.to_le_bytes());
+        let crc = cc_core::crc32c_zeroed_tail(&hidden_index);
+        let tail = hidden_index.len() - 4;
+        hidden_index[tail..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode_reply(&hidden_index), Err(KvError::InvalidInput));
+    }
+
+    #[test]
+    fn trap_nested_batch_is_rejected() {
         let nested = KvCommand::Batch {
             commands: vec![KvCommand::Batch {
                 commands: vec![KvCommand::Ping],
@@ -2112,7 +2243,10 @@ mod tests {
             decode_command(&encode_command(&nested)),
             Err(KvError::InvalidInput)
         );
+    }
 
+    #[test]
+    fn trap_oversized_batch_reply_aborts_before_publish() {
         let mut kv = kv();
         let reply = kv.apply_command_only_with_batch_limits(
             LogIndex::new(1),
@@ -2135,7 +2269,7 @@ mod tests {
         assert_eq!(
             reply,
             KvReply::BatchError {
-                failed_index: 0,
+                failed_index: None,
                 error: KvError::TooLarge,
             }
         );

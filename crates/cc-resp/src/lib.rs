@@ -208,6 +208,9 @@ pub enum ClientCommand {
     Multi,
     Exec,
     Discard,
+    /// One atomic command group. The wire form is `BATCH` followed by one
+    /// nested RESP array whose children are ordinary command arrays.
+    Batch(Vec<ClientCommand>),
     Ping,
     Echo(Vec<u8>),
     Set {
@@ -283,6 +286,47 @@ pub fn parse_command(value: RespValue) -> Result<ClientCommand, RespError> {
     let RespValue::Array(values) = value else {
         return Err(RespError::Protocol("command must be an array"));
     };
+    if values
+        .first()
+        .and_then(resp_argument)
+        .is_some_and(|command| command.eq_ignore_ascii_case(b"BATCH"))
+    {
+        return parse_batch_command(values);
+    }
+    if values.len() == 5
+        && values
+            .first()
+            .and_then(resp_argument)
+            .is_some_and(|command| command.eq_ignore_ascii_case(b"CC.REQUEST"))
+        && values
+            .get(3)
+            .and_then(resp_argument)
+            .is_some_and(|command| command.eq_ignore_ascii_case(b"BATCH"))
+    {
+        let client = parse_u64(
+            values
+                .get(1)
+                .and_then(resp_argument)
+                .ok_or(RespError::Protocol("CC.REQUEST client must be a string"))?,
+        )?;
+        let sequence = parse_u64(
+            values
+                .get(2)
+                .and_then(resp_argument)
+                .ok_or(RespError::Protocol("CC.REQUEST sequence must be a string"))?,
+        )?;
+        let commands = parse_batch_children(
+            values
+                .into_iter()
+                .nth(4)
+                .ok_or(RespError::Protocol("BATCH requires a nested array"))?,
+        )?;
+        return Ok(ClientCommand::Request {
+            client,
+            sequence,
+            command: Box::new(ClientCommand::Batch(commands)),
+        });
+    }
     let args: Vec<Vec<u8>> = values
         .into_iter()
         .map(|value| match value {
@@ -294,6 +338,32 @@ pub fn parse_command(value: RespValue) -> Result<ClientCommand, RespError> {
         })
         .collect::<Result<_, _>>()?;
     parse_args(args)
+}
+
+fn resp_argument(value: &RespValue) -> Option<&[u8]> {
+    match value {
+        RespValue::Bulk(Some(bytes)) => Some(bytes),
+        RespValue::Simple(text) => Some(text.as_bytes()),
+        _ => None,
+    }
+}
+
+fn parse_batch_command(mut values: Vec<RespValue>) -> Result<ClientCommand, RespError> {
+    if values.len() != 2 {
+        return Err(RespError::Protocol(
+            "BATCH requires exactly one nested command array",
+        ));
+    }
+    Ok(ClientCommand::Batch(parse_batch_children(
+        values.remove(1),
+    )?))
+}
+
+fn parse_batch_children(value: RespValue) -> Result<Vec<ClientCommand>, RespError> {
+    let RespValue::Array(children) = value else {
+        return Err(RespError::Protocol("BATCH commands must be a nested array"));
+    };
+    children.into_iter().map(parse_command).collect()
 }
 
 fn parse_args(args: Vec<Vec<u8>>) -> Result<ClientCommand, RespError> {
@@ -718,6 +788,80 @@ mod tests {
                 RespValue::Bulk(Some(b"extra".to_vec())),
             ])),
             Ok(ClientCommand::Unknown(_))
+        ));
+    }
+
+    #[test]
+    fn batch_uses_one_nested_array_and_preserves_subcommands() {
+        let nested = RespValue::Array(vec![
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"SET".to_vec())),
+                RespValue::Bulk(Some(b"k".to_vec())),
+                RespValue::Bulk(Some(b"v".to_vec())),
+            ]),
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"GET".to_vec())),
+                RespValue::Bulk(Some(b"k".to_vec())),
+            ]),
+        ]);
+        let batch = parse_command(RespValue::Array(vec![
+            RespValue::Bulk(Some(b"BATCH".to_vec())),
+            nested.clone(),
+        ]))
+        .expect("one-shot batch");
+        assert_eq!(
+            batch,
+            ClientCommand::Batch(vec![
+                ClientCommand::Set {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                    ttl: None,
+                    nx: false,
+                    xx: false,
+                },
+                ClientCommand::Get(b"k".to_vec()),
+            ])
+        );
+        assert_eq!(
+            parse_command(RespValue::Array(vec![
+                RespValue::Bulk(Some(b"CC.REQUEST".to_vec())),
+                RespValue::Bulk(Some(b"7".to_vec())),
+                RespValue::Bulk(Some(b"9".to_vec())),
+                RespValue::Bulk(Some(b"BATCH".to_vec())),
+                nested,
+            ])),
+            Ok(ClientCommand::Request {
+                client: 7,
+                sequence: 9,
+                command: Box::new(ClientCommand::Batch(vec![
+                    ClientCommand::Set {
+                        key: b"k".to_vec(),
+                        value: b"v".to_vec(),
+                        ttl: None,
+                        nx: false,
+                        xx: false,
+                    },
+                    ClientCommand::Get(b"k".to_vec()),
+                ])),
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_batch_shape_is_rejected_before_execution() {
+        assert!(matches!(
+            parse_command(RespValue::Array(vec![
+                RespValue::Bulk(Some(b"BATCH".to_vec())),
+                RespValue::Bulk(Some(b"SET k v".to_vec())),
+            ])),
+            Err(RespError::Protocol(_))
+        ));
+        assert!(matches!(
+            parse_command(RespValue::Array(vec![
+                RespValue::Bulk(Some(b"BATCH".to_vec())),
+                RespValue::Array(vec![RespValue::Bulk(Some(b"SET".to_vec()))]),
+            ])),
+            Err(RespError::Protocol(_))
         ));
     }
 

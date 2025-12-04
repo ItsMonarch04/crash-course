@@ -493,8 +493,13 @@ fn encode_record(record: &DurableRecord) -> Result<Vec<u8>, LogError> {
             if entry.index.get() == 0 {
                 return Err(LogError::Invalid("zero append index"));
             }
-            enc.u8(3);
-            encode_entry(&mut enc, entry)?;
+            if matches!(entry.kind, EntryKind::AppV3 | EntryKind::ConfigV3) {
+                enc.u8(7);
+                encode_entry_v3(&mut enc, entry)?;
+            } else {
+                enc.u8(3);
+                encode_entry(&mut enc, entry)?;
+            }
         }
         DurableRecord::Truncate { from } => {
             if from.get() == 0 {
@@ -599,6 +604,7 @@ fn decode_record(bytes: &[u8]) -> Result<DurableRecord, LogError> {
                 crc32c: dec.u32()?,
             })
         }
+        7 => DurableRecord::Append(decode_entry_v3(&mut dec)?),
         tag => return Err(LogError::InvalidTag(tag)),
     };
     dec.finish()?;
@@ -627,6 +633,44 @@ fn decode_entry(dec: &mut Dec<'_>) -> Result<Entry, LogError> {
         2 => EntryKind::Noop,
         3 => EntryKind::Config,
         tag => return Err(LogError::InvalidTag(tag)),
+    };
+    Ok(Entry {
+        term,
+        index,
+        kind,
+        payload: dec.bytes()?,
+    })
+}
+
+fn encode_entry_v3(enc: &mut Enc, entry: &Entry) -> Result<(), LogError> {
+    if entry.payload.len() > cc_core::MAX_CODEC_BYTES {
+        return Err(LogError::Invalid("entry payload too large"));
+    }
+    let (required_features, kind) = match entry.kind {
+        EntryKind::AppV3 => (cc_core::ATOMIC_BATCH_FEATURE, EntryKind::App),
+        EntryKind::ConfigV3 => (0, EntryKind::Config),
+        _ => return Err(LogError::Invalid("v3 entry kind")),
+    };
+    enc.u64(entry.term.get());
+    enc.u64(entry.index.get());
+    enc.u16(cc_raft::SEMANTIC_VERSION_V3);
+    enc.u64(required_features);
+    enc.u8(kind as u8);
+    enc.bytes(&entry.payload);
+    Ok(())
+}
+
+fn decode_entry_v3(dec: &mut Dec<'_>) -> Result<Entry, LogError> {
+    let term = Term::new(dec.u64()?);
+    let index = LogIndex::new(dec.u64()?);
+    if index.get() == 0 || dec.u16()? != cc_raft::SEMANTIC_VERSION_V3 {
+        return Err(LogError::Invalid("v3 entry header"));
+    }
+    let required_features = dec.u64()?;
+    let kind = match (dec.u8()?, required_features) {
+        (1, cc_core::ATOMIC_BATCH_FEATURE) => EntryKind::AppV3,
+        (3, 0) => EntryKind::ConfigV3,
+        _ => return Err(LogError::Invalid("v3 entry requirements")),
     };
     Ok(Entry {
         term,

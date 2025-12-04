@@ -4,6 +4,9 @@
 #![forbid(unsafe_code)]
 #![doc = "Sans-IO Raft core: deterministic elections, replication, and read barriers."]
 
+#[cfg(all(feature = "kata01", feature = "kata02"))]
+compile_error!("kata features are mutually exclusive");
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -73,6 +76,20 @@ pub enum EntryKind {
     App = 1,
     Noop = 2,
     Config = 3,
+    AppV3 = 4,
+    ConfigV3 = 5,
+}
+
+impl EntryKind {
+    #[must_use]
+    pub const fn is_app(self) -> bool {
+        matches!(self, Self::App | Self::AppV3)
+    }
+
+    #[must_use]
+    pub const fn is_config(self) -> bool {
+        matches!(self, Self::Config | Self::ConfigV3)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -524,20 +541,33 @@ impl RaftNode {
                 .match_index
                 .get(&transfer.target)
                 .is_some_and(|index| *index >= transfer.intent_index))
-        .then(|| {
-            RaftEffect::Send(Message {
-                proto_version: PROTOCOL_VERSION,
-                from: self.id,
-                to: transfer.target,
-                term: self.hard_state.term,
-                kind: MessageKind::TimeoutNow {
-                    intent_index: transfer.intent_index,
-                },
-            })
-        })
+        .then_some(RaftEffect::Send(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: self.id,
+            to: transfer.target,
+            term: self.hard_state.term,
+            kind: MessageKind::TimeoutNow {
+                intent_index: transfer.intent_index,
+            },
+        }))
     }
 
     pub fn propose(&mut self, payload: Vec<u8>) -> Result<Vec<RaftEffect>, RaftError> {
+        self.propose_with_kind(payload, EntryKind::App)
+    }
+
+    pub fn propose_v3_batch(&mut self, payload: Vec<u8>) -> Result<Vec<RaftEffect>, RaftError> {
+        if self.active_features & cc_core::ATOMIC_BATCH_FEATURE == 0 {
+            return Err(RaftError::Busy);
+        }
+        self.propose_with_kind(payload, EntryKind::AppV3)
+    }
+
+    fn propose_with_kind(
+        &mut self,
+        payload: Vec<u8>,
+        kind: EntryKind,
+    ) -> Result<Vec<RaftEffect>, RaftError> {
         if self.role != Role::Leader {
             return Err(RaftError::NotLeader);
         }
@@ -555,7 +585,7 @@ impl RaftNode {
         let entry = Entry {
             term: self.hard_state.term,
             index: LogIndex::new(self.last_index().get() + 1),
-            kind: EntryKind::App,
+            kind,
             payload,
         };
         self.log.push(entry.clone());
@@ -737,7 +767,7 @@ impl RaftNode {
     /// membership projection remains separate; this method intentionally runs
     /// only from a Raft `Apply` effect.
     pub fn apply_committed_config(&mut self, entry: &Entry) -> Result<Vec<RaftEffect>, RaftError> {
-        if entry.kind != EntryKind::Config {
+        if !entry.kind.is_config() {
             return Err(RaftError::InvalidMessage);
         }
         let envelope =
@@ -823,10 +853,15 @@ impl RaftNode {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
+        let kind = if matches!(&envelope.operation, ConfigOperation::ActivateFeature { .. }) {
+            EntryKind::ConfigV3
+        } else {
+            EntryKind::Config
+        };
         let entry = Entry {
             term: self.hard_state.term,
             index: LogIndex::new(self.last_index().get().saturating_add(1)),
-            kind: EntryKind::Config,
+            kind,
             payload: envelope.encode(),
         };
         let terminal_index = entry.index;
@@ -1447,6 +1482,12 @@ impl RaftNode {
             effects.push(RaftEffect::PersistHard(self.hard_state));
             self.reset_election(now);
         }
+        #[cfg(feature = "kata02")]
+        if !granted {
+            // Synthetic teaching defect: even a denied vote request postpones
+            // the local election.
+            self.reset_election(now);
+        }
         effects.push(RaftEffect::Send(Message {
             proto_version: PROTOCOL_VERSION,
             from: self.id,
@@ -1586,15 +1627,14 @@ impl RaftNode {
                 .and_then(|candidate| ConfigEnvelope::decode(&candidate.payload).ok())
             && matches!(enter.operation, ConfigOperation::EnterJoint { .. })
             && enter.admin_session.is_some()
-        {
-            if let Ok(finish) = self.append_config(ConfigEnvelope {
+            && let Ok(finish) = self.append_config(ConfigEnvelope {
                 admin_session: enter.admin_session,
                 leader_time: enter.leader_time,
                 operation: ConfigOperation::LeaveJoint { enter_index },
-            }) {
-                effects.extend(finish);
-                return effects;
-            }
+            })
+        {
+            effects.extend(finish);
+            return effects;
         }
         // A committed transfer intent belongs to the cluster, not the old
         // leader.  The first leader elected afterwards makes the terminal
@@ -1703,7 +1743,7 @@ impl RaftNode {
                 ));
                 return effects;
             }
-            if entry.kind == EntryKind::Config && self.apply_config_on_append(&entry).is_err() {
+            if entry.kind.is_config() && self.apply_config_on_append(&entry).is_err() {
                 // Do not retain an entry whose append-time configuration
                 // projection is invalid.  Keeping it would make later
                 // recovery derive a membership that was never acknowledged.
@@ -2040,7 +2080,16 @@ impl RaftNode {
     }
 
     fn majority(&self) -> usize {
-        self.voters.len() / 2 + 1
+        #[cfg(feature = "kata01")]
+        {
+            // Synthetic teaching defect: even-sized configurations commit
+            // with exactly half of the voters.
+            self.voters.len() / 2
+        }
+        #[cfg(not(feature = "kata01"))]
+        {
+            self.voters.len() / 2 + 1
+        }
     }
 
     fn commit_quorum(&self, candidate: u64) -> bool {
@@ -2173,7 +2222,7 @@ impl RaftNode {
                 if feature != cc_core::ATOMIC_BATCH_FEATURE
                     || self.active_features & feature != 0
                     || self.log.iter().any(|prior| {
-                        prior.kind == EntryKind::Config
+                        prior.kind.is_config()
                             && ConfigEnvelope::decode(&prior.payload).is_ok_and(|envelope| {
                                 matches!(
                                     envelope.operation,
@@ -2202,7 +2251,7 @@ impl RaftNode {
             .log
             .clone()
             .iter()
-            .filter(|entry| entry.kind == EntryKind::Config)
+            .filter(|entry| entry.kind.is_config())
         {
             let Ok(envelope) = ConfigEnvelope::decode(&entry.payload) else {
                 break;
@@ -2273,7 +2322,7 @@ impl RaftNode {
         for entry in self
             .log
             .iter()
-            .filter(|entry| entry.kind == EntryKind::Config && entry.index < index)
+            .filter(|entry| entry.kind.is_config() && entry.index < index)
         {
             let Ok(envelope) = ConfigEnvelope::decode(&entry.payload) else {
                 return true;
@@ -2327,6 +2376,61 @@ impl RaftNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "kata01")]
+    #[test]
+    fn trap_kata_01_commit_quorum_is_found_within_budget() {
+        let voters = [
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+        ]
+        .into_iter()
+        .collect();
+        let node = RaftNode::new(NodeId::new(1), voters, Seed::new(1), RaftConfig::default());
+
+        assert_eq!(
+            node.majority(),
+            2,
+            "the synthetic defect must be observable"
+        );
+    }
+
+    #[cfg(feature = "kata02")]
+    #[test]
+    fn trap_kata_02_wrong_timer_reset_is_found_within_budget() {
+        let mut follower = node(2);
+        follower.hard_state.term = Term::new(1);
+        follower.hard_state.voted_for = Some(NodeId::new(3));
+        let before = follower.election_deadline;
+
+        let effects = follower.on_message_at(
+            Message {
+                proto_version: PROTOCOL_VERSION,
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                term: Term::new(1),
+                kind: MessageKind::VoteReq {
+                    last_index: LogIndex::new(0),
+                    last_term: Term::new(0),
+                },
+            },
+            Time::from_nanos(1_000_000_000),
+        );
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RaftEffect::Send(Message {
+                kind: MessageKind::VoteResp { granted: false },
+                ..
+            })
+        )));
+        assert_ne!(
+            follower.election_deadline, before,
+            "a denied vote exposes the synthetic timer-reset defect"
+        );
+    }
 
     fn voters() -> BTreeSet<NodeId> {
         [NodeId::new(1), NodeId::new(2), NodeId::new(3)]

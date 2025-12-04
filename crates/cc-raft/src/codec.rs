@@ -15,7 +15,8 @@ use crate::{
 pub const CCRP_MAGIC: u32 = u32::from_le_bytes(*b"CCRP");
 pub const CCRP_FORMAT_VERSION: u16 = 1;
 const MAX_ENTRIES: usize = 64;
-const MIN_ENTRY_BYTES: usize = 8 + 8 + 1 + 4;
+const MIN_ENTRY_V2_BYTES: usize = 8 + 8 + 1 + 4;
+const MIN_ENTRY_V3_BYTES: usize = 8 + 8 + 2 + 8 + 1 + 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CodecError {
@@ -96,7 +97,7 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, CodecError> {
                     .map_err(|_| CodecError::TooLarge("entry count"))?,
             );
             for entry in &request.entries {
-                encode_entry(&mut enc, entry)?;
+                encode_entry(&mut enc, entry, message.proto_version)?;
             }
         }
         MessageKind::AppendResp(response) => {
@@ -263,14 +264,19 @@ pub fn decode(bytes: &[u8]) -> Result<Message, CodecError> {
             let read_round = dec.u64()?;
             let count =
                 usize::try_from(dec.u32()?).map_err(|_| CodecError::TooLarge("entry count"))?;
+            let min_entry_bytes = if proto_version >= SEMANTIC_VERSION_V3 {
+                MIN_ENTRY_V3_BYTES
+            } else {
+                MIN_ENTRY_V2_BYTES
+            };
             if count > MAX_ENTRIES
-                || count > bytes.len().saturating_sub(dec.position()) / MIN_ENTRY_BYTES
+                || count > bytes.len().saturating_sub(dec.position()) / min_entry_bytes
             {
                 return Err(CodecError::TooLarge("entry count"));
             }
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
-                entries.push(decode_entry(&mut dec)?);
+                entries.push(decode_entry(&mut dec, proto_version)?);
             }
             MessageKind::AppendReq(AppendRequest {
                 prev_index,
@@ -443,23 +449,38 @@ fn bool(dec: &mut Dec<'_>) -> Result<bool, CodecError> {
         _ => Err(CodecError::Invalid("noncanonical boolean")),
     }
 }
-fn encode_entry(enc: &mut Enc, entry: &Entry) -> Result<(), CodecError> {
+fn encode_entry(enc: &mut Enc, entry: &Entry, semantic: u16) -> Result<(), CodecError> {
     if entry.index.get() == 0 || entry.payload.len() > cc_core::MAX_CODEC_BYTES {
         return Err(CodecError::TooLarge("entry"));
     }
     enc.u64(entry.term.get());
     enc.u64(entry.index.get());
-    enc.u8(entry.kind as u8);
+    let (minimum, required_features, kind) = entry_v3_fields(entry.kind);
+    if semantic >= SEMANTIC_VERSION_V3 {
+        enc.u16(minimum);
+        enc.u64(required_features);
+        enc.u8(kind as u8);
+    } else {
+        if minimum > semantic || required_features != 0 {
+            return Err(CodecError::UnsupportedSemantic(semantic));
+        }
+        enc.u8(kind as u8);
+    }
     enc.bytes(&entry.payload);
     Ok(())
 }
-fn decode_entry(dec: &mut Dec<'_>) -> Result<Entry, CodecError> {
+fn decode_entry(dec: &mut Dec<'_>, semantic: u16) -> Result<Entry, CodecError> {
     let term = Term::new(dec.u64()?);
     let index = LogIndex::new(dec.u64()?);
     if index.get() == 0 {
         return Err(CodecError::Invalid("zero entry index"));
     }
-    let kind = match dec.u8()? {
+    let (minimum, required_features) = if semantic >= SEMANTIC_VERSION_V3 {
+        (dec.u16()?, dec.u64()?)
+    } else {
+        (crate::PROTOCOL_VERSION, 0)
+    };
+    let base_kind = match dec.u8()? {
         1 => EntryKind::App,
         2 => EntryKind::Noop,
         3 => EntryKind::Config,
@@ -470,12 +491,44 @@ fn decode_entry(dec: &mut Dec<'_>) -> Result<Entry, CodecError> {
             }));
         }
     };
+    let kind = decode_entry_kind(base_kind, minimum, required_features)?;
     Ok(Entry {
         term,
         index,
         kind,
         payload: dec.bytes()?,
     })
+}
+
+fn entry_v3_fields(kind: EntryKind) -> (u16, u64, EntryKind) {
+    match kind {
+        EntryKind::App => (crate::PROTOCOL_VERSION, 0, EntryKind::App),
+        EntryKind::Noop => (crate::PROTOCOL_VERSION, 0, EntryKind::Noop),
+        EntryKind::Config => (crate::PROTOCOL_VERSION, 0, EntryKind::Config),
+        EntryKind::AppV3 => (
+            SEMANTIC_VERSION_V3,
+            cc_core::ATOMIC_BATCH_FEATURE,
+            EntryKind::App,
+        ),
+        EntryKind::ConfigV3 => (SEMANTIC_VERSION_V3, 0, EntryKind::Config),
+    }
+}
+
+fn decode_entry_kind(
+    base: EntryKind,
+    minimum: u16,
+    required_features: u64,
+) -> Result<EntryKind, CodecError> {
+    match (base, minimum, required_features) {
+        (EntryKind::App, crate::PROTOCOL_VERSION, 0) => Ok(EntryKind::App),
+        (EntryKind::Noop, crate::PROTOCOL_VERSION, 0) => Ok(EntryKind::Noop),
+        (EntryKind::Config, crate::PROTOCOL_VERSION, 0) => Ok(EntryKind::Config),
+        (EntryKind::App, SEMANTIC_VERSION_V3, cc_core::ATOMIC_BATCH_FEATURE) => {
+            Ok(EntryKind::AppV3)
+        }
+        (EntryKind::Config, SEMANTIC_VERSION_V3, 0) => Ok(EntryKind::ConfigV3),
+        _ => Err(CodecError::Invalid("entry semantic requirements")),
+    }
 }
 
 #[cfg(test)]
