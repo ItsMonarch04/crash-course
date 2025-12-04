@@ -31,14 +31,64 @@ connection route counter.
 TTL deadlines are derived from the leader timestamp in the replicated entry.
 Replica wall clocks and clock skew do not affect visibility. Scan results are
 ordered and snapshot-consistent within one call; cursor pages are independent.
-Multi-key commands are a sequence of independent entries, not an atomic
-transaction. Authentication, authorization, TLS, sharding, and cross-region
-replication are outside this laboratory's core promise.
+
+`MULTI` queues a closed set of batchable RESP commands on one connection;
+`EXEC` submits them as one CCKV v3 batch only after the replicated
+`ATOMIC_BATCH` feature has committed. Every subcommand observes its
+predecessors using the one replicated leader timestamp, and either every
+mutation becomes visible or the complete batch returns a deterministic
+failing-index error without publishing any child mutation. `DISCARD` and a
+connection close drop only the local queue. An empty `EXEC` returns an empty
+array without proposing an entry. There are no interactive transactions, no
+cross-group atomicity, no snapshot isolation, and no `WATCH` optimistic
+concurrency. A plain `MULTI`/`EXEC` exchange has the documented lost-reply
+at-least-once edge; it is not a reconnect-stable `CC.REQUEST` batch envelope.
+
+`READ STALE GET key` is an explicit local observation, returned as
+`["STALE", reply, applied_index, applied_term, read_time, last_contact_ms]`.
+It makes no linearizability or time-bounded freshness claim. `READ FOLLOWER
+GET|TTL` is separately tagged as `["FOLLOWER", reply, read_index,
+applied_index, applied_term, read_time]`. It is admitted only on a current
+v3 `FOLLOWER_READ` CCHL connection; the leader issues its grant after a fresh
+ReadIndex quorum, and the follower waits until that index is locally applied
+before evaluating the command at the leader-supplied timestamp. A missing
+leader, v2/featureless connection, term/config change, or timeout returns
+`TRYAGAIN` with a leader hint instead of labelling local state linearizable.
+
+Authentication, authorization, TLS, sharding, and cross-region replication
+are outside this laboratory's core promise.
 
 The linearizability checker in `cc-checker` tests completed operations and
 branches open timeouts as either taking effect or not taking effect. The
 simulator's invariant checker separately enforces trace order and bounded
 liveness, so a checker `undecided` result is never silently reported as safe.
+
+## Client session guarantees
+
+The checker also reports four client-scoped guarantees over completed,
+sequential, strong-mode `UserRequest` operations. A retry with the same
+`(client, sequence)` is one logical request; failed commands do not establish
+a write, a successful delete establishes nil, and a nil read is an ordinary
+observation. Open/time-out operations, diagnostic final or replica probes,
+stale-local reads, and AdminRequest workflows are outside this report.
+
+- **Read-your-writes:** after a client's acknowledged mutation, its later
+  strong read cannot return the pre-mutation state when no other successful
+  mutation overlaps or intervenes.
+- **Monotonic reads:** two sequential strong reads by one client cannot move
+  between states without an intervening successful mutation that could
+  explain the change.
+- **Monotonic writes:** the request sequence of sequential client mutations
+  cannot regress. An equal sequence is a retry, not a second write.
+- **Writes-follow-reads:** a sequential mutation following a strong read
+  cannot carry a request sequence older than that read.
+
+For a well-formed client whose completed operations are all strong,
+non-diagnostic, sequential in certain real-time order, and included in the
+same history, a `Linearizable` verdict must satisfy all four predicates. The
+campaign runner treats a contradiction as a checker invariant failure. Mixed
+consistency histories are deliberately excluded from that implication rather
+than being falsely condemned.
 
 ## Claim receipts
 

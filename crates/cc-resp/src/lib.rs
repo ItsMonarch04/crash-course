@@ -193,7 +193,21 @@ fn encode_into(value: &RespValue, output: &mut Vec<u8>) {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminOperation {
+    AddLearner { id: u64, peer_address: Vec<u8> },
+    Promote { id: u64 },
+    Remove { id: u64 },
+    UpdateAddress { id: u64, peer_address: Vec<u8> },
+    TransferLeader { id: u64 },
+    LeaveJoint,
+    ActivateAtomicBatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientCommand {
+    Multi,
+    Exec,
+    Discard,
     Ping,
     Echo(Vec<u8>),
     Set {
@@ -204,6 +218,11 @@ pub enum ClientCommand {
         xx: bool,
     },
     Get(Vec<u8>),
+    Cas {
+        key: Vec<u8>,
+        expected: Vec<u8>,
+        value: Vec<u8>,
+    },
     Del(Vec<Vec<u8>>),
     Exists(Vec<u8>),
     IncrBy {
@@ -246,6 +265,16 @@ pub enum ClientCommand {
         sequence: u64,
         command: Box<ClientCommand>,
     },
+    Admin {
+        operator_id: u64,
+        sequence: u64,
+        operation: AdminOperation,
+    },
+    AdminMembers {
+        consistent: bool,
+    },
+    ReadFollower(Box<ClientCommand>),
+    ReadStale(Box<ClientCommand>),
     Info,
     Unknown(Vec<u8>),
 }
@@ -274,10 +303,18 @@ fn parse_args(args: Vec<Vec<u8>>) -> Result<ClientCommand, RespError> {
         .map(u8::to_ascii_uppercase)
         .collect::<Vec<_>>();
     match upper.as_slice() {
+        b"MULTI" if args.len() == 1 => Ok(ClientCommand::Multi),
+        b"EXEC" if args.len() == 1 => Ok(ClientCommand::Exec),
+        b"DISCARD" if args.len() == 1 => Ok(ClientCommand::Discard),
         b"PING" if args.len() == 1 => Ok(ClientCommand::Ping),
         b"ECHO" if args.len() == 2 => Ok(ClientCommand::Echo(args[1].clone())),
         b"SET" if args.len() >= 3 => parse_set(args),
         b"GET" if args.len() == 2 => Ok(ClientCommand::Get(args[1].clone())),
+        b"CAS" if args.len() == 4 => Ok(ClientCommand::Cas {
+            key: args[1].clone(),
+            expected: args[2].clone(),
+            value: args[3].clone(),
+        }),
         b"DEL" if args.len() >= 2 => Ok(ClientCommand::Del(args[1..].to_vec())),
         b"EXISTS" if args.len() == 2 => Ok(ClientCommand::Exists(args[1].clone())),
         b"INCR" if args.len() == 2 => Ok(ClientCommand::IncrBy {
@@ -321,6 +358,87 @@ fn parse_args(args: Vec<Vec<u8>>) -> Result<ClientCommand, RespError> {
             sequence: parse_u64(&args[2])?,
             command: Box::new(parse_args(args[3..].to_vec())?),
         }),
+        b"CC.ADMIN" if args.len() == 6 && args[1].eq_ignore_ascii_case(b"ADDLEARNER") => {
+            Ok(ClientCommand::Admin {
+                operator_id: parse_u64(&args[4])?,
+                sequence: parse_u64(&args[5])?,
+                operation: AdminOperation::AddLearner {
+                    id: parse_u64(&args[2])?,
+                    peer_address: args[3].clone(),
+                },
+            })
+        }
+        b"CC.ADMIN" if args.len() == 5 && args[1].eq_ignore_ascii_case(b"PROMOTE") => {
+            Ok(ClientCommand::Admin {
+                operator_id: parse_u64(&args[3])?,
+                sequence: parse_u64(&args[4])?,
+                operation: AdminOperation::Promote {
+                    id: parse_u64(&args[2])?,
+                },
+            })
+        }
+        b"CC.ADMIN" if args.len() == 5 && args[1].eq_ignore_ascii_case(b"REMOVE") => {
+            Ok(ClientCommand::Admin {
+                operator_id: parse_u64(&args[3])?,
+                sequence: parse_u64(&args[4])?,
+                operation: AdminOperation::Remove {
+                    id: parse_u64(&args[2])?,
+                },
+            })
+        }
+        b"CC.ADMIN" if args.len() == 6 && args[1].eq_ignore_ascii_case(b"UPDATEADDRESS") => {
+            Ok(ClientCommand::Admin {
+                operator_id: parse_u64(&args[4])?,
+                sequence: parse_u64(&args[5])?,
+                operation: AdminOperation::UpdateAddress {
+                    id: parse_u64(&args[2])?,
+                    peer_address: args[3].clone(),
+                },
+            })
+        }
+        b"CC.ADMIN" if args.len() == 5 && args[1].eq_ignore_ascii_case(b"TRANSFER") => {
+            Ok(ClientCommand::Admin {
+                operator_id: parse_u64(&args[3])?,
+                sequence: parse_u64(&args[4])?,
+                operation: AdminOperation::TransferLeader {
+                    id: parse_u64(&args[2])?,
+                },
+            })
+        }
+        b"CC.ADMIN" if args.len() == 4 && args[1].eq_ignore_ascii_case(b"LEAVEJOINT") => {
+            Ok(ClientCommand::Admin {
+                operator_id: parse_u64(&args[2])?,
+                sequence: parse_u64(&args[3])?,
+                operation: AdminOperation::LeaveJoint,
+            })
+        }
+        b"CC.ADMIN"
+            if args.len() == 5
+                && args[1].eq_ignore_ascii_case(b"ACTIVATE")
+                && args[2].eq_ignore_ascii_case(b"ATOMIC-BATCH") =>
+        {
+            Ok(ClientCommand::Admin {
+                operator_id: parse_u64(&args[3])?,
+                sequence: parse_u64(&args[4])?,
+                operation: AdminOperation::ActivateAtomicBatch,
+            })
+        }
+        b"CC.ADMIN" if args.len() == 2 && args[1].eq_ignore_ascii_case(b"MEMBERS") => {
+            Ok(ClientCommand::AdminMembers { consistent: false })
+        }
+        b"CC.ADMIN"
+            if args.len() == 3
+                && args[1].eq_ignore_ascii_case(b"MEMBERS")
+                && args[2].eq_ignore_ascii_case(b"CONSISTENT") =>
+        {
+            Ok(ClientCommand::AdminMembers { consistent: true })
+        }
+        b"READ" if args.len() >= 3 && args[1].eq_ignore_ascii_case(b"FOLLOWER") => Ok(
+            ClientCommand::ReadFollower(Box::new(parse_args(args[2..].to_vec())?)),
+        ),
+        b"READ" if args.len() >= 3 && args[1].eq_ignore_ascii_case(b"STALE") => Ok(
+            ClientCommand::ReadStale(Box::new(parse_args(args[2..].to_vec())?)),
+        ),
         b"INFO" if args.len() == 1 => Ok(ClientCommand::Info),
         _ => Ok(ClientCommand::Unknown(
             args.first().cloned().unwrap_or_default(),
@@ -507,6 +625,100 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn admin_membership_controls_are_closed_and_typed() {
+        let command = |parts: &[&[u8]]| {
+            parse_command(RespValue::Array(
+                parts
+                    .iter()
+                    .map(|part| RespValue::Bulk(Some(part.to_vec())))
+                    .collect(),
+            ))
+            .expect("admin command")
+        };
+        assert_eq!(
+            command(&[
+                b"CC.ADMIN",
+                b"ADDLEARNER",
+                b"4",
+                b"127.0.0.1:7204",
+                b"77",
+                b"1",
+            ]),
+            ClientCommand::Admin {
+                operator_id: 77,
+                sequence: 1,
+                operation: AdminOperation::AddLearner {
+                    id: 4,
+                    peer_address: b"127.0.0.1:7204".to_vec(),
+                },
+            }
+        );
+        assert_eq!(
+            command(&[b"CC.ADMIN", b"PROMOTE", b"4", b"77", b"2"]),
+            ClientCommand::Admin {
+                operator_id: 77,
+                sequence: 2,
+                operation: AdminOperation::Promote { id: 4 },
+            }
+        );
+        assert_eq!(
+            command(&[b"CC.ADMIN", b"LEAVEJOINT", b"77", b"3"]),
+            ClientCommand::Admin {
+                operator_id: 77,
+                sequence: 3,
+                operation: AdminOperation::LeaveJoint,
+            }
+        );
+        assert_eq!(
+            command(&[b"CC.ADMIN", b"ACTIVATE", b"ATOMIC-BATCH", b"77", b"4",]),
+            ClientCommand::Admin {
+                operator_id: 77,
+                sequence: 4,
+                operation: AdminOperation::ActivateAtomicBatch,
+            }
+        );
+    }
+
+    #[test]
+    fn read_wrappers_preserve_the_inner_closed_command() {
+        let command = |parts: &[&[u8]]| {
+            parse_command(RespValue::Array(
+                parts
+                    .iter()
+                    .map(|part| RespValue::Bulk(Some(part.to_vec())))
+                    .collect(),
+            ))
+            .expect("read wrapper")
+        };
+        assert_eq!(
+            command(&[b"READ", b"FOLLOWER", b"GET", b"k"]),
+            ClientCommand::ReadFollower(Box::new(ClientCommand::Get(b"k".to_vec()))),
+        );
+        assert_eq!(
+            command(&[b"READ", b"STALE", b"GET", b"k"]),
+            ClientCommand::ReadStale(Box::new(ClientCommand::Get(b"k".to_vec()))),
+        );
+    }
+
+    #[test]
+    fn transaction_controls_are_closed_zero_argument_commands() {
+        let command = |name: &[u8]| {
+            parse_command(RespValue::Array(vec![RespValue::Bulk(Some(name.to_vec()))]))
+                .expect("transaction command")
+        };
+        assert_eq!(command(b"MULTI"), ClientCommand::Multi);
+        assert_eq!(command(b"EXEC"), ClientCommand::Exec);
+        assert_eq!(command(b"DISCARD"), ClientCommand::Discard);
+        assert!(matches!(
+            parse_command(RespValue::Array(vec![
+                RespValue::Bulk(Some(b"MULTI".to_vec())),
+                RespValue::Bulk(Some(b"extra".to_vec())),
+            ])),
+            Ok(ClientCommand::Unknown(_))
+        ));
     }
 
     #[test]

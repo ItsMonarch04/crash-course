@@ -21,6 +21,7 @@ const requiredDocs = [
   "docs/LIMITATIONS.md",
   "docs/formats.md",
   "docs/compatibility.md",
+  "docs/calibration.md",
   "docs/ops.md",
   "docs/sim.md",
   "docs/threat-model.md",
