@@ -21,10 +21,11 @@ narrow.
   claim. See [consistency](consistency.md).
 - `MULTI`/`EXEC` has an all-or-nothing CCKV v3 implementation. Atomic-batch
   admission is fenced by a replicated feature bit that changes only on commit
-  and currently requires every observed member capability. The full
-  mixed-build rolling-upgrade fence—semantic-v3 log-entry metadata and a
-  per-entry CCID reader-floor barrier—is still incomplete. Do not treat the
-  feature as rolling-upgrade-safe yet.
+  and currently requires every observed member capability. Semantic-v3 log
+  entries carry min-semantic/feature metadata; a node fsyncs its CCID reader
+  floor before advertising v3 or acknowledging a v3 entry, and a v2 binary
+  refuses that directory before mutation. Mixed-build rolling upgrade is still
+  an operator-paced membership workflow, not an automatic protocol.
 - `CC.ADMIN ADDLEARNER <id>`, `PROMOTE <id>`, and `LEAVEJOINT` are live
   operator controls and append the matching replicated config transition;
   `ccdb admin add-learner|promote-learner --node-id <id>` follows the current

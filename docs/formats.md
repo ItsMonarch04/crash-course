@@ -86,8 +86,9 @@ Snapshot/EditBatch records. `CCMT` v2 is the atomic pointer
 `magic:u32="CCMT" | version:u16 | generation:u64 |
 manifest_header_crc32c:u32 | meta_crc32c:u32`. The codecs validate table
 ranges, footer checksums, monotonic file/watermark edits, and a torn final
-record prefix. They currently produce a host-neutral publication plan; ccdb
-does not yet execute that plan as persistent Storage v2 authority.
+record prefix. The same codecs drive Storage v2 publication in `ccdb` and the
+simulator: atomic META install, file-backed SST reads, and store-WAL
+authority.
 
 `CCSN` v1 is a logical checkpoint: `magic:u32="CCSN" | version:u16 |
 cluster_id:bytes16 | cluster_policy_hash:u64 | index:u64 | term:u64 |
@@ -103,7 +104,9 @@ with MVCC sequence and optional deadline, then `(namespace, client)`-ordered
 live session and tombstone records. An optional tag-6 record preserves a
 committed leadership-transfer intent as `intent_index`, target, deadline,
 finishing flag, and its exact AdminRequest identity; absent identity fields
-must be canonical zeroes. It rejects duplicate, out-of-order,
+must be canonical zeroes. Installing that checkpoint restores the transfer
+so TimeoutNow and Finish still apply after the Begin entry has been compacted
+out of the log. It rejects duplicate, out-of-order,
 expired, noncanonical, wrong-cluster, and checksum-invalid state before the
 core installs it.
 
@@ -120,7 +123,9 @@ unmarked files are not authority.
 New checkpoint publication is deferred while joint consensus is active and
 while a reachable removed peer has not acknowledged the terminal LeaveJoint.
 The host may still send an older marked checkpoint followed by the retained
-suffix, so catch-up does not compact away an operator workflow identity.
+suffix. A checkpoint that already covers a committed BeginLeaderTransfer
+carries that workflow in its tag-6 record, and install restores it instead of
+relying on the compacted-away log entry.
 
 `CCLR` v1 remains a CRC-protected framed Raft durability record. Tag 5 is a
 locally-created snapshot mark and requires the marked position to exist in the

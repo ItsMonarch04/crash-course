@@ -13,8 +13,9 @@ and the same core runs in three places: inside the deterministic simulator,
 compiled to WebAssembly inside the browser theater, and behind the real
 `ccdb` socket/filesystem adapter. The real adapter drives `cc-host::Driver`,
 uses the same Raft message codec and durability continuations, and performs a
-checked peer hello before it accepts a peer frame. Its storage and snapshot
-work are still intentionally incomplete; the exact boundary is spelled out in
+checked peer hello before it accepts a peer frame. Remaining storage and
+snapshot limits — snapshot transfer resumes from byte zero, and CCBK restore
+creates a fresh cluster identity — are spelled out in
 [limitations](docs/LIMITATIONS.md).
 
 ![The browser theater running a five-node cluster, killing the leader, and
@@ -137,4 +138,4 @@ publishes an altered simulator as a website cannot keep those changes closed.
 
 ---
 
-**Version:** v0.15.14
+**Version:** v0.15.15

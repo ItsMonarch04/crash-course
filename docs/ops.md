@@ -153,7 +153,8 @@ state copy.
 it runs 20 independently port-isolated 3→5 cycles with forced checkpoint
 catch-up, learner promotion, address publication, leader transfer, voter
 removal, terminal-node exit, final probes, and one checked CC-HISTORY per run.
-Set `CC_MEMBERSHIP_RUNS=1..20` only to shorten local diagnosis. The test-only
+Set `CC_MEMBERSHIP_RUNS=1..20` only to shorten local diagnosis. CI runs the
+same 20-cycle command from `.github/workflows/campaigns.yml`. The test-only
 `CCDB_SNAPSHOT_AFTER_BYTES` environment variable lowers the checkpoint trigger
 within this lab; production configuration continues to use bounded host
 defaults.
