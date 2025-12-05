@@ -78,7 +78,7 @@ shows the machinery that catches it.
 
 - [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) — what this does and does not
   prove; read it before interpreting any result
-- [`docs/writeups/`](docs/writeups/) — the nine essays:
+- [`docs/writeups/`](docs/writeups/) — the twelve essays:
   [determinism as a boundary](docs/writeups/01-determinism.md),
   [fsync and the page cache](docs/writeups/02-fsync-page-cache.md),
   [Raft traps worth naming](docs/writeups/03-raft-traps.md),
@@ -87,11 +87,16 @@ shows the machinery that catches it.
   [membership as a two-quorum story](docs/writeups/06-membership.md),
   [benchmarking without theater](docs/writeups/07-benchmark-honesty.md),
   [the flight recorder](docs/writeups/08-theater.md), and
-  [exporting the determinism perimeter](docs/writeups/09-determinism-lint.md)
+  [exporting the determinism perimeter](docs/writeups/09-determinism-lint.md),
+  [the storage engine that finally wrote a byte](docs/writeups/10-storage-byte.md),
+  [record in production, replay in the simulator](docs/writeups/11-record-replay.md), and
+  [what the simulator does not know](docs/writeups/12-simulator-residuals.md)
 - [`docs/consistency.md`](docs/consistency.md) — what a successful write and a
   leader read actually guarantee, and the ReadIndex fixture behind them
 - [`docs/sim.md`](docs/sim.md) — scenarios as data: seeds, profiles, fault
   plans, and the replay/shrink/diff commands
+- [`docs/katas/`](docs/katas/) — five opt-in, mechanically synthetic teaching
+  defects with fixed detectors and strict exclusion from production evidence
 - [`docs/formats.md`](docs/formats.md) — every persisted and wire format, with
   magic values, versions, and bounds
 - [`docs/compatibility.md`](docs/compatibility.md) — the current compatibility
@@ -132,4 +137,4 @@ publishes an altered simulator as a website cannot keep those changes closed.
 
 ---
 
-**Version:** v0.15.9
+**Version:** v0.15.10
