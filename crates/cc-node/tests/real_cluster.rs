@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cc_core::{NodeId, PeerAddress};
 use cc_host::journal::{InputJournal, JournalTermination, RecordedBootImage, replay_journal};
+use cc_resp::RespValue;
 
 fn frame(parts: &[&str]) -> Vec<u8> {
     let mut output = format!("*{}\r\n", parts.len()).into_bytes();
@@ -34,6 +35,20 @@ fn request(port: u16, parts: &[&str]) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     stream.read_to_end(&mut output)?;
     Ok(output)
+}
+
+fn request_value(port: u16, value: &RespValue) -> std::io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(4)))?;
+    stream.write_all(&cc_resp::encode(value))?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut output = Vec::new();
+    stream.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn bulk(value: &[u8]) -> RespValue {
+    RespValue::Bulk(Some(value.to_vec()))
 }
 
 fn request_pipeline(port: u16, commands: &[&[&str]]) -> std::io::Result<Vec<u8>> {
@@ -754,8 +769,22 @@ fn trap_real_host_effects_match_replay() {
             .any(|window| window == b"STALE"),
         "stale read must be explicitly tagged: {stale:?}"
     );
-    let follower_read = request(stale_port, &["READ", "FOLLOWER", "GET", "process"])
-        .expect("follower read response");
+    let follower_read_deadline = Instant::now() + Duration::from_secs(5);
+    let follower_read = loop {
+        let reply = request(stale_port, &["READ", "FOLLOWER", "GET", "process"])
+            .expect("follower read response");
+        if reply
+            .windows(b"FOLLOWER".len())
+            .any(|window| window == b"FOLLOWER")
+        {
+            break reply;
+        }
+        assert!(
+            Instant::now() < follower_read_deadline,
+            "v3 follower read did not become available after the ReadIndex round: {reply:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
     assert!(
         follower_read
             .windows(b"FOLLOWER".len())
@@ -816,6 +845,35 @@ fn trap_real_host_effects_match_replay() {
     assert_eq!(
         batch,
         b"+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n+OK\r\n$5\r\nvalue\r\n"
+    );
+    let nested_batch = RespValue::Array(vec![
+        bulk(b"BATCH"),
+        RespValue::Array(vec![
+            RespValue::Array(vec![bulk(b"SET"), bulk(b"one-shot"), bulk(b"value")]),
+            RespValue::Array(vec![bulk(b"GET"), bulk(b"one-shot")]),
+        ]),
+    ]);
+    assert_eq!(
+        request_value(leader_port, &nested_batch).expect("one-shot nested BATCH"),
+        b"*2\r\n+OK\r\n$5\r\nvalue\r\n"
+    );
+    let durable_batch = RespValue::Array(vec![
+        bulk(b"CC.REQUEST"),
+        bulk(b"902"),
+        bulk(b"1"),
+        bulk(b"BATCH"),
+        RespValue::Array(vec![
+            RespValue::Array(vec![bulk(b"INCR"), bulk(b"batch-retry")]),
+            RespValue::Array(vec![bulk(b"GET"), bulk(b"batch-retry")]),
+        ]),
+    ]);
+    let first_durable_batch =
+        request_value(leader_port, &durable_batch).expect("first durable BATCH");
+    assert_eq!(first_durable_batch, b"*2\r\n:1\r\n$1\r\n1\r\n");
+    assert_eq!(
+        request_value(leader_port, &durable_batch).expect("retry durable BATCH"),
+        first_durable_batch,
+        "the explicit batch envelope must deduplicate as one unit"
     );
     let (_, stable) = request_eventually(&ports, &["SET", "batch-stable", "before"]);
     assert_eq!(stable, b"+OK\r\n");

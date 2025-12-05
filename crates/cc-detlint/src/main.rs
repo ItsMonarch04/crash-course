@@ -66,6 +66,11 @@ fn check(args: &[String]) -> io::Result<()> {
             || text.contains("use std::time::{Instant")
             || text.contains(", Instant");
         for (line_index, line) in text.lines().enumerate() {
+            // Host adapters must annotate the exact boundary line rather than
+            // excluding an entire mixed host/core crate from the scan.
+            if line.contains("cc-detlint: allow host-boundary") {
+                continue;
+            }
             for (needle, reason) in FORBIDDEN {
                 if line.contains(needle) {
                     violations.push(format!(
@@ -191,6 +196,22 @@ mod tests {
         )
         .expect("test input");
         assert!(check(&[directory.display().to_string()]).is_err());
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn explicit_host_boundary_line_is_the_only_clock_escape() {
+        let directory =
+            env::temp_dir().join(format!("cc-detlint-host-boundary-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("test directory");
+        let file = directory.join("lib.rs");
+        fs::write(
+            &file,
+            "use std::time::Instant; // cc-detlint: allow host-boundary\n\
+             fn now() { let _ = Instant::now(); } // cc-detlint: allow host-boundary\n",
+        )
+        .expect("test input");
+        assert!(check(&[directory.display().to_string()]).is_ok());
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 }

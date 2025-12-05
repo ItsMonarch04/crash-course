@@ -2,9 +2,22 @@
 // Copyright (c) 2025 Sidakpreet Singh
 
 #![forbid(unsafe_code)]
+#![doc = "`ccdb` is deliberately a thin operator/transport adapter. Raft, durable \
+          continuations, and application state all live below `driver_host`."]
 
-//! `ccdb` is deliberately a thin operator/transport adapter.  Raft, durable
-//! continuations, and application state all live below `driver_host`.
+#[cfg(any(
+    all(feature = "kata01", feature = "kata02"),
+    all(feature = "kata01", feature = "kata03"),
+    all(feature = "kata01", feature = "kata04"),
+    all(feature = "kata01", feature = "kata05"),
+    all(feature = "kata02", feature = "kata03"),
+    all(feature = "kata02", feature = "kata04"),
+    all(feature = "kata02", feature = "kata05"),
+    all(feature = "kata03", feature = "kata04"),
+    all(feature = "kata03", feature = "kata05"),
+    all(feature = "kata04", feature = "kata05"),
+))]
+compile_error!("kata features are mutually exclusive");
 
 #[cfg(test)]
 mod c0_identity_fixtures;
@@ -20,7 +33,7 @@ use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use cc_cluster::backup::{
     BACKUP_MAGIC, BACKUP_V2_FOOTER_BYTES, BACKUP_V2_HEADER_BYTES, BACKUP_VERSION, BackupProvenance,
-    BackupV2, LEGACY_BACKUP_VERSION,
+    BackupV2, LEGACY_BACKUP_VERSION, snapshot_for_fresh_cluster,
 };
 use cc_cluster::{CcsnSnapshot, ccsn_file_crc, decode_ccsn, encode_ccsn};
 use cc_core::{
@@ -50,6 +63,14 @@ const MIN_STORAGE_READER: u16 = 2;
 const MIN_SEMANTIC_READER: u16 = 3;
 
 fn main() -> io::Result<()> {
+    #[cfg(any(
+        feature = "kata01",
+        feature = "kata02",
+        feature = "kata03",
+        feature = "kata04",
+        feature = "kata05",
+    ))]
+    eprintln!("SYNTHETIC KATA ENABLED; this process must not produce release evidence");
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("init") => init_cluster(&args[1..]),
@@ -1867,36 +1888,25 @@ fn restore_backup(
             "restore must use a fresh cluster id",
         ));
     }
-    let mut snapshot = decode_ccsn(
+    let source_snapshot = decode_ccsn(
         &backup.checkpoint,
         backup.source_cluster_id.bytes(),
         BACKUP_MAX_FILE as u64,
     )
     .map_err(io::Error::other)?;
-    validate_restore_capabilities(&backup, &snapshot)?;
+    validate_restore_capabilities(&backup, &source_snapshot)?;
     let restore_time = Time::from_nanos(
         process_time()
             .as_nanos()
-            .max(snapshot.kv.last_leader_time.as_nanos()),
+            .max(source_snapshot.kv.last_leader_time.as_nanos()),
     );
-    snapshot.kv.entries.retain(|entry| {
-        entry
-            .deadline
-            .is_none_or(|deadline| deadline > restore_time)
-    });
-    snapshot.sessions = snapshot
-        .sessions
-        .for_fresh_cluster_restore(snapshot.cluster_policy, restore_time)
-        .map_err(io::Error::other)?;
-    let mut membership = MembershipState::new([NodeId::new(new_node_id)].into_iter().collect())
-        .map_err(io::Error::other)?;
-    membership.active_features = snapshot.membership.active_features;
-    membership.validate().map_err(io::Error::other)?;
-    snapshot.cluster_id = new_cluster_id.bytes();
-    snapshot.membership = membership.clone();
-    snapshot.kv.applied_index = LogIndex::new(1);
-    snapshot.kv.applied_term = Term::new(1);
-    snapshot.kv.last_leader_time = restore_time;
+    let snapshot = snapshot_for_fresh_cluster(
+        &backup,
+        new_cluster_id,
+        NodeId::new(new_node_id),
+        restore_time,
+    )?;
+    let membership = snapshot.membership.clone();
     let checkpoint = encode_ccsn(&snapshot).map_err(io::Error::other)?;
     let checkpoint_crc = ccsn_file_crc(&checkpoint).map_err(io::Error::other)?;
     let checkpoint_mark = ManifestCheckpoint {
@@ -2285,7 +2295,10 @@ pub(crate) fn to_resp(reply: KvReply) -> RespValue {
         KvReply::BatchError {
             failed_index,
             error,
-        } => RespValue::Error(format!("ERR batch failed at index {failed_index}: {error}")),
+        } => RespValue::Error(failed_index.map_or_else(
+            || format!("ERR batch failed before publish: {error}"),
+            |index| format!("ERR batch failed at index {index}: {error}"),
+        )),
         KvReply::Ok => RespValue::Simple(String::from("OK")),
         KvReply::Value(Some(value)) => RespValue::Bulk(Some(value)),
         KvReply::Value(None) => RespValue::Bulk(None),

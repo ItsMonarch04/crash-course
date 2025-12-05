@@ -68,7 +68,10 @@ type ReplySender = mpsc::SyncSender<Vec<u8>>;
 /// host-local and never replicated. Only `EXEC` creates the single canonical
 /// CCKV batch entry; closing the socket simply drops this value.
 enum ClientTransaction {
-    Clean(Vec<(ClientCommand, KvCommand)>),
+    Clean {
+        commands: Vec<(ClientCommand, KvCommand)>,
+        encoded_bytes: u64,
+    },
     Dirty,
 }
 
@@ -384,6 +387,17 @@ struct OutboundPeer {
     address: String,
     stream: TcpStream,
     negotiated: cc_env::NegotiatedPeer,
+}
+
+struct PeerCapabilityGuard<'a> {
+    state: &'a DriverHost,
+    peer: NodeId,
+}
+
+impl Drop for PeerCapabilityGuard<'_> {
+    fn drop(&mut self) {
+        self.state.forget_peer_capability(self.peer);
+    }
 }
 
 /// Append-only CCIJ writer. It retains only the current ordinal and file
@@ -1418,6 +1432,7 @@ impl DriverHost {
                 .is_some_and(|connection| connection.address != address)
             {
                 peers.remove(&to);
+                self.forget_peer_capability(to);
             }
             if let std::collections::btree_map::Entry::Vacant(entry) = peers.entry(to) {
                 entry.insert(self.connect_peer(to, &address)?);
@@ -1434,6 +1449,7 @@ impl DriverHost {
                 Err(error) => {
                     last_error = Some(error);
                     peers.remove(&to);
+                    self.forget_peer_capability(to);
                 }
             }
         }
@@ -1582,6 +1598,12 @@ impl DriverHost {
         self.metrics
             .observe_peer(peer, negotiated.semantic_version, negotiated.features);
         Ok(())
+    }
+
+    fn forget_peer_capability(&self, peer: NodeId) {
+        if let Ok(mut driver) = self.driver.lock() {
+            driver.forget_peer_capability(peer);
+        }
     }
 
     fn follower_read(
@@ -2489,6 +2511,9 @@ fn serve_client(
             let command = match parse_command(value) {
                 Ok(command) => command,
                 Err(error) => {
+                    if transaction.is_some() {
+                        transaction = Some(ClientTransaction::Dirty);
+                    }
                     stream.write_all(&encode(&RespValue::Error(format!("ERR {error}"))))?;
                     continue;
                 }
@@ -2516,7 +2541,10 @@ fn execute_client(
             if !state.atomic_batch_active().map_err(io::Error::other)? {
                 return Ok(RespValue::Error(String::from("FEATUREDISABLED")));
             }
-            *transaction = Some(ClientTransaction::Clean(Vec::new()));
+            *transaction = Some(ClientTransaction::Clean {
+                commands: Vec::new(),
+                encoded_bytes: 0,
+            });
             Ok(RespValue::Simple(String::from("OK")))
         }
         ClientCommand::Discard => {
@@ -2530,31 +2558,52 @@ fn execute_client(
             Some(ClientTransaction::Dirty) => Ok(RespValue::Error(String::from(
                 "EXECABORT transaction discarded because it contains queue errors",
             ))),
-            Some(ClientTransaction::Clean(commands)) => {
+            Some(ClientTransaction::Clean { commands, .. }) => {
                 execute_transaction(state, client, commands)
             }
         },
         command => {
             if let Some(transaction) = transaction {
-                return match queue_transaction_command(command) {
-                    Ok(queued) => match transaction {
-                        ClientTransaction::Clean(commands) => {
-                            commands.push(queued);
-                            Ok(RespValue::Simple(String::from("QUEUED")))
-                        }
-                        ClientTransaction::Dirty => Ok(RespValue::Error(String::from(
-                            "ERR transaction is already dirty",
-                        ))),
-                    },
-                    Err(error) => {
-                        *transaction = ClientTransaction::Dirty;
-                        Ok(RespValue::Error(format!(
-                            "ERR command cannot be queued: {error}"
-                        )))
-                    }
-                };
+                return Ok(queue_client_transaction(transaction, command));
             }
             execute_client_immediate(state, client, command)
+        }
+    }
+}
+
+fn queue_client_transaction(
+    transaction: &mut ClientTransaction,
+    command: ClientCommand,
+) -> RespValue {
+    match queue_transaction_command(command) {
+        Ok(queued) => match transaction {
+            ClientTransaction::Clean {
+                commands,
+                encoded_bytes,
+            } => {
+                let policy = cc_core::ClusterPolicy::default();
+                let child_bytes =
+                    u64::try_from(encode_command(&queued.1).len()).unwrap_or(u64::MAX);
+                let next_bytes = encoded_bytes.checked_add(child_bytes);
+                if commands.len()
+                    >= usize::try_from(policy.max_batch_commands).unwrap_or(usize::MAX)
+                    || next_bytes.is_none_or(|bytes| bytes > policy.max_batch_bytes)
+                {
+                    *transaction = ClientTransaction::Dirty;
+                    RespValue::Error(String::from("ERR transaction exceeds batch limits"))
+                } else {
+                    *encoded_bytes = next_bytes.expect("checked batch bytes");
+                    commands.push(queued);
+                    RespValue::Simple(String::from("QUEUED"))
+                }
+            }
+            ClientTransaction::Dirty => {
+                RespValue::Error(String::from("ERR transaction is already dirty"))
+            }
+        },
+        Err(error) => {
+            *transaction = ClientTransaction::Dirty;
+            RespValue::Error(format!("ERR command cannot be queued: {error}"))
         }
     }
 }
@@ -2590,6 +2639,32 @@ fn execute_transaction(
     }
 }
 
+fn execute_one_shot_batch(
+    state: &DriverHost,
+    client: ClientId,
+    commands: Vec<ClientCommand>,
+) -> io::Result<RespValue> {
+    let batch = batch_kv(&commands)?;
+    let reply = submit(state, client, batch)?;
+    Ok(render_write_reply(&ClientCommand::Batch(commands), reply))
+}
+
+fn batch_kv(commands: &[ClientCommand]) -> io::Result<KvCommand> {
+    if commands.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BATCH requires at least one command",
+        ));
+    }
+    let commands = commands
+        .iter()
+        .cloned()
+        .map(queue_transaction_command)
+        .map(|result| result.map(|(_, command)| command))
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(KvCommand::Batch { commands })
+}
+
 fn queue_transaction_command(command: ClientCommand) -> io::Result<(ClientCommand, KvCommand)> {
     let kv = match &command {
         ClientCommand::Set { .. } => set_kv(&command)?,
@@ -2603,6 +2678,7 @@ fn queue_transaction_command(command: ClientCommand) -> io::Result<(ClientComman
             ));
         }
         ClientCommand::Request { .. }
+        | ClientCommand::Batch(_)
         | ClientCommand::Admin { .. }
         | ClientCommand::AdminMembers { .. }
         | ClientCommand::ReadFollower(_)
@@ -2635,6 +2711,7 @@ fn execute_client_immediate(
         ClientCommand::Ping => Ok(RespValue::Simple(String::from("PONG"))),
         ClientCommand::Echo(value) => Ok(RespValue::Bulk(Some(value))),
         ClientCommand::Info => Ok(RespValue::Bulk(Some(info(state).into_bytes()))),
+        ClientCommand::Batch(commands) => execute_one_shot_batch(state, client, commands),
         ClientCommand::Request {
             client: session_client,
             sequence,
@@ -2985,6 +3062,7 @@ fn execute_explicit_request(
 /// replicated operations.
 fn explicit_write_kv(command: &ClientCommand) -> io::Result<KvCommand> {
     match command {
+        ClientCommand::Batch(commands) => batch_kv(commands),
         ClientCommand::Set { .. } => set_kv(command),
         ClientCommand::Del(keys) if keys.len() == 1 => Ok(KvCommand::Del {
             key: keys[0].clone(),
@@ -3048,6 +3126,17 @@ fn set_kv(command: &ClientCommand) -> io::Result<KvCommand> {
 
 fn render_write_reply(command: &ClientCommand, reply: KvReply) -> RespValue {
     match (command, reply) {
+        (ClientCommand::Batch(commands), KvReply::Batch(replies))
+            if commands.len() == replies.len() =>
+        {
+            RespValue::Array(
+                commands
+                    .iter()
+                    .zip(replies)
+                    .map(|(command, reply)| render_write_reply(command, reply))
+                    .collect(),
+            )
+        }
         (ClientCommand::Set { .. }, KvReply::Conditional(false)) => RespValue::Bulk(None),
         (ClientCommand::Set { .. }, KvReply::Conditional(true)) => {
             RespValue::Simple(String::from("OK"))
@@ -3162,6 +3251,10 @@ fn serve_peer(mut stream: TcpStream, state: &Arc<DriverHost>) -> io::Result<()> 
     // that has received our hello can then be used as a strict capability
     // preflight without racing this server thread's observation.
     state.observe_peer_capability(hello.node_id, negotiated)?;
+    let _capability = PeerCapabilityGuard {
+        state,
+        peer: hello.node_id,
+    };
     stream.write_all(&local.encode().map_err(io::Error::other)?)?;
     let mut scratch = [0_u8; 8 * 1024];
     loop {
@@ -3878,6 +3971,89 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn trap_dirty_transaction_never_proposes() {
+        let mut transaction = ClientTransaction::Clean {
+            commands: Vec::new(),
+            encoded_bytes: 0,
+        };
+        let response = queue_client_transaction(
+            &mut transaction,
+            ClientCommand::Unknown(b"unsupported".to_vec()),
+        );
+        assert!(matches!(response, RespValue::Error(_)));
+        assert!(matches!(transaction, ClientTransaction::Dirty));
+        let exec = match Some(transaction).take() {
+            Some(ClientTransaction::Dirty) => RespValue::Error(String::from("EXECABORT")),
+            Some(ClientTransaction::Clean { .. }) => panic!("dirty transaction became clean"),
+            None => panic!("transaction disappeared"),
+        };
+        assert_eq!(exec, RespValue::Error(String::from("EXECABORT")));
+    }
+
+    #[test]
+    fn trap_exec_disconnect_discards_queue() {
+        let next_connection = {
+            let mut transaction = ClientTransaction::Clean {
+                commands: Vec::new(),
+                encoded_bytes: 0,
+            };
+            assert_eq!(
+                queue_client_transaction(
+                    &mut transaction,
+                    ClientCommand::Set {
+                        key: b"k".to_vec(),
+                        value: b"v".to_vec(),
+                        ttl: None,
+                        nx: false,
+                        xx: false,
+                    },
+                ),
+                RespValue::Simple(String::from("QUEUED"))
+            );
+            assert!(matches!(transaction, ClientTransaction::Clean { .. }));
+            // `serve_client` owns this value on its stack. Returning on EOF
+            // drops it; a new connection always starts from `None`.
+            None::<ClientTransaction>
+        };
+        assert!(next_connection.is_none());
+    }
+
+    #[test]
+    fn trap_exec_cannot_claim_reconnect_dedup_without_a_batch_envelope() {
+        assert!(explicit_write_kv(&ClientCommand::Exec).is_err());
+        assert!(explicit_write_kv(&ClientCommand::Multi).is_err());
+        assert!(explicit_write_kv(&ClientCommand::Discard).is_err());
+        let batch = ClientCommand::Batch(vec![ClientCommand::SetNx {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        }]);
+        assert!(matches!(
+            explicit_write_kv(&batch),
+            Ok(KvCommand::Batch { .. })
+        ));
+    }
+
+    #[test]
+    fn trap_v2_peer_never_serves_local_state_as_linearizable() {
+        let negotiated = cc_env::NegotiatedPeer {
+            semantic_version: PROTOCOL_VERSION,
+            features: 0,
+            max_peer_frame: 1024,
+        };
+        let request = cc_cluster::Message {
+            proto_version: SEMANTIC_VERSION_V3,
+            from: NodeId::new(2),
+            to: NodeId::new(1),
+            term: cc_core::Term::new(1),
+            kind: cc_cluster::MessageKind::FollowerReadRequest {
+                request_id: 1,
+                command_hash: 2,
+            },
+        };
+        assert!(!message_features_are_allowed(&request, negotiated));
     }
 
     #[test]

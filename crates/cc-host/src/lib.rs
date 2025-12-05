@@ -12,7 +12,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::Instant; // cc-detlint: allow host-boundary
 
 use cc_cluster::{
     CcsnSnapshot, CcsnStreamDecoder, CcsnStreamEncoder, Message, MessageKind, Node, NodeConfig,
@@ -77,7 +77,7 @@ impl BlockSource for FileBlockSource {
         offset: u64,
         len: u32,
     ) -> Result<BlockRead, BlockReadError> {
-        let started = Instant::now();
+        let started = Instant::now(); // cc-detlint: allow host-boundary
         let result = (|| {
             let FileId::Sst { file_no } = file else {
                 return Err(StoreError::InvalidInput("block source file class"));
@@ -257,6 +257,7 @@ enum IoStage {
         file: FileId,
         len: u32,
     },
+    #[cfg_attr(feature = "kata03", allow(dead_code))]
     Fsync {
         file: FileId,
     },
@@ -1167,6 +1168,12 @@ impl Driver {
         Ok(())
     }
 
+    /// Remove capability evidence when the owning CCHL connection generation
+    /// closes or fails.
+    pub fn forget_peer_capability(&mut self, peer: NodeId) {
+        self.node.forget_peer_capability(peer);
+    }
+
     pub fn take_follower_read_metadata(
         &mut self,
         client: ClientId,
@@ -1506,12 +1513,25 @@ impl Driver {
         };
         match (stage, result) {
             (IoStage::Write { file, len }, IoResult::Written { len: actual }) if len == actual => {
-                let fsync_id = self.allocate_io()?;
-                self.pending_io.insert(fsync_id, IoStage::Fsync { file });
-                Ok((
-                    DriverPoll::Ready,
-                    vec![Effect::DiskFsync { file, id: fsync_id }],
-                ))
+                #[cfg(feature = "kata03")]
+                {
+                    let _ = file;
+                    // Synthetic teaching defect: publish the continuation
+                    // after write completion without an fsync acknowledgement.
+                    let effects = self
+                        .node
+                        .on_input(cc_cluster::NodeInput::Persisted { success: true })?;
+                    return Ok((DriverPoll::Ready, self.translate(effects)?));
+                }
+                #[cfg(not(feature = "kata03"))]
+                {
+                    let fsync_id = self.allocate_io()?;
+                    self.pending_io.insert(fsync_id, IoStage::Fsync { file });
+                    Ok((
+                        DriverPoll::Ready,
+                        vec![Effect::DiskFsync { file, id: fsync_id }],
+                    ))
+                }
             }
             (IoStage::Fsync { file }, IoResult::Fsynced) => {
                 let _ = file;
@@ -2956,6 +2976,59 @@ mod tests {
         .expect("driver")
     }
 
+    #[cfg(feature = "kata03")]
+    #[test]
+    fn trap_kata_03_ack_before_fsync_is_found_within_budget() {
+        let mut driver = driver();
+        let mut blocks = MemoryBlockSource::default();
+        driver.node_mut().raft.hard_state.term = cc_core::Term::new(1);
+        let request = Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(2),
+            to: NodeId::new(1),
+            term: cc_core::Term::new(1),
+            kind: MessageKind::VoteReq {
+                last_index: cc_core::LogIndex::new(0),
+                last_term: cc_core::Term::new(0),
+            },
+        };
+        let wire = encode_peer_effect(&request).expect("CCRP");
+        let (_, write) = driver
+            .deliver(
+                Time::from_nanos(1),
+                Input::Recv {
+                    from: NodeId::new(2),
+                    msg: wire,
+                },
+                &mut blocks,
+            )
+            .expect("vote request");
+        let [Effect::DiskWrite { id, bytes, .. }] = write.as_slice() else {
+            panic!("hard state must write first");
+        };
+
+        let (_, released) = driver
+            .deliver(
+                Time::from_nanos(1),
+                Input::IoDone {
+                    id: *id,
+                    result: IoResult::Written {
+                        len: u32::try_from(bytes.len()).expect("write length"),
+                    },
+                },
+                &mut blocks,
+            )
+            .expect("write completion");
+
+        assert!(matches!(released.as_slice(), [Effect::Send { .. }]));
+        assert!(
+            !released
+                .iter()
+                .any(|effect| matches!(effect, Effect::DiskFsync { .. })),
+            "the synthetic continuation must escape before fsync"
+        );
+    }
+
     #[test]
     fn trap_driver_correlates_write_and_fsync_before_continuation() {
         let mut driver = driver();
@@ -4252,7 +4325,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "cc-host-block-source-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current().name().unwrap_or("test") // cc-detlint: allow host-boundary
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).expect("temp block root");
@@ -4278,7 +4351,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "cc-host-open-file-cap-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current().name().unwrap_or("test") // cc-detlint: allow host-boundary
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).expect("temp block root");
