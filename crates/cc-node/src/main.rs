@@ -2499,11 +2499,177 @@ mod tests {
     }
 
     #[test]
-    fn trap_cluster_id_has_one_nonzero_canonical_text_form() {
+    fn trap_node_config_rejects_a_noncanonical_cluster_id() {
         assert!(ClusterId::from_hex(TEST_CLUSTER_ID).is_ok());
         assert!(ClusterId::from_hex("00112233445566778899AABBCCDDEEFF").is_err());
         assert!(ClusterId::from_hex("00112233445566778899aabbccddeef").is_err());
         assert!(ClusterId::from_hex("00000000000000000000000000000000").is_err());
+    }
+
+    #[test]
+    fn trap_cluster_id_is_required_and_not_the_label() {
+        // The human `--cluster` name is a label. It never establishes identity,
+        // so a configuration carrying only a name has no cluster id to parse.
+        let named_only = parse_config(&format!(
+            "[node]\nid = 1\ncluster = \"production\"\ndata_dir = \"{}\"\nlisten_client = \"127.0.0.1:7101\"\nlisten_peer = \"127.0.0.1:7201\"\nlisten_metrics = \"127.0.0.1:7301\"\npeer_nodes = \"\"\n",
+            env::temp_dir().display()
+        ));
+        assert_eq!(
+            named_only.expect_err("a label is not an identity").kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // Two clusters may share a label; they may never share an id, and the
+        // id itself must be explicit, canonical, and nonzero.
+        assert!(ClusterId::from_hex(TEST_CLUSTER_ID).is_ok());
+        assert!(ClusterId::from_hex("00000000000000000000000000000000").is_err());
+    }
+
+    #[test]
+    fn trap_cluster_policy_mismatch_refuses_before_service() {
+        let directory =
+            env::temp_dir().join(format!("cc-node-policy-{}", process_time().as_nanos()));
+        fs::create_dir_all(directory.join("raft")).expect("state directory");
+        let state = directory.join("raft/wal.0");
+        fs::write(&state, b"must-not-be-opened").expect("state sentinel");
+        write_identity(
+            &identity_path(&directory),
+            DiskIdentity {
+                policy_hash: ClusterPolicy::default().hash() ^ 1,
+                ..DiskIdentity::fresh(test_cluster_id(), 1)
+            },
+        )
+        .expect("drifted policy identity");
+        let error = validate_identity(&test_config(directory.clone()))
+            .expect_err("policy drift must refuse before service");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(&state).expect("state sentinel after refusal"),
+            b"must-not-be-opened"
+        );
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn trap_ccid_lifecycle_rejects_removed_directory_reactivation() {
+        let directory =
+            env::temp_dir().join(format!("cc-node-reactivate-{}", process_time().as_nanos()));
+        fs::create_dir_all(&directory).expect("identity directory");
+        let marker = identity_path(&directory);
+        write_identity(
+            &marker,
+            DiskIdentity {
+                lifecycle: IDENTITY_REMOVED,
+                ..DiskIdentity::fresh(test_cluster_id(), 1)
+            },
+        )
+        .expect("removed identity");
+        let config = test_config(directory.clone());
+        assert_eq!(
+            validate_identity(&config)
+                .expect_err("Removed is terminal")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // Every legal transition ends at Removed; nothing walks back out of it.
+        assert_eq!(
+            mark_identity_lifecycle(&config, IDENTITY_ACTIVE)
+                .expect_err("Removed cannot become Active")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            mark_identity_lifecycle(&config, IDENTITY_JOINING)
+                .expect_err("Removed cannot rejoin in place")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            DiskIdentity::decode(&fs::read(&marker).expect("identity bytes"))
+                .expect("identity")
+                .lifecycle,
+            IDENTITY_REMOVED
+        );
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn trap_ccid_minima_only_increase() {
+        let directory =
+            env::temp_dir().join(format!("cc-node-minima-{}", process_time().as_nanos()));
+        fs::create_dir_all(&directory).expect("identity directory");
+        let marker = identity_path(&directory);
+        write_identity(
+            &marker,
+            DiskIdentity {
+                min_storage_reader: 1,
+                min_semantic_reader: 2,
+                migration_epoch: 0,
+                ..DiskIdentity::fresh(test_cluster_id(), 1)
+            },
+        )
+        .expect("baseline identity");
+        let config = test_config(directory.clone());
+
+        raise_identity_storage_reader(&config, MIN_STORAGE_READER).expect("raise storage floor");
+        raise_identity_semantic_reader(&config, MIN_SEMANTIC_READER).expect("raise semantic floor");
+        let raised = DiskIdentity::decode(&fs::read(&marker).expect("identity bytes"))
+            .expect("raised identity");
+        assert_eq!(raised.min_storage_reader, MIN_STORAGE_READER);
+        assert_eq!(raised.min_semantic_reader, MIN_SEMANTIC_READER);
+        assert_eq!(
+            raised.migration_epoch, 2,
+            "each real transition advances exactly one epoch"
+        );
+
+        // A lower request is a no-op, not a downgrade, and writes nothing.
+        raise_identity_storage_reader(&config, 1).expect("lower storage request");
+        raise_identity_semantic_reader(&config, 2).expect("lower semantic request");
+        assert_eq!(
+            DiskIdentity::decode(&fs::read(&marker).expect("identity bytes"))
+                .expect("identity after lower request"),
+            raised
+        );
+
+        // Nothing may ask for a floor this build cannot read.
+        assert_eq!(
+            raise_identity_semantic_reader(&config, MIN_SEMANTIC_READER + 1)
+                .expect_err("unsupported semantic floor")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            raise_identity_storage_reader(&config, MIN_STORAGE_READER + 1)
+                .expect_err("unsupported storage floor")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn trap_unsupported_ccid_refuses_before_cleanup() {
+        let directory =
+            env::temp_dir().join(format!("cc-node-unsupported-{}", process_time().as_nanos()));
+        fs::create_dir_all(directory.join("raft")).expect("state directory");
+        let leftover = directory.join("raft/wal.0.tmp");
+        fs::write(&leftover, b"leftover-temp").expect("temp sentinel");
+        write_identity(
+            &identity_path(&directory),
+            DiskIdentity {
+                min_semantic_reader: MIN_SEMANTIC_READER.saturating_add(1),
+                ..DiskIdentity::fresh(test_cluster_id(), 1)
+            },
+        )
+        .expect("future-semantic identity");
+        let error = validate_identity(&test_config(directory.clone()))
+            .expect_err("unsupported semantic reader must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(&leftover).expect("temp sentinel after refusal"),
+            b"leftover-temp",
+            "an unsupported CCID refuses before any temp cleanup"
+        );
+        fs::remove_dir_all(directory).expect("remove fixture");
     }
 
     #[test]
@@ -2737,7 +2903,48 @@ mod tests {
     }
 
     #[test]
-    fn trap_rolling_upgrade_rejects_cluster_policy_drift() {
+    fn trap_v2_binary_refuses_v3_log_before_cleanup() {
+        // A node that has appended or acknowledged a semantic-v3 entry has
+        // already fsynced `min_semantic_reader = 3`. A v2-only binary must
+        // refuse that directory before it truncates a torn tail, replays the
+        // log, or removes a stale temporary file.
+        let directory = env::temp_dir().join(format!(
+            "cc-node-v2-refuses-v3-{}",
+            process_time().as_nanos()
+        ));
+        fs::create_dir_all(directory.join("raft")).expect("state directory");
+        let log = directory.join("raft/wal.0");
+        fs::write(&log, b"v3-log-bytes").expect("log sentinel");
+        let leftover = directory.join("raft/wal.0.tmp");
+        fs::write(&leftover, b"leftover-temp").expect("temp sentinel");
+        write_identity(
+            &identity_path(&directory),
+            DiskIdentity {
+                min_storage_reader: 2,
+                min_semantic_reader: 3,
+                migration_epoch: 4,
+                ..DiskIdentity::fresh(test_cluster_id(), 1)
+            },
+        )
+        .expect("v3 identity");
+        let config = test_config(directory.clone());
+
+        // The current build reads v3 happily.
+        validate_identity(&config).expect("this build reads its own directory");
+        // A v2-only reader refuses, and touches nothing.
+        let error = validate_identity_for_readers(&config, MIN_STORAGE_READER, 2)
+            .expect_err("a v2 binary must refuse a v3 directory");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&log).expect("log after refusal"), b"v3-log-bytes");
+        assert_eq!(
+            fs::read(&leftover).expect("temp after refusal"),
+            b"leftover-temp"
+        );
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn trap_node_directory_rejects_cluster_policy_drift() {
         let directory = env::temp_dir().join(format!(
             "cc-node-policy-drift-{}",
             process_time().as_nanos()

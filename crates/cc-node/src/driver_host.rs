@@ -243,6 +243,27 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
         ));
     }
 
+    let joining_state = Arc::clone(&state);
+    if !spawn_host_thread(
+        Arc::clone(&state.thread_budget),
+        "ccdb-join-capability",
+        move || {
+            while !joining_state.stopping.load(Ordering::Acquire) {
+                if joining_state.serves_clients() {
+                    // Admitted members exchange consensus traffic, which keeps
+                    // their own routes and capability observations current.
+                    return;
+                }
+                joining_state.refresh_join_capability_links();
+                thread::sleep(StdDuration::from_millis(50));
+            }
+        },
+    )? {
+        return Err(io::Error::other(
+            "thread admission refused ccdb-join-capability",
+        ));
+    }
+
     let deadline = run_for.and_then(|duration| Instant::now().checked_add(duration));
     loop {
         if state.stopping.load(Ordering::Acquire) {
@@ -372,6 +393,10 @@ struct DriverHost {
     wal: Mutex<File>,
     store_wal: Mutex<File>,
     outbound_peers: Mutex<BTreeMap<NodeId, OutboundPeer>>,
+    /// Live negotiated connections per peer. Capability evidence must survive
+    /// one of several concurrent connections closing, so the core observation
+    /// is cleared only when the last link to that peer is gone.
+    peer_links: Mutex<BTreeMap<NodeId, u32>>,
     replies: Mutex<BTreeMap<ReplyRoute, ReplySender>>,
     lifecycle_lock: Mutex<()>,
     next_client: AtomicU64,
@@ -628,18 +653,27 @@ struct HostClock {
 }
 
 impl HostClock {
+    /// The wall clock is read exactly once, at boot. A host that resampled it
+    /// per request would let an operator's clock adjustment move replicated
+    /// expiry deadlines, so every later reading is this epoch plus monotonic
+    /// elapsed time.
+    fn boot_epoch_from_wall(since_unix_epoch: StdDuration) -> io::Result<Time> {
+        u64::try_from(since_unix_epoch.as_nanos())
+            .map(Time::from_nanos)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "wall clock exceeds logical time range",
+                )
+            })
+    }
+
     fn new(floor: Time) -> io::Result<Self> {
         let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "wall clock predates Unix epoch")
         })?;
-        let nanos = u64::try_from(elapsed.as_nanos()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "wall clock exceeds logical time range",
-            )
-        })?;
         Ok(Self {
-            boot_epoch: Time::from_nanos(nanos),
+            boot_epoch: Self::boot_epoch_from_wall(elapsed)?,
             boot_instant: Instant::now(),
             floor,
         })
@@ -899,6 +933,7 @@ impl DriverHost {
             wal: Mutex::new(wal),
             store_wal: Mutex::new(store_wal),
             outbound_peers: Mutex::new(BTreeMap::new()),
+            peer_links: Mutex::new(BTreeMap::new()),
             replies: Mutex::new(BTreeMap::new()),
             lifecycle_lock: Mutex::new(()),
             next_client: AtomicU64::new(1),
@@ -1456,6 +1491,35 @@ impl DriverHost {
         Err(last_error.unwrap_or_else(|| io::Error::other("peer send retry exhausted")))
     }
 
+    /// Hold one live connection to each discovery seed while this node is
+    /// still joining. Peer capability is deliberately connection-current
+    /// evidence, and a catch-up node sends no consensus traffic of its own, so
+    /// without this it would never be observably v3-capable and an activated
+    /// cluster could never admit it.
+    fn refresh_join_capability_links(&self) {
+        for peer in &self.config.peers {
+            let to = NodeId::new(peer.id);
+            if to.get() == 0 || to.get() == self.config.id {
+                continue;
+            }
+            let Ok(mut peers) = self.outbound_peers.lock() else {
+                return;
+            };
+            if peers.contains_key(&to) {
+                continue;
+            }
+            match self.connect_peer(to, &peer.address) {
+                Ok(connection) => {
+                    peers.insert(to, connection);
+                }
+                Err(error) => {
+                    drop(peers);
+                    eprintln!("join capability link to n{} failed: {error}", to.get());
+                }
+            }
+        }
+    }
+
     fn connect_peer(&self, to: NodeId, address: &str) -> io::Result<OutboundPeer> {
         let mut stream =
             TcpStream::connect_timeout(&resolve_peer_addr(address)?, PEER_CONNECT_TIMEOUT)?;
@@ -1597,10 +1661,28 @@ impl DriverHost {
             .map_err(io::Error::other)?;
         self.metrics
             .observe_peer(peer, negotiated.semantic_version, negotiated.features);
+        if let Ok(mut links) = self.peer_links.lock() {
+            *links.entry(peer).or_default() += 1;
+        }
         Ok(())
     }
 
+    /// Release one negotiated link. A peer that still holds another live
+    /// connection remains observably capable: a closing probe must not erase
+    /// evidence that a concurrent connection is still proving.
     fn forget_peer_capability(&self, peer: NodeId) {
+        if let Ok(mut links) = self.peer_links.lock() {
+            match links.get_mut(&peer) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    return;
+                }
+                Some(_) => {
+                    links.remove(&peer);
+                }
+                None => {}
+            }
+        }
         if let Ok(mut driver) = self.driver.lock() {
             driver.forget_peer_capability(peer);
         }
@@ -2553,14 +2635,12 @@ fn execute_client(
             }
             Ok(RespValue::Simple(String::from("OK")))
         }
-        ClientCommand::Exec => match transaction.take() {
-            None => Ok(RespValue::Error(String::from("ERR EXEC without MULTI"))),
-            Some(ClientTransaction::Dirty) => Ok(RespValue::Error(String::from(
+        ClientCommand::Exec => match take_exec_plan(transaction) {
+            ExecPlan::NoTransaction => Ok(RespValue::Error(String::from("ERR EXEC without MULTI"))),
+            ExecPlan::Abort => Ok(RespValue::Error(String::from(
                 "EXECABORT transaction discarded because it contains queue errors",
             ))),
-            Some(ClientTransaction::Clean { commands, .. }) => {
-                execute_transaction(state, client, commands)
-            }
+            ExecPlan::Propose(commands) => execute_transaction(state, client, commands),
         },
         command => {
             if let Some(transaction) = transaction {
@@ -2568,6 +2648,23 @@ fn execute_client(
             }
             execute_client_immediate(state, client, command)
         }
+    }
+}
+
+/// What `EXEC` does with the queue it just consumed. `Propose` is the only variant that can
+/// reach Raft, so a dirty queue is provably unable to produce a proposal.
+#[derive(Debug)]
+enum ExecPlan {
+    NoTransaction,
+    Abort,
+    Propose(Vec<(ClientCommand, KvCommand)>),
+}
+
+fn take_exec_plan(transaction: &mut Option<ClientTransaction>) -> ExecPlan {
+    match transaction.take() {
+        None => ExecPlan::NoTransaction,
+        Some(ClientTransaction::Dirty) => ExecPlan::Abort,
+        Some(ClientTransaction::Clean { commands, .. }) => ExecPlan::Propose(commands),
     }
 }
 
@@ -3856,6 +3953,62 @@ mod tests {
     }
 
     #[test]
+    fn trap_real_clock_boot_is_bounded_by_recovered_time() {
+        // A cluster that recovers a leader time from its checkpoint must never
+        // boot below it, whatever the host wall clock says.
+        let recovered = Time::from_nanos(9_000_000_000_000);
+        let clock = HostClock {
+            boot_epoch: Time::from_nanos(1),
+            boot_instant: Instant::now(),
+            floor: recovered,
+        };
+        assert!(clock.now() >= recovered);
+        // A boot epoch already above the recovered floor is not dragged down.
+        let ahead = HostClock {
+            boot_epoch: Time::from_nanos(recovered.as_nanos() + 1_000),
+            boot_instant: Instant::now(),
+            floor: recovered,
+        };
+        assert!(ahead.now() > recovered);
+    }
+
+    #[test]
+    fn trap_real_clock_samples_wall_epoch_once() {
+        let clock = HostClock {
+            boot_epoch: Time::from_nanos(1_000_000),
+            boot_instant: Instant::now(),
+            floor: Time::from_nanos(0),
+        };
+        let first = clock.now();
+        let second = clock.now();
+        assert!(second >= first, "host time is monotonic");
+        // Every reading is the one sampled epoch plus monotonic elapsed time,
+        // so nothing can carry the reading below that epoch.
+        assert!(first >= clock.boot_epoch);
+        let elapsed = u64::try_from(clock.boot_instant.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        assert!(
+            second.as_nanos() <= clock.boot_epoch.as_nanos().saturating_add(elapsed),
+            "a second wall sample would move the reading off the boot epoch"
+        );
+    }
+
+    #[test]
+    fn trap_real_clock_out_of_range_refuses_service() {
+        let representable = StdDuration::from_nanos(u64::MAX);
+        assert_eq!(
+            HostClock::boot_epoch_from_wall(representable).expect("in-range epoch"),
+            Time::from_nanos(u64::MAX)
+        );
+        let beyond = representable + StdDuration::from_nanos(1);
+        assert_eq!(
+            HostClock::boot_epoch_from_wall(beyond)
+                .expect_err("an unrepresentable wall clock refuses service")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn trap_host_thread_count_and_stack_reservations_are_bounded() {
         let stack_bytes = 256 * 1024;
         let budget = Arc::new(ThreadBudget::new(1, stack_bytes));
@@ -3946,6 +4099,117 @@ mod tests {
     }
 
     #[test]
+    fn trap_resp_conditional_set_has_no_host_preread() {
+        // SET NX/XX and SETNX are translation only: one replicated
+        // ConditionalSet, never a host read followed by a host write.
+        for (nx, xx, expected) in [
+            (true, false, Some(SetCondition::Nx)),
+            (false, true, Some(SetCondition::Xx)),
+            (false, false, None),
+        ] {
+            let mapped = set_kv(&ClientCommand::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                ttl: None,
+                nx,
+                xx,
+            })
+            .expect("SET maps to one command");
+            match expected {
+                Some(condition) => assert!(matches!(
+                    mapped,
+                    KvCommand::ConditionalSet { condition: actual, .. } if actual == condition
+                )),
+                None => assert!(matches!(mapped, KvCommand::Set { .. })),
+            }
+        }
+        assert!(
+            set_kv(&ClientCommand::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                ttl: None,
+                nx: true,
+                xx: true,
+            })
+            .is_err(),
+            "NX and XX together is a typed error, not a host-side decision"
+        );
+        assert!(matches!(
+            simple_kv(ClientCommand::SetNx {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            })
+            .expect("SETNX maps to one command"),
+            KvCommand::ConditionalSet {
+                condition: SetCondition::Nx,
+                ..
+            }
+        ));
+        // No conditional pre-read helper may reappear below the RESP
+        // boundary: the condition belongs in the one replicated apply.
+        assert_no_source_contains(&["fn conditional_preread", "fn preread_condition"]);
+    }
+
+    #[test]
+    fn trap_no_second_replication_protocol() {
+        assert_no_source_contains(&[
+            "CCREPL",
+            "DurableJournal",
+            "struct HostState",
+            "fn run_node",
+            "fn apply_durable",
+            "fn apply_replica",
+            "fn replicate(",
+            "thread::spawn",
+        ]);
+    }
+
+    /// Read every checked-in `cc-node` source file. The scan below is the same
+    /// architecture rule `scripts/ci/forbidden-grep.sh` enforces in CI, run
+    /// in-process so the receipt does not depend on a nested cargo build.
+    fn node_sources() -> Vec<(PathBuf, String)> {
+        fn walk(directory: &Path, found: &mut Vec<(PathBuf, String)>) {
+            for entry in fs::read_dir(directory).expect("read cc-node source directory") {
+                let path = entry.expect("source directory entry").path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let text = fs::read_to_string(&path).expect("read source file");
+                    found.push((path, text));
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert!(!found.is_empty(), "cc-node has sources to scan");
+        found
+    }
+
+    fn assert_no_source_contains(needles: &[&str]) {
+        for (path, text) in node_sources() {
+            // The rule governs the shipped adapter. Test modules hold the
+            // forbidden literals themselves, so the scan stops at the first
+            // `cfg(test)` boundary in each file.
+            let production = text.split("#[cfg(test)]").next().unwrap_or_default();
+            for line in production.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for needle in needles {
+                    assert!(
+                        !line.contains(needle),
+                        "{} reintroduces {needle}: {line}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn trap_multi_queue_is_closed_and_does_not_expand_multikey_writes() {
         let queued = queue_transaction_command(ClientCommand::Set {
             key: b"k".to_vec(),
@@ -3985,12 +4249,14 @@ mod tests {
         );
         assert!(matches!(response, RespValue::Error(_)));
         assert!(matches!(transaction, ClientTransaction::Dirty));
-        let exec = match Some(transaction).take() {
-            Some(ClientTransaction::Dirty) => RespValue::Error(String::from("EXECABORT")),
-            Some(ClientTransaction::Clean { .. }) => panic!("dirty transaction became clean"),
-            None => panic!("transaction disappeared"),
-        };
-        assert_eq!(exec, RespValue::Error(String::from("EXECABORT")));
+        let mut open = Some(transaction);
+        let plan = take_exec_plan(&mut open);
+        assert!(
+            matches!(plan, ExecPlan::Abort),
+            "a dirty queue must abort instead of producing a proposal: {plan:?}"
+        );
+        assert!(open.is_none(), "EXEC must consume the queue it aborted");
+        assert!(matches!(take_exec_plan(&mut open), ExecPlan::NoTransaction));
     }
 
     #[test]
@@ -4054,6 +4320,136 @@ mod tests {
             },
         };
         assert!(!message_features_are_allowed(&request, negotiated));
+    }
+
+    #[test]
+    fn trap_plain_resp_has_no_reconnect_dedup_claim() {
+        // A plain RESP write carries no replicated session envelope, so it
+        // makes no exactly-once claim across a reconnect. Only the explicit
+        // wrapper does, and it must name a nonzero client and sequence.
+        let bulk = |value: &[u8]| cc_resp::RespValue::Bulk(Some(value.to_vec()));
+        let plain = cc_resp::parse_command(cc_resp::RespValue::Array(vec![
+            bulk(b"SET"),
+            bulk(b"k"),
+            bulk(b"v"),
+        ]))
+        .expect("plain SET parses");
+        assert!(matches!(plain, ClientCommand::Set { .. }));
+        assert!(
+            !matches!(plain, ClientCommand::Request { .. }),
+            "a plain command must never carry a session identity"
+        );
+
+        let wrapped = cc_resp::parse_command(cc_resp::RespValue::Array(vec![
+            bulk(b"CC.REQUEST"),
+            bulk(b"7"),
+            bulk(b"3"),
+            bulk(b"SET"),
+            bulk(b"k"),
+            bulk(b"v"),
+        ]))
+        .expect("CC.REQUEST parses");
+        assert!(matches!(
+            wrapped,
+            ClientCommand::Request {
+                client: 7,
+                sequence: 3,
+                ..
+            }
+        ));
+        // A zero identity is refused before it can reach the replicated
+        // session table, so it can never alias a cached reply.
+        assert!(
+            SessionKey::new(SessionNamespace::UserRequest as u8, ClientId::new(0)).is_err(),
+            "a zero client is not a session"
+        );
+        let source = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/driver_host.rs"),
+        )
+        .expect("read adapter source");
+        assert!(
+            source.contains("if session_client == 0 || sequence == 0 {"),
+            "CC.REQUEST must refuse a zero identity before submitting"
+        );
+    }
+
+    #[test]
+    fn trap_plain_resp_route_id_never_aliases_persisted_session() {
+        // Route ids are host-local connection counters. They are never used
+        // to build a persisted session key, so a counter reused after restart
+        // cannot alias an old cached reply.
+        let session = SessionKey::new(SessionNamespace::UserRequest as u8, ClientId::new(9))
+            .expect("explicit session");
+        assert_eq!(session.namespace, SessionNamespace::UserRequest as u8);
+        // The host-local route allocator hands out fresh, strictly increasing
+        // ids that carry no namespace at all.
+        let next = AtomicU64::new(1);
+        let first = ClientId::new(next.fetch_add(1, Ordering::Relaxed));
+        let second = ClientId::new(next.fetch_add(1, Ordering::Relaxed));
+        assert_ne!(first, second);
+        // Only an explicit envelope produces a session; a plain route never
+        // reaches the persisted namespace.
+        assert!(
+            SessionKey::new(SessionNamespace::UserRequest as u8, ClientId::new(0)).is_err(),
+            "a zero identity is not a session"
+        );
+        assert_no_source_contains(&[
+            "SessionKey::new(SessionNamespace::UserRequest as u8, client)",
+        ]);
+    }
+
+    #[test]
+    fn trap_v3_capability_is_advertised_only_after_local_ccid_fsync() {
+        // CCHL advertises semantic v3 unconditionally, so the durable
+        // downgrade fence must already be at least v3 before any listener
+        // exists. `run` raises the CCID floor before it binds a socket.
+        const { assert!(crate::MIN_SEMANTIC_READER >= SEMANTIC_VERSION_V3) };
+        let source = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/driver_host.rs"),
+        )
+        .expect("read adapter source");
+        let run = source.split("pub(crate) fn run(").nth(1).expect("run body");
+        let raise = run
+            .find("raise_identity_semantic_reader")
+            .expect("run raises the semantic reader floor");
+        let bind = run.find("TcpListener::bind").expect("run binds listeners");
+        assert!(
+            raise < bind,
+            "the CCID semantic fence must be durable before any listener advertises v3"
+        );
+        let config = Config {
+            id: 1,
+            cluster_id: cc_core::ClusterId::from_hex("00112233445566778899aabbccddeeff")
+                .expect("cluster id"),
+            data_dir: PathBuf::from("."),
+            listen_client: String::from("127.0.0.1:0"),
+            listen_peer: String::from("127.0.0.1:0"),
+            listen_metrics: String::from("127.0.0.1:0"),
+            peers: Vec::new(),
+        };
+        assert_eq!(local_hello(&config).semantic_max, SEMANTIC_VERSION_V3);
+    }
+
+    #[test]
+    fn trap_entryv3_fsyncs_ccid_before_log_ack() {
+        // A v3 entry may only be appended or acknowledged by a node whose
+        // durable reader floor already refuses an older binary. The adapter
+        // raises that floor during boot, before the Driver — and therefore
+        // before any log record — exists.
+        const { assert!(crate::MIN_SEMANTIC_READER >= SEMANTIC_VERSION_V3) };
+        let source = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/driver_host.rs"),
+        )
+        .expect("read adapter source");
+        let run = source.split("pub(crate) fn run(").nth(1).expect("run body");
+        let raise = run
+            .find("raise_identity_semantic_reader")
+            .expect("run raises the semantic reader floor");
+        let boot = run.find("DriverHost::boot(").expect("run boots the driver");
+        assert!(
+            raise < boot,
+            "the log must not open before the CCID semantic fence is durable"
+        );
     }
 
     #[test]

@@ -2992,6 +2992,7 @@ impl Node {
                 self.session_expiry_sweep_inflight = self.pending_internal_sweep(true);
                 if self.continuation.is_none()
                     && self.raft.role == Role::Leader
+                    && self.raft.leadership_transfer_state().is_none()
                     && !self.expiry_sweep_inflight
                     && self
                         .kv
@@ -3012,6 +3013,7 @@ impl Node {
                     output.extend(self.map_effects(effects, None)?);
                 } else if self.continuation.is_none()
                     && self.raft.role == Role::Leader
+                    && self.raft.leadership_transfer_state().is_none()
                     && !self.session_expiry_sweep_inflight
                     && self
                         .sessions
@@ -3307,14 +3309,20 @@ impl Node {
         {
             return Err(NodeError::Kv(KvError::Busy));
         }
-        let effects = self.raft.propose(
-            AppEnvelope {
-                session,
-                leader_time,
-                command,
-            }
-            .encode(),
-        )?;
+        // A batch is a semantic-v3 state-machine transition, so it must occupy
+        // a v3 entry. Proposing it as a plain `App` entry would make every
+        // node reject its own committed work as malformed.
+        let envelope = AppEnvelope {
+            session,
+            leader_time,
+            command,
+        }
+        .encode();
+        let effects = if matches!(parsed, KvCommand::Batch { .. }) {
+            self.raft.propose_v3_batch(envelope)?
+        } else {
+            self.raft.propose(envelope)?
+        };
         let index = self.raft.last_index();
         self.client_routes.insert(index, (route_client, route_req));
         if reservation != SessionReservation::default() {
@@ -3376,7 +3384,7 @@ impl Node {
             membership: self.raft.membership_state_at(self.kv.applied_index),
             kv: kv.logical_snapshot(kv.last_leader_time()),
             sessions,
-            leadership_transfer: self.raft.leadership_transfer_state(),
+            leadership_transfer: self.raft.snapshot_leadership_transfer(),
         })
         .map(|encoder| encoder.total_len())
         .map_err(|_| NodeError::Kv(KvError::TooLarge))
@@ -3386,9 +3394,7 @@ impl Node {
         self.raft
             .log
             .iter()
-            .filter(|entry| {
-                entry.index > self.raft.applied_index && entry.kind.is_config()
-            })
+            .filter(|entry| entry.index > self.raft.applied_index && entry.kind.is_config())
             .filter_map(|entry| ConfigEnvelope::decode(&entry.payload).ok())
             .find_map(|envelope| envelope.admin_session.map(|(key, _)| key))
     }
@@ -3397,9 +3403,7 @@ impl Node {
         self.raft
             .log
             .iter()
-            .filter(|entry| {
-                entry.index > self.raft.applied_index && entry.kind.is_app()
-            })
+            .filter(|entry| entry.index > self.raft.applied_index && entry.kind.is_app())
             .filter_map(|entry| decode_proposal(entry).ok().flatten())
             .filter_map(|envelope| decode_command(&envelope.command).ok())
             .any(|command| {
@@ -3636,10 +3640,7 @@ impl Node {
                     let envelope = ConfigEnvelope::decode(&entry.payload)
                         .map_err(|_| NodeError::MalformedCommittedEntry(entry.index))?;
                     if matches!(entry.kind, cc_raft::EntryKind::ConfigV3)
-                        != matches!(
-                            envelope.operation,
-                            ConfigOperation::ActivateFeature { .. }
-                        )
+                        != matches!(envelope.operation, ConfigOperation::ActivateFeature { .. })
                     {
                         return Err(NodeError::MalformedCommittedEntry(entry.index));
                     }
@@ -4109,7 +4110,7 @@ impl Node {
             kv,
             sessions: self.sessions.clone(),
             membership: self.raft.membership_state_at(self.kv.applied_index),
-            leadership_transfer: self.raft.leadership_transfer_state(),
+            leadership_transfer: self.raft.snapshot_leadership_transfer(),
             cluster_policy: self.config.policy,
             last_included_index: self.raft.applied_index,
             last_included_term: self
@@ -4149,7 +4150,7 @@ impl Node {
             membership: self.raft.membership_state_at(self.kv.applied_index),
             kv: self.kv.logical_snapshot(self.kv.last_leader_time()),
             sessions: self.sessions.clone(),
-            leadership_transfer: self.raft.leadership_transfer_state(),
+            leadership_transfer: self.raft.snapshot_leadership_transfer(),
         })
     }
 
@@ -4163,7 +4164,7 @@ impl Node {
             membership: self.raft.membership_state_at(self.kv.applied_index),
             kv: self.kv.logical_snapshot(self.kv.last_leader_time()),
             sessions: self.sessions.clone(),
-            leadership_transfer: self.raft.leadership_transfer_state(),
+            leadership_transfer: self.raft.snapshot_leadership_transfer(),
         })
     }
 
@@ -4223,8 +4224,12 @@ impl Node {
         self.raft
             .restore_membership_state(snapshot.membership)
             .map_err(NodeError::Raft)?;
+        // BeginLeaderTransfer may already sit at or below the snapshot index,
+        // so the retained suffix cannot reconstruct it. Dropping the snapshot
+        // field made TimeoutNow and Finish un-replicable after compaction:
+        // followers rejected both, and the leader stayed TransferInProgress.
         self.raft
-            .restore_leadership_transfer(None)
+            .restore_leadership_transfer(snapshot.leadership_transfer)
             .map_err(NodeError::Raft)?;
         self.kv = kv;
         self.sessions = snapshot.sessions;
@@ -4365,7 +4370,7 @@ fn decode_proposal(entry: &Entry) -> Result<Option<AppEnvelope>, KvError> {
 mod tests {
     use super::*;
     use cc_core::Term;
-    use cc_raft::{AppendResponse, MessageKind, PROTOCOL_VERSION};
+    use cc_raft::{AppendResponse, MessageKind, PROTOCOL_VERSION, RaftEffect, Role};
 
     fn config(id: u64) -> NodeConfig {
         NodeConfig {
@@ -4516,6 +4521,32 @@ mod tests {
         let crc = crc32c_zeroed_tail(&encoded);
         encoded[last..].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(AppEnvelope::decode(&encoded), Err(KvError::InvalidInput));
+    }
+
+    #[test]
+    fn golden_ccap_v1() {
+        // The checked-in compatibility-base vector is the authority for CCAP
+        // v1 bytes: this build must decode it and re-encode it exactly.
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bytes = std::fs::read(root.join("tests/golden/compat-base/ccap-v1.bin"))
+            .expect("read CCAP v1 golden");
+        let envelope = AppEnvelope::decode(&bytes).expect("decode CCAP v1 golden");
+        assert_eq!(
+            envelope.encode(),
+            bytes,
+            "CCAP v1 encoding is not canonical"
+        );
+        assert_eq!(
+            bytes.get(..4),
+            Some(&APP_ENVELOPE_MAGIC.to_le_bytes()[..]),
+            "CCAP keeps its own magic"
+        );
+        // Truncation and corruption are typed errors, never partial reads.
+        assert!(AppEnvelope::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut corrupt = bytes.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0x80;
+        assert!(AppEnvelope::decode(&corrupt).is_err());
     }
 
     #[test]
@@ -5250,6 +5281,63 @@ mod tests {
     }
 
     #[test]
+    fn trap_ccsn_install_restores_transfer_so_timeout_now_can_elect() {
+        let voters: BTreeSet<NodeId> = [NodeId::new(1), NodeId::new(2)].into_iter().collect();
+        let mut source = Node::new(config(1), voters.clone()).expect("source");
+        source.kv.apply_command_only(
+            LogIndex::new(7),
+            Term::new(2),
+            KvCommand::Ping,
+            Time::from_nanos(10),
+        );
+        source.raft.applied_index = LogIndex::new(7);
+        let admin = SessionKey::new(SessionNamespace::AdminRequest as u8, ClientId::new(77))
+            .expect("admin");
+        let transfer = LeadershipTransferState {
+            intent_index: LogIndex::new(7),
+            target: NodeId::new(2),
+            deadline: Time::from_nanos(100),
+            finishing: false,
+            admin_session: Some((admin, 9)),
+        };
+        source
+            .raft
+            .restore_leadership_transfer(Some(transfer))
+            .expect("transfer state");
+        let bytes = source.encode_ccsn_snapshot().expect("checkpoint");
+        let decoded = decode_ccsn(&bytes, [7; 16], u64::MAX).expect("decode");
+        let mut target = Node::new(config(2), voters).expect("target");
+        target
+            .install_decoded_ccsn_snapshot(decoded)
+            .expect("install CCSN");
+        assert_eq!(
+            target.raft.leadership_transfer_state(),
+            Some(transfer),
+            "peer snapshot install must keep the compacted Begin workflow"
+        );
+        target.raft.role = Role::Follower;
+        target.raft.hard_state.term = Term::new(2);
+        target.raft.leader_id = Some(NodeId::new(1));
+        let effects = target.raft.on_message(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(1),
+            to: NodeId::new(2),
+            term: Term::new(2),
+            kind: MessageKind::TimeoutNow {
+                intent_index: LogIndex::new(7),
+            },
+        });
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                RaftEffect::PersistHard(hard)
+                    if hard.term == Term::new(3) && hard.voted_for == Some(NodeId::new(2))
+            )),
+            "TimeoutNow must start an election after CCSN compaction: {effects:?}"
+        );
+    }
+
+    #[test]
     fn trap_ccsn_stream_decoder_matches_complete_decoder_without_raw_image_buffer() {
         let voters: BTreeSet<NodeId> = [NodeId::new(1)].into_iter().collect();
         let mut source = Node::new(config(1), voters).expect("source");
@@ -5410,6 +5498,160 @@ mod tests {
         );
         assert_eq!(conflict, KvReply::Error(KvError::SequenceConflict));
         assert_eq!(mutations, 1);
+    }
+
+    #[test]
+    fn trap_peer_identity_must_match_inner_frame() {
+        let voters = [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+            .into_iter()
+            .collect();
+        let mut node = Node::new(config(1), voters).expect("node");
+        let mut blocks = cc_store::MemoryBlockSource::default();
+        let honest = Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(2),
+            to: NodeId::new(1),
+            term: Term::new(1),
+            kind: MessageKind::VoteReq {
+                last_index: LogIndex::new(0),
+                last_term: Term::new(0),
+            },
+        };
+        let payload = cc_raft::codec::encode(&honest).expect("CCRP encode");
+        let msg = cc_env::WireMsg::new(honest.proto_version, payload.clone());
+
+        // The connection this frame arrived on says n3; the frame says n2.
+        // A transport identity that disagrees with the inner frame is
+        // refused, so a peer cannot speak in another node's name.
+        let step = node.on_env_input(
+            Time::from_nanos(1),
+            cc_env::Input::Recv {
+                from: NodeId::new(3),
+                msg: msg.clone(),
+            },
+            &mut blocks,
+        );
+        assert_eq!(
+            step.outcome,
+            Err(NodeError::Environment("peer CCRP identity"))
+        );
+
+        // A frame addressed to a different node is refused for the same
+        // reason, and the matching pair is accepted.
+        let misaddressed = Message {
+            to: NodeId::new(9),
+            ..honest.clone()
+        };
+        let wrong_target = cc_env::WireMsg::new(
+            misaddressed.proto_version,
+            cc_raft::codec::encode(&misaddressed).expect("CCRP encode"),
+        );
+        assert_eq!(
+            node.on_env_input(
+                Time::from_nanos(2),
+                cc_env::Input::Recv {
+                    from: NodeId::new(2),
+                    msg: wrong_target,
+                },
+                &mut blocks,
+            )
+            .outcome,
+            Err(NodeError::Environment("peer CCRP identity"))
+        );
+        assert!(
+            node.on_env_input(
+                Time::from_nanos(3),
+                cc_env::Input::Recv {
+                    from: NodeId::new(2),
+                    msg,
+                },
+                &mut blocks,
+            )
+            .outcome
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn trap_cc_request_deduplicates_across_reconnect() {
+        // The replicated session identity, not the host route, owns the
+        // exactly-once claim. A caller that reconnects on a new socket and
+        // replays the same (client, sequence) gets the cached reply back and
+        // mutates nothing a second time.
+        let mut sessions = SessionTable::default();
+        let key = SessionKey::new(SessionNamespace::UserRequest as u8, ClientId::new(7))
+            .expect("session key");
+        let command = encode_command(&KvCommand::Incr {
+            key: b"counter".to_vec(),
+            delta: 1,
+        });
+        let mut applied = 0_u64;
+        let first = sessions.apply_user(
+            ClusterPolicy::default(),
+            key,
+            9,
+            command.clone(),
+            Time::from_nanos(1),
+            || {
+                applied += 1;
+                KvReply::Integer(1)
+            },
+        );
+        assert_eq!(first, KvReply::Integer(1));
+
+        // A different route id — a new connection — with the same replicated
+        // identity and canonical bytes.
+        let retry = sessions.apply_user(
+            ClusterPolicy::default(),
+            key,
+            9,
+            command,
+            Time::from_nanos(50),
+            || {
+                applied += 1;
+                KvReply::Integer(2)
+            },
+        );
+        assert_eq!(retry, first, "the retry must be byte-identical");
+        assert_eq!(applied, 1, "a reconnect must not re-apply the command");
+    }
+
+    #[test]
+    fn trap_client_route_generation_drops_late_reply() {
+        let voters = [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+            .into_iter()
+            .collect();
+        let mut node = Node::new(config(1), voters).expect("node");
+        node.raft.role = Role::Leader;
+        node.raft.hard_state.term = Term::new(1);
+        node.on_input(NodeInput::ClientBytes {
+            route_client: ClientId::new(21),
+            route_req: 5,
+            session: None,
+            command: encode_command(&KvCommand::Ping),
+            leader_time: Time::from_nanos(1),
+        })
+        .expect("plain request");
+        complete_persistence(&mut node);
+        let index = node.raft.last_index();
+        assert_eq!(
+            node.client_routes.get(&index).copied(),
+            Some((ClientId::new(21), 5))
+        );
+
+        // The connection goes away before the entry commits. The route is
+        // dropped, so committed apply publishes no reply into a socket that a
+        // later connection could be holding under the same route id.
+        node.client_routes.remove(&index);
+        let entry = node.raft.log.last().expect("entry").clone();
+        let effects = append_committed(&mut node, LogIndex::new(index.get() - 1), vec![entry]);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, NodeEffect::ClientReply { .. })),
+            "a late reply escaped to a dropped route: {effects:?}"
+        );
+        assert_eq!(node.raft.applied_index, index, "apply still completed");
     }
 
     #[cfg(feature = "kata05")]
@@ -5856,7 +6098,7 @@ mod tests {
                 vec![Entry {
                     term: Term::new(1),
                     index: LogIndex::new(index),
-                    kind: cc_raft::EntryKind::App,
+                    kind: cc_raft::EntryKind::AppV3,
                     payload: payload.clone(),
                 }],
             );

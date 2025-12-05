@@ -90,6 +90,14 @@ impl EntryKind {
     pub const fn is_config(self) -> bool {
         matches!(self, Self::Config | Self::ConfigV3)
     }
+
+    /// The v2 `Entry` layout is frozen, so a kind that only exists under the
+    /// v3 layout cannot be encoded at v2. An append carrying one must declare
+    /// v3 on the wire.
+    #[must_use]
+    pub const fn requires_semantic_v3(self) -> bool {
+        matches!(self, Self::AppV3 | Self::ConfigV3)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,7 +347,7 @@ pub struct RaftNode {
     /// acknowledgement from each peer. It is advisory availability evidence,
     /// never persisted consensus state.
     pub last_contact: BTreeMap<NodeId, Time>,
-    retiring_peers: BTreeMap<NodeId, LogIndex>,
+    retiring_peers: BTreeMap<NodeId, RetiringPeer>,
     pub election_deadline: Time,
     pub heartbeat_deadline: Time,
     pub config: RaftConfig,
@@ -355,6 +363,15 @@ pub struct RaftNode {
     snapshot_term: Term,
     next_snapshot_transfer_id: u64,
     transfer: Option<LeadershipTransfer>,
+}
+
+/// A voter that a committed `LeaveJoint` removed. It is no longer part of any
+/// quorum, but the leader keeps a best-effort route so the node can learn that
+/// its own removal committed and retire itself. Volatile leader state only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetiringPeer {
+    terminal: LogIndex,
+    farewell_sent: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -464,6 +481,7 @@ impl RaftNode {
     }
 
     pub fn tick(&mut self, now: Time) -> Vec<RaftEffect> {
+        self.resync_transfer_finishing();
         if self.role == Role::Leader
             && self
                 .transfer
@@ -643,6 +661,7 @@ impl RaftNode {
             || self.joint.is_some()
             || self.voters.contains(&node)
             || self.learners.contains(&node)
+            || self.uncommitted_membership_change()
             || self.config_transition_in_flight_before(LogIndex::new(
                 self.last_index().get().saturating_add(1),
             ))
@@ -690,6 +709,7 @@ impl RaftNode {
         if self.joint.is_some()
             || new_voters.is_empty()
             || new_voters.iter().any(|id| id.get() == 0)
+            || self.uncommitted_membership_change()
         {
             return Err(RaftError::Busy);
         }
@@ -872,7 +892,13 @@ impl RaftNode {
             .copied()
             .filter(|peer| *peer != self.id)
         {
-            self.retiring_peers.insert(peer, terminal_index);
+            self.retiring_peers.insert(
+                peer,
+                RetiringPeer {
+                    terminal: terminal_index,
+                    farewell_sent: false,
+                },
+            );
         }
         let mut effects = vec![RaftEffect::PersistEntries(vec![entry])];
         effects.extend(self.broadcast_append());
@@ -922,6 +948,7 @@ impl RaftNode {
                     || self.voters.contains(id)
                     || self.learners.contains(id)
                     || self.addresses.values().any(|existing| existing == address)
+                    || self.uncommitted_membership_change()
                     || self.config_transition_in_flight_before(next_index)
                 {
                     return Err(RaftError::InvalidMessage);
@@ -930,6 +957,7 @@ impl RaftNode {
             ConfigOperation::RemoveLearner { id } => {
                 if self.joint.is_some()
                     || !self.learners.contains(id)
+                    || self.uncommitted_membership_change()
                     || self.config_transition_in_flight_before(next_index)
                 {
                     return Err(RaftError::InvalidMessage);
@@ -942,6 +970,7 @@ impl RaftNode {
                         .addresses
                         .iter()
                         .any(|(node, existing)| node != id && existing == address)
+                    || self.uncommitted_membership_change()
                     || self.config_transition_in_flight_before(next_index)
                 {
                     return Err(RaftError::InvalidMessage);
@@ -952,6 +981,7 @@ impl RaftNode {
                     || new_voters.is_empty()
                     || new_voters == &self.voters
                     || new_voters.iter().any(|id| id.get() == 0)
+                    || self.uncommitted_membership_change()
                     || self.config_transition_in_flight_before(next_index)
                 {
                     return Err(RaftError::Busy);
@@ -1126,6 +1156,20 @@ impl RaftNode {
             finishing: transfer.finishing,
             admin_session: transfer.admin_session,
         })
+    }
+
+    /// Transfer workflow that belongs in a logical snapshot at `applied_index`.
+    /// An uncommitted Finish is not part of that prefix, so the snapshot must
+    /// not carry a sticky `finishing` flag that would later skip TimeoutNow
+    /// and the timeout append after compaction.
+    #[must_use]
+    pub fn snapshot_leadership_transfer(&self) -> Option<LeadershipTransferState> {
+        let mut transfer = self.leadership_transfer_state()?;
+        if transfer.intent_index > self.applied_index {
+            return None;
+        }
+        transfer.finishing = false;
+        Some(transfer)
     }
 
     /// Restore the committed transfer workflow carried by a logical snapshot.
@@ -1640,6 +1684,7 @@ impl RaftNode {
         // leader.  The first leader elected afterwards makes the terminal
         // result durable in its own term so the workflow cannot pause future
         // proposals indefinitely after a crash.
+        self.resync_transfer_finishing();
         if let Some(transfer) = self.transfer
             && !transfer.finishing
         {
@@ -1878,11 +1923,31 @@ impl RaftNode {
         }
         if response.success {
             self.last_contact.insert(message.from, now);
-            if self
+            if let Some(retiring) = self
                 .retiring_peers
                 .get(&message.from)
-                .is_some_and(|terminal| response.match_index >= *terminal)
+                .copied()
+                .filter(|retiring| response.match_index >= retiring.terminal)
             {
+                // Holding the entry is not knowing it committed. A retired
+                // voter dropped here would never apply its own removal and
+                // would keep serving clients, so the route survives until the
+                // leader has both committed the terminal entry and delivered
+                // a farewell append carrying that commit.
+                if self.commit_index < retiring.terminal {
+                    self.append_response_from_peer(message.from, response);
+                    return Vec::new();
+                }
+                if !retiring.farewell_sent {
+                    self.retiring_peers.insert(
+                        message.from,
+                        RetiringPeer {
+                            farewell_sent: true,
+                            ..retiring
+                        },
+                    );
+                    return self.send_append(message.from);
+                }
                 self.retiring_peers.remove(&message.from);
                 self.next_index.remove(&message.from);
                 self.match_index.remove(&message.from);
@@ -1893,6 +1958,21 @@ impl RaftNode {
         self.append_response_from_peer(message.from, response)
     }
 
+    /// An append declares the lowest semantic version that can describe every
+    /// entry it carries. Feature activation already proves each voter and
+    /// learner advertises v3 before a v3 entry can exist, so raising the
+    /// version here never surprises a v2-only peer.
+    fn append_semantic_version(entries: &[Entry]) -> u16 {
+        if entries
+            .iter()
+            .any(|entry| entry.kind.requires_semantic_v3())
+        {
+            SEMANTIC_VERSION_V3
+        } else {
+            PROTOCOL_VERSION
+        }
+    }
+
     fn send_append(&self, peer: NodeId) -> Vec<RaftEffect> {
         let next = self
             .next_index
@@ -1901,7 +1981,7 @@ impl RaftNode {
             .unwrap_or(LogIndex::new(self.last_index().get() + 1));
         let prev_index = LogIndex::new(next.get().saturating_sub(1));
         let prev_term = self.term_at(prev_index).unwrap_or(Term::new(0));
-        let entries = self
+        let entries: Vec<Entry> = self
             .log
             .iter()
             .filter(|entry| entry.index >= next)
@@ -1909,7 +1989,7 @@ impl RaftNode {
             .cloned()
             .collect();
         vec![RaftEffect::Send(Message {
-            proto_version: PROTOCOL_VERSION,
+            proto_version: Self::append_semantic_version(&entries),
             from: self.id,
             to: peer,
             term: self.hard_state.term,
@@ -2239,7 +2319,45 @@ impl RaftNode {
         Ok(())
     }
 
+    /// `finishing` records that a terminal transfer entry exists in the log,
+    /// not that the workflow is over. A suffix truncation can remove that
+    /// entry before it ever commits, and a sticky flag would then wedge the
+    /// cluster: the timeout tick and the newly elected leader both skip a
+    /// transfer that claims to be finishing, so nothing would ever retry and
+    /// every later proposal would fail with `TransferInProgress`. The inverse
+    /// is also required: a snapshot that restored `finishing=false` while the
+    /// retained suffix still holds Finish must not append a second terminal.
+    fn resync_transfer_finishing(&mut self) {
+        let Some(transfer) = self.transfer else {
+            return;
+        };
+        // A terminal entry can only sit above its own intent, so the scan
+        // stops there instead of walking the whole retained log.
+        let terminal_entry_present = self
+            .log
+            .iter()
+            .rev()
+            .take_while(|entry| entry.index > transfer.intent_index)
+            .any(|entry| {
+                entry.kind.is_config()
+                    && ConfigEnvelope::decode(&entry.payload).is_ok_and(|envelope| {
+                        matches!(
+                            envelope.operation,
+                            ConfigOperation::FinishLeaderTransfer { intent_index, .. }
+                                if intent_index == transfer.intent_index
+                        )
+                    })
+            });
+        if transfer.finishing != terminal_entry_present {
+            self.transfer = Some(LeadershipTransfer {
+                finishing: terminal_entry_present,
+                ..transfer
+            });
+        }
+    }
+
     fn rebuild_membership_from_log(&mut self) {
+        self.resync_transfer_finishing();
         self.voters = self.base_voters.clone();
         self.learners = self.base_learners.clone();
         self.joint = self.base_joint.clone();
@@ -2289,7 +2407,13 @@ impl RaftNode {
                             .copied()
                             .filter(|peer| *peer != self.id)
                         {
-                            self.retiring_peers.insert(peer, entry.index);
+                            self.retiring_peers.insert(
+                                peer,
+                                RetiringPeer {
+                                    terminal: entry.index,
+                                    farewell_sent: false,
+                                },
+                            );
                         }
                         self.voters = new;
                     }
@@ -2317,6 +2441,30 @@ impl RaftNode {
     /// one permitted multi-entry workflow.  This examines only the prefix
     /// before `index`, making it correct both while appending a fresh entry and
     /// while replaying a retained suffix after truncation.
+    /// One membership change at a time is a leader-side admission rule. A
+    /// config entry above the commit index is already in this log but is not
+    /// yet cluster state, so proposing a second one would put two overlapping
+    /// transitions in flight. Followers deliberately do not apply this rule:
+    /// they must accept whatever prefix their leader replicates.
+    fn uncommitted_membership_change(&self) -> bool {
+        self.log
+            .iter()
+            .rev()
+            .take_while(|entry| entry.index > self.commit_index)
+            .filter(|entry| entry.kind.is_config())
+            .any(|entry| {
+                ConfigEnvelope::decode(&entry.payload).is_ok_and(|envelope| {
+                    matches!(
+                        envelope.operation,
+                        ConfigOperation::AddLearner { .. }
+                            | ConfigOperation::RemoveLearner { .. }
+                            | ConfigOperation::UpdateAddress { .. }
+                            | ConfigOperation::EnterJoint { .. }
+                    )
+                })
+            })
+    }
+
     fn config_transition_in_flight_before(&self, index: LogIndex) -> bool {
         let mut transfer = None;
         for entry in self
@@ -3114,20 +3262,140 @@ mod tests {
         );
         assert!(leader.has_retiring_peers());
         let terminal = leader.last_index();
+        let ack = |leader: &mut RaftNode| {
+            leader.on_message(Message {
+                proto_version: PROTOCOL_VERSION,
+                from: NodeId::new(3),
+                to: NodeId::new(1),
+                term: Term::new(1),
+                kind: MessageKind::AppendResp(AppendResponse {
+                    success: true,
+                    match_index: terminal,
+                    conflict_term: None,
+                    conflict_index: LogIndex::new(0),
+                    read_round: 0,
+                }),
+            })
+        };
+        // Storing the entry is not knowing it committed. Until the leader can
+        // prove the commit, the removed voter keeps its route or it would
+        // never apply its own removal.
+        assert!(ack(&mut leader).is_empty());
+        assert!(leader.has_retiring_peers());
+
+        leader.commit_index = terminal;
+        let farewell = ack(&mut leader);
+        assert!(
+            farewell.iter().any(|effect| matches!(
+                effect,
+                RaftEffect::Send(Message {
+                    to,
+                    kind: MessageKind::AppendReq(AppendRequest { leader_commit, .. }),
+                    ..
+                }) if *to == NodeId::new(3) && *leader_commit >= terminal
+            )),
+            "the farewell append must carry the commit that retires the voter: {farewell:?}"
+        );
+        // The route survives until the retired voter acknowledges that
+        // farewell, so a single lost datagram cannot strand it.
+        assert!(leader.has_retiring_peers());
+        assert!(ack(&mut leader).is_empty());
+        assert!(!leader.has_retiring_peers());
+    }
+
+    #[test]
+    fn trap_only_one_config_change_can_be_in_flight() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(1);
+        leader.add_learner(NodeId::new(4)).expect("first learner");
+        // A second membership change while the first is still uncommitted is
+        // refused; joint consensus is only safe one transition at a time.
+        assert_eq!(
+            leader.add_learner(NodeId::new(5)),
+            Err(RaftError::InvalidMessage)
+        );
+        let joint: BTreeSet<NodeId> = [
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(leader.enter_joint(joint.clone()), Err(RaftError::Busy));
+
+        // Once the first change commits, the next one is admitted.
+        leader.commit_index = leader.last_index();
+        let entry = leader
+            .log
+            .iter()
+            .rev()
+            .find(|entry| entry.kind.is_config())
+            .cloned()
+            .expect("committed learner entry");
+        leader
+            .apply_committed_config(&entry)
+            .expect("committed learner");
+        leader.applied_index = leader.commit_index;
+        leader
+            .enter_joint(joint)
+            .expect("second change is admitted");
+
+        // A joint transition is itself in flight until LeaveJoint commits.
+        assert_eq!(
+            leader.add_learner(NodeId::new(6)),
+            Err(RaftError::InvalidMessage)
+        );
+    }
+
+    #[test]
+    fn trap_learner_append_response_cannot_commit() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(1);
+        leader.add_learner(NodeId::new(4)).expect("learner");
+        leader.propose(b"payload".to_vec()).expect("proposal");
+        let target = leader.last_index();
+        assert!(leader.commit_index < target);
+
+        // A learner replicates but never counts toward any quorum, so its
+        // acknowledgement alone cannot advance the commit index.
+        for _ in 0..3 {
+            leader.on_message(Message {
+                proto_version: PROTOCOL_VERSION,
+                from: NodeId::new(4),
+                to: NodeId::new(1),
+                term: Term::new(1),
+                kind: MessageKind::AppendResp(AppendResponse {
+                    success: true,
+                    match_index: target,
+                    conflict_term: None,
+                    conflict_index: LogIndex::new(0),
+                    read_round: 0,
+                }),
+            });
+        }
+        assert!(
+            leader.commit_index < target,
+            "a learner acknowledgement formed a quorum"
+        );
+
+        // One real voter completes the majority with the leader itself.
         leader.on_message(Message {
             proto_version: PROTOCOL_VERSION,
-            from: NodeId::new(3),
+            from: NodeId::new(2),
             to: NodeId::new(1),
             term: Term::new(1),
             kind: MessageKind::AppendResp(AppendResponse {
                 success: true,
-                match_index: terminal,
+                match_index: target,
                 conflict_term: None,
                 conflict_index: LogIndex::new(0),
                 read_round: 0,
             }),
         });
-        assert!(!leader.has_retiring_peers());
+        assert_eq!(leader.commit_index, target);
     }
 
     #[test]
@@ -3560,6 +3828,49 @@ mod tests {
     }
 
     #[test]
+    fn trap_append_carrying_a_v3_entry_declares_semantic_v3() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(1);
+        leader.log.push(Entry {
+            term: Term::new(1),
+            index: LogIndex::new(1),
+            kind: EntryKind::App,
+            payload: b"v2".to_vec(),
+        });
+        for peer in [NodeId::new(2), NodeId::new(3)] {
+            leader.next_index.insert(peer, LogIndex::new(1));
+        }
+        for effect in leader.broadcast_append() {
+            let RaftEffect::Send(message) = effect else {
+                continue;
+            };
+            assert_eq!(message.proto_version, PROTOCOL_VERSION);
+            codec::encode(&message).expect("a v2 append encodes at v2");
+        }
+
+        leader.log.push(Entry {
+            term: Term::new(1),
+            index: LogIndex::new(2),
+            kind: EntryKind::ConfigV3,
+            payload: b"activate".to_vec(),
+        });
+        let mut sends = 0;
+        for effect in leader.broadcast_append() {
+            let RaftEffect::Send(message) = effect else {
+                continue;
+            };
+            sends += 1;
+            assert_eq!(
+                message.proto_version, SEMANTIC_VERSION_V3,
+                "an append carrying a v3 entry must declare v3"
+            );
+            codec::encode(&message).expect("a v3 append encodes at v3");
+        }
+        assert!(sends > 0, "leader must broadcast to its peers");
+    }
+
+    #[test]
     fn trap_join_discovery_membership_never_grants_a_vote() {
         let mut joining = RaftNode::new(
             NodeId::new(9),
@@ -3918,6 +4229,39 @@ mod tests {
     }
 
     #[test]
+    fn trap_timeout_now_survives_snapshot_compaction_of_the_intent() {
+        let mut target = node(2);
+        target.hard_state.term = Term::new(3);
+        target.leader_id = Some(NodeId::new(1));
+        let transfer = LeadershipTransferState {
+            intent_index: LogIndex::new(4),
+            target: NodeId::new(2),
+            deadline: Time::from_nanos(20),
+            finishing: false,
+            admin_session: None,
+        };
+        target.applied_index = transfer.intent_index;
+        target
+            .restore_leadership_transfer(Some(transfer))
+            .expect("restore compacted intent");
+        target.install_snapshot_state(transfer.intent_index, Term::new(3));
+        target.replay_retained_membership_suffix();
+        let effects = target.on_message(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(1),
+            to: NodeId::new(2),
+            term: Term::new(3),
+            kind: MessageKind::TimeoutNow {
+                intent_index: transfer.intent_index,
+            },
+        });
+        assert!(
+            matches!(effects.first(), Some(RaftEffect::PersistHard(hard)) if hard.term == Term::new(4) && hard.voted_for == Some(NodeId::new(2))),
+            "TimeoutNow must not require the compacted Begin entry to remain in the log: {effects:?}"
+        );
+    }
+
+    #[test]
     fn trap_wrong_target_or_stale_transfer_cannot_complete() {
         let mut target = node(2);
         target.hard_state.term = Term::new(3);
@@ -3997,6 +4341,77 @@ mod tests {
         assert!(
             finish.is_some(),
             "new target leader must append success finish"
+        );
+    }
+
+    #[test]
+    fn trap_leadership_transfer_recovers_or_finishes_after_crash() {
+        let mut leader = node(1);
+        leader.role = Role::Leader;
+        leader.hard_state.term = Term::new(2);
+        leader.match_index.insert(NodeId::new(2), LogIndex::new(0));
+        let intent = Entry {
+            term: Term::new(2),
+            index: LogIndex::new(1),
+            kind: EntryKind::Config,
+            payload: ConfigEnvelope {
+                admin_session: None,
+                leader_time: Time::from_nanos(5),
+                operation: ConfigOperation::BeginLeaderTransfer {
+                    target: NodeId::new(2),
+                },
+            }
+            .encode(),
+        };
+        leader.log.push(intent.clone());
+        leader.commit_index = LogIndex::new(1);
+        leader
+            .apply_committed_config(&intent)
+            .expect("committed transfer intent");
+        let deadline = leader
+            .leadership_transfer_state()
+            .expect("transfer state")
+            .deadline;
+
+        // The timeout appends a terminal entry, so the workflow is finishing.
+        assert!(!leader.tick(deadline).is_empty(), "timeout must finish");
+        assert!(
+            leader
+                .leadership_transfer_state()
+                .expect("transfer still pending commit")
+                .finishing
+        );
+        assert_eq!(
+            leader.propose(b"blocked".to_vec()),
+            Err(RaftError::TransferInProgress)
+        );
+
+        // A new leader's conflicting suffix removes that terminal entry before
+        // it ever commits. The workflow must become retryable again rather
+        // than blocking every later proposal forever.
+        leader.log.retain(|entry| entry.index <= LogIndex::new(1));
+        leader.rebuild_membership_from_log();
+        assert!(
+            !leader
+                .leadership_transfer_state()
+                .expect("intent survives truncation")
+                .finishing,
+            "a truncated terminal entry must reopen the workflow"
+        );
+        let retried = leader.tick(deadline);
+        assert!(
+            retried.iter().any(|effect| matches!(
+                effect,
+                RaftEffect::PersistEntries(entries)
+                    if entries.iter().any(|entry| matches!(
+                        ConfigEnvelope::decode(&entry.payload),
+                        Ok(ConfigEnvelope {
+                            operation: ConfigOperation::FinishLeaderTransfer { .. },
+                            ..
+                        })
+                    ))
+            )),
+            "the timeout must append a fresh terminal entry: {retried:?}"
         );
     }
 

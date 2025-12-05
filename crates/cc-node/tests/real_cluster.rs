@@ -197,7 +197,10 @@ fn transfer_eventually(binary: &Path, ports: &[u16], target: u16, operator: u64)
     let operation = ["transfer-leader", "--node-id", target_text.as_str()];
     let mut terminal = BTreeMap::new();
     for sequence in 1..=4 {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The cluster policy's transfer timeout is 15s. Waiting less than that
+        // on sequence 1 cannot observe TransferTimeout, and a later sequence
+        // is a different admin identity that only sees TransferInProgress.
+        let deadline = Instant::now() + Duration::from_secs(20);
         let mut last = BTreeMap::new();
         while Instant::now() < deadline {
             for port in ports {
@@ -259,6 +262,45 @@ fn cluster_diagnostics(ports: &[u16], key: &str) -> BTreeMap<u16, String> {
             (*port, format!("INFO={info:?} STALE={stale:?}"))
         })
         .collect()
+}
+
+/// Remove a voter that must not be the current leader. Removing the leader is
+/// deliberately refused until leadership moves, and nothing pins leadership
+/// after a transfer, so an operator whose cluster re-elected the old leader
+/// transfers again under a fresh operator id and reissues the same unproposed
+/// removal pair. Retrying the refusal alone would only re-observe it.
+fn remove_voter_eventually(
+    binary: &Path,
+    ports: &[u16],
+    node_id: u16,
+    away_from: u16,
+    operator: u64,
+) -> String {
+    let node_text = node_id.to_string();
+    let remove = ["remove", "--node-id", node_text.as_str()];
+    let mut last = String::new();
+    for attempt in 0..4_u64 {
+        let output = Command::new(binary)
+            .args(["admin", "--addr", &format!("127.0.0.1:{}", ports[0])])
+            .args(remove)
+            .args(["--operator-id", &operator.to_string(), "--sequence", "1"])
+            .output()
+            .expect("voter removal command");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if output.status.success() && stdout.contains("result=Applied") {
+            return stdout;
+        }
+        last = format!(
+            "status={} stdout={stdout} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        transfer_eventually(binary, ports, away_from, operator + 100 + attempt);
+    }
+    panic!(
+        "removal of n{node_id} never applied: {last}; members={:?}",
+        membership_diagnostics(ports)
+    );
 }
 
 fn membership_diagnostics(ports: &[u16]) -> BTreeMap<u16, String> {
@@ -645,8 +687,7 @@ fn run_membership_demo(run: usize) {
     transfer_eventually(binary, &active_ports, 4, 1_300);
     history_set(&mut history, epoch, &active_ports, key, "leader-n4");
 
-    let remove = ["remove", "--node-id", "1"];
-    admin_eventually(binary, &active_ports, &remove, 1_400, 1, "result=Applied");
+    remove_voter_eventually(binary, &active_ports, 1, 4, 1_400);
     active_ports.retain(|port| *port != client_base + 1);
     history_set(&mut history, epoch, &active_ports, key, "final");
 
