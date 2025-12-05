@@ -37,7 +37,7 @@ use cc_sim::{
 use cc_store::StoreConfig;
 
 use cc_swarm::{
-    ClusterRun, DETERMINISM_PROFILES, LedgerError, LedgerKey, LedgerRow, LedgerVerdict,
+    ClusterRun, DETERMINISM_PROFILES, LedgerError, LedgerKey, LedgerKind, LedgerRow, LedgerVerdict,
     REACHABILITY_BEACONS, REACHABILITY_BEACONS_HELP, SeedLedger, Shard, canonical_run_spec_json,
     deterministic_cluster_trace, deterministic_cluster_trace_for, encode_ledger_row, fuzz_decode,
     minimize_case, mutate_case, mutate_fault_plan, reachability_beacons, reproduces_failure,
@@ -59,6 +59,11 @@ struct CampaignWorkerSummary {
 }
 
 fn main() -> io::Result<()> {
+    if let Some(kata) = cc_swarm::ACTIVE_KATA {
+        eprintln!(
+            "SYNTHETIC KATA ENABLED: {kata}; artifacts cannot support claims or museum exhibits"
+        );
+    }
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--determinism") => emit_determinism_trace(),
@@ -468,6 +473,12 @@ fn coverage_summary(
     allow_dev: bool,
     generated_at: u128,
 ) -> io::Result<String> {
+    if ledger.kind() != LedgerKind::Production {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coverage summaries reject synthetic kata ledgers",
+        ));
+    }
     if generator_build.is_empty() || generator_build.contains(['\t', '\n', '\r']) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -600,7 +611,11 @@ fn write_ledger_conflict_artifact(
     write_ledger_atomic(path, &contents)
 }
 
-fn append_ledger_rows(path: &Path, rows: &[LedgerRow]) -> io::Result<usize> {
+fn append_ledger_rows(
+    path: &Path,
+    rows: &[LedgerRow],
+    expected_kind: LedgerKind,
+) -> io::Result<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
@@ -628,7 +643,10 @@ fn append_ledger_rows(path: &Path, rows: &[LedgerRow]) -> io::Result<usize> {
         existing_bytes.truncate(canonical_len);
     }
     let mut existing = if existing_bytes.is_empty() {
-        SeedLedger::default()
+        match expected_kind {
+            LedgerKind::Production => SeedLedger::default(),
+            LedgerKind::Kata => SeedLedger::kata(),
+        }
     } else {
         SeedLedger::parse(
             std::str::from_utf8(&existing_bytes)
@@ -636,13 +654,22 @@ fn append_ledger_rows(path: &Path, rows: &[LedgerRow]) -> io::Result<usize> {
         )
         .map_err(io::Error::other)?
     };
+    if existing.kind() != expected_kind {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "campaign ledger type does not match this build",
+        ));
+    }
     if existing_bytes.is_empty() {
-        file.write_all(cc_swarm::LEDGER_HEADER.as_bytes())?;
+        file.write_all(expected_kind.header().as_bytes())?;
         file.write_all(b"\n")?;
         file.write_all(cc_swarm::LEDGER_COLUMNS.as_bytes())?;
         file.write_all(b"\n")?;
     }
-    let mut canonical = SeedLedger::default();
+    let mut canonical = match expected_kind {
+        LedgerKind::Production => SeedLedger::default(),
+        LedgerKind::Kata => SeedLedger::kata(),
+    };
     for row in rows {
         if existing.insert(row.clone()).map_err(io::Error::other)? {
             canonical.insert(row.clone()).map_err(io::Error::other)?;
@@ -1352,6 +1379,7 @@ fn operation_key(kind: &OperationKind) -> &[u8] {
         | OperationKind::Incr { key }
         | OperationKind::Cas { key, .. } => key,
         OperationKind::Scan { prefix, .. } => prefix.as_deref().unwrap_or_default(),
+        OperationKind::Batch { .. } => &[],
     }
 }
 
@@ -1363,6 +1391,7 @@ fn operation_outcome(outcome: &Outcome) -> String {
         Outcome::Integer(value) => format!("integer:{value}"),
         Outcome::Cas(value) => format!("cas:{value}"),
         Outcome::Scan(values) => format!("scan:{}", values.len()),
+        Outcome::Batch { replies } => format!("batch:{}", replies.len()),
         Outcome::Error => String::from("error"),
         Outcome::Timeout => String::from("timeout"),
     }
@@ -1702,11 +1731,24 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
         ));
     }
     let config_hash = campaign_config_hash(profile, disk_profile.as_ref());
+    let expected_ledger_kind = if cc_swarm::ACTIVE_KATA.is_some() {
+        LedgerKind::Kata
+    } else {
+        LedgerKind::Production
+    };
     let prior_ledger = match ledger_path.as_deref() {
         Some(path) if Path::new(path).exists() => read_ledger(Path::new(path))?,
-        Some(_) => SeedLedger::default(),
-        None => SeedLedger::default(),
+        Some(_) | None => match expected_ledger_kind {
+            LedgerKind::Production => SeedLedger::default(),
+            LedgerKind::Kata => SeedLedger::kata(),
+        },
     };
+    if prior_ledger.kind() != expected_ledger_kind {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "campaign ledger type does not match this build",
+        ));
+    }
     if resume && ledger_path.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1811,7 +1853,8 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
                         fs::write(
                             format!("artifacts/{seed}.json"),
                             format!(
-                                "{{\"fixture_version\":1,\"seed\":\"{seed}\",\"profile\":\"{}\",\"error\":\"{}\"}}",
+                                "{{\"fixture_version\":1,\"synthetic\":{},\"seed\":\"{seed}\",\"profile\":\"{}\",\"error\":\"{}\"}}",
+                                cc_swarm::ACTIVE_KATA.is_some(),
                                 profile.as_str(),
                                 json_escape(&error)
                             ),
@@ -1894,7 +1937,7 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
                 appended.push(row);
             }
         }
-        let appended_count = append_ledger_rows(Path::new(path), &appended)?;
+        let appended_count = append_ledger_rows(Path::new(path), &appended, expected_ledger_kind)?;
         println!(
             "ledger path={path} appended={} config_hash={config_hash:016x} build={build_label}",
             appended_count
@@ -1914,7 +1957,8 @@ fn run_campaign(args: &[String]) -> io::Result<()> {
             )
         });
         let receipt = format!(
-            "{{\"schema_version\":1,\"source_ledger\":\"{}\",\"source_ledger_hash\":\"{:016x}\",\"build_label\":\"{}\",\"config_hash\":\"{config_hash:016x}\",\"profile\":\"{}\",\"shard\":\"{}\",\"range\":\"0..{seeds}\",\"host\":\"{}-{}\",\"started_unix_ms\":{started_unix_ms},\"ended_unix_ms\":{ended_unix_ms},\"wall_duration_ms\":{},\"runs\":{runs},\"events\":{events},\"runs_per_sec\":{:.6}}}\n",
+            "{{\"schema_version\":1,\"synthetic\":{},\"source_ledger\":\"{}\",\"source_ledger_hash\":\"{:016x}\",\"build_label\":\"{}\",\"config_hash\":\"{config_hash:016x}\",\"profile\":\"{}\",\"shard\":\"{}\",\"range\":\"0..{seeds}\",\"host\":\"{}-{}\",\"started_unix_ms\":{started_unix_ms},\"ended_unix_ms\":{ended_unix_ms},\"wall_duration_ms\":{},\"runs\":{runs},\"events\":{events},\"runs_per_sec\":{:.6}}}\n",
+            cc_swarm::ACTIVE_KATA.is_some(),
             json_escape(path),
             fnv1a(&ledger_bytes),
             json_escape(&build_label),
@@ -2617,6 +2661,21 @@ fn print_help() {
 #[cfg(test)]
 mod trace_tests {
     use super::*;
+
+    #[test]
+    fn trap_kata_ledger_cannot_generate_production_summary() {
+        let ledger = SeedLedger::kata();
+        let error = coverage_summary(
+            Path::new("not-read-for-kata-summary.tsv"),
+            &ledger,
+            "build",
+            false,
+            0,
+        )
+        .expect_err("synthetic summary must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("synthetic kata ledgers"));
+    }
 
     #[test]
     fn trap_named_disk_profile_is_canonical_and_does_not_change_defaults() {

@@ -12,7 +12,25 @@ use std::fmt;
 use cc_sim::FaultProfile;
 
 pub const LEDGER_HEADER: &str = "# cc-ledger-v1";
+pub const KATA_LEDGER_HEADER: &str = "# cc-kata-ledger-v1";
 pub const LEDGER_COLUMNS: &str = "build_label\tconfig_hash\tprofile\tseed_hex\tverdict\tevents\tchecker_states\tpeak_total_bytes\tartifact_hash";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LedgerKind {
+    #[default]
+    Production,
+    Kata,
+}
+
+impl LedgerKind {
+    #[must_use]
+    pub const fn header(self) -> &'static str {
+        match self {
+            Self::Production => LEDGER_HEADER,
+            Self::Kata => KATA_LEDGER_HEADER,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Shard {
@@ -129,6 +147,7 @@ pub struct LedgerRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LedgerError {
     Header,
+    Kind,
     Line { line: usize, reason: &'static str },
     Conflict { key: LedgerKey },
     Coverage(String),
@@ -138,6 +157,7 @@ impl fmt::Display for LedgerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Header => f.write_str("invalid campaign ledger header"),
+            Self::Kind => f.write_str("production and synthetic kata ledgers cannot be mixed"),
             Self::Line { line, reason } => write!(f, "campaign ledger line {line}: {reason}"),
             Self::Conflict { key } => write!(
                 f,
@@ -238,10 +258,24 @@ impl std::error::Error for LedgerError {}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SeedLedger {
+    kind: LedgerKind,
     rows: BTreeMap<LedgerKey, LedgerRow>,
 }
 
 impl SeedLedger {
+    #[must_use]
+    pub fn kata() -> Self {
+        Self {
+            kind: LedgerKind::Kata,
+            rows: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> LedgerKind {
+        self.kind
+    }
+
     pub fn rows(&self) -> impl Iterator<Item = &LedgerRow> {
         self.rows.values()
     }
@@ -270,14 +304,19 @@ impl SeedLedger {
     pub fn parse(text: &str) -> Result<Self, LedgerError> {
         let mut lines = text.split_inclusive('\n');
         let header = lines.next().ok_or(LedgerError::Header)?;
-        if header.trim_end_matches('\n') != LEDGER_HEADER {
-            return Err(LedgerError::Header);
-        }
+        let kind = match header.trim_end_matches('\n') {
+            LEDGER_HEADER => LedgerKind::Production,
+            KATA_LEDGER_HEADER => LedgerKind::Kata,
+            _ => return Err(LedgerError::Header),
+        };
         let columns = lines.next().ok_or(LedgerError::Header)?;
         if columns.trim_end_matches('\n') != LEDGER_COLUMNS {
             return Err(LedgerError::Header);
         }
-        let mut ledger = Self::default();
+        let mut ledger = match kind {
+            LedgerKind::Production => Self::default(),
+            LedgerKind::Kata => Self::kata(),
+        };
         for (offset, raw) in lines.enumerate() {
             // A crash may tear only the last line.  It is safe to discard
             // exactly that suffix; any earlier malformed complete record is
@@ -295,8 +334,21 @@ impl SeedLedger {
     pub fn merge<'a>(
         ledgers: impl IntoIterator<Item = &'a SeedLedger>,
     ) -> Result<Self, LedgerError> {
-        let mut merged = Self::default();
+        let mut ledgers = ledgers.into_iter();
+        let Some(first) = ledgers.next() else {
+            return Ok(Self::default());
+        };
+        let mut merged = match first.kind {
+            LedgerKind::Production => Self::default(),
+            LedgerKind::Kata => Self::kata(),
+        };
+        for row in first.rows() {
+            merged.insert(row.clone())?;
+        }
         for ledger in ledgers {
+            if ledger.kind != merged.kind {
+                return Err(LedgerError::Kind);
+            }
             for row in ledger.rows() {
                 merged.insert(row.clone())?;
             }
@@ -306,7 +358,7 @@ impl SeedLedger {
 
     #[must_use]
     pub fn encode(&self) -> String {
-        let mut result = String::from(LEDGER_HEADER);
+        let mut result = String::from(self.kind.header());
         result.push('\n');
         result.push_str(LEDGER_COLUMNS);
         result.push('\n');
@@ -423,6 +475,18 @@ mod tests {
         assert!(ledger.insert(row(1)).expect("first row"));
         assert!(!ledger.insert(row(1)).expect("identical retry"));
         assert_eq!(ledger.rows().count(), 1);
+    }
+
+    #[test]
+    fn trap_synthetic_ledger_is_typed_and_cannot_merge_with_production() {
+        let mut kata = SeedLedger::kata();
+        kata.insert(row(1)).expect("kata row");
+        assert!(kata.encode().starts_with(KATA_LEDGER_HEADER));
+        assert_eq!(SeedLedger::parse(&kata.encode()), Ok(kata.clone()));
+        assert_eq!(
+            SeedLedger::merge([&SeedLedger::default(), &kata]),
+            Err(LedgerError::Kind)
+        );
     }
 
     #[test]

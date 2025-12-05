@@ -7,6 +7,14 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+default = []
+kata01 = ["cc-raft/kata01"]
+kata02 = ["cc-raft/kata02"]
+kata03 = ["cc-host/kata03"]
+kata04 = ["cc-store/kata04"]
+kata05 = ["cc-cluster/kata05"]
+
 [dependencies]
 cc-cluster = { path = "../cc-cluster" }
 cc-checker = { path = "../cc-checker" }

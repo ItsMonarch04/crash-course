@@ -4,13 +4,84 @@
 #![forbid(unsafe_code)]
 #![doc = "The real deterministic cluster fixture used by cc-swarm and later theater work."]
 
+#[cfg(any(
+    all(feature = "kata01", feature = "kata02"),
+    all(feature = "kata01", feature = "kata03"),
+    all(feature = "kata01", feature = "kata04"),
+    all(feature = "kata01", feature = "kata05"),
+    all(feature = "kata02", feature = "kata03"),
+    all(feature = "kata02", feature = "kata04"),
+    all(feature = "kata02", feature = "kata05"),
+    all(feature = "kata03", feature = "kata04"),
+    all(feature = "kata03", feature = "kata05"),
+    all(feature = "kata04", feature = "kata05"),
+))]
+compile_error!("kata features are mutually exclusive");
+
+#[cfg(feature = "kata01")]
+pub const ACTIVE_KATA: Option<&str> = Some("kata01");
+#[cfg(all(not(feature = "kata01"), feature = "kata02"))]
+pub const ACTIVE_KATA: Option<&str> = Some("kata02");
+#[cfg(all(not(any(feature = "kata01", feature = "kata02")), feature = "kata03"))]
+pub const ACTIVE_KATA: Option<&str> = Some("kata03");
+#[cfg(all(
+    not(any(feature = "kata01", feature = "kata02", feature = "kata03")),
+    feature = "kata04"
+))]
+pub const ACTIVE_KATA: Option<&str> = Some("kata04");
+#[cfg(all(
+    not(any(
+        feature = "kata01",
+        feature = "kata02",
+        feature = "kata03",
+        feature = "kata04"
+    )),
+    feature = "kata05"
+))]
+pub const ACTIVE_KATA: Option<&str> = Some("kata05");
+#[cfg(not(any(
+    feature = "kata01",
+    feature = "kata02",
+    feature = "kata03",
+    feature = "kata04",
+    feature = "kata05",
+)))]
+pub const ACTIVE_KATA: Option<&str> = None;
+
 mod fuzzing;
 mod ledger;
 pub use fuzzing::{FuzzOutcome, MAX_FUZZ_INPUT_BYTES, fuzz_decode, minimize_case, mutate_case};
 pub use ledger::{
-    LEDGER_COLUMNS, LEDGER_HEADER, LedgerError, LedgerKey, LedgerRow, LedgerVerdict, SeedLedger,
-    Shard, ShardError, encode_ledger_row, validate_sharded_coverage,
+    KATA_LEDGER_HEADER, LEDGER_COLUMNS, LEDGER_HEADER, LedgerError, LedgerKey, LedgerKind,
+    LedgerRow, LedgerVerdict, SeedLedger, Shard, ShardError, encode_ledger_row,
+    validate_sharded_coverage,
 };
+
+#[cfg(all(
+    test,
+    not(any(
+        feature = "kata01",
+        feature = "kata02",
+        feature = "kata03",
+        feature = "kata04",
+        feature = "kata05",
+    ))
+))]
+mod default_kata_tests {
+    use super::ACTIVE_KATA;
+
+    #[test]
+    fn trap_default_build_enables_no_kata() {
+        assert_eq!(ACTIVE_KATA, None);
+    }
+
+    #[test]
+    fn trap_kata_features_are_mutually_exclusive() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("compile_error!(\"kata features are mutually exclusive\")"));
+        assert_eq!(source.matches("all(feature = \"kata").count(), 10);
+    }
+}
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -563,7 +634,8 @@ impl ClusterRun {
             .join(",");
         let run_footprint = run_footprint_json(self.run_footprint);
         format!(
-            "{{\"fixture_version\":1,\"run_spec\":{},\"seed\":\"{}\",\"profile\":\"{}\",\"events\":{},\"completed_operations\":{},\"peak_total_bytes\":{},\"had_leader\":{},\"trace_invariants_ok\":{},\"invariant_violations\":[{}],\"run_footprint\":{},\"liveness_ok\":{},\"verdict\":\"{}\",\"checker_report\":{},\"trace\":{}}}",
+            "{{\"fixture_version\":1,\"synthetic\":{},\"run_spec\":{},\"seed\":\"{}\",\"profile\":\"{}\",\"events\":{},\"completed_operations\":{},\"peak_total_bytes\":{},\"had_leader\":{},\"trace_invariants_ok\":{},\"invariant_violations\":[{}],\"run_footprint\":{},\"liveness_ok\":{},\"verdict\":\"{}\",\"checker_report\":{},\"trace\":{}}}",
+            ACTIVE_KATA.is_some(),
             canonical_run_spec_json(&self.spec),
             self.seed,
             profile.as_str(),
@@ -617,6 +689,37 @@ fn json_escape(value: &str) -> String {
         }
     }
     escaped
+}
+
+/// Claims ledgers, summaries, and badges accept only artifacts produced by a
+/// default build. The scan is intentionally dependency-free and whitespace-
+/// insensitive; escaped content remains inside strings and cannot spell an
+/// unescaped JSON field token.
+#[must_use]
+pub fn artifact_is_claim_eligible(bytes: &[u8]) -> bool {
+    let mut compact = Vec::with_capacity(bytes.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in bytes {
+        if in_string {
+            compact.push(*byte);
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+        } else if *byte == b'"' {
+            in_string = true;
+            compact.push(*byte);
+        } else if !byte.is_ascii_whitespace() {
+            compact.push(*byte);
+        }
+    }
+    !compact
+        .windows(b"\"synthetic\":true".len())
+        .any(|window| window == b"\"synthetic\":true")
 }
 
 #[must_use]
@@ -1069,6 +1172,14 @@ impl SimCluster {
             actors: BTreeMap::new(),
             history: History::default(),
         };
+        if let Some(kata) = ACTIVE_KATA {
+            cluster.record(
+                Time::from_nanos(0),
+                None,
+                EventKind::SyntheticKataEnabled,
+                format!("synthetic=true kata={kata}").into_bytes(),
+            );
+        }
         cluster.seed_events();
         Ok(cluster)
     }
@@ -3075,6 +3186,46 @@ fn role_name(role: Role) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(
+        feature = "kata01",
+        feature = "kata02",
+        feature = "kata03",
+        feature = "kata04",
+        feature = "kata05",
+    ))]
+    #[test]
+    fn trap_active_kata_is_visible_in_trace_and_artifact_type() {
+        let cluster = SimCluster::new(
+            RunSpec::standard(Seed::new(0), FaultProfile::Calm),
+            RecorderLevel::Gate,
+        )
+        .expect("synthetic cluster");
+        let event = cluster
+            .recorder
+            .trace()
+            .events
+            .as_slice()
+            .first()
+            .expect("synthetic marker");
+        assert_eq!(event.kind, EventKind::SyntheticKataEnabled);
+        assert!(event.payload.starts_with(b"synthetic=true kata="));
+        assert!(ACTIVE_KATA.is_some());
+    }
+
+    #[test]
+    fn trap_synthetic_artifact_is_rejected_by_claims_and_museum() {
+        assert!(artifact_is_claim_eligible(
+            br#"{"fixture_version":1,"synthetic":false}"#
+        ));
+        assert!(!artifact_is_claim_eligible(
+            br#"{ "fixture_version": 1, "synthetic" : true }"#
+        ));
+        let schema = include_str!("../../../exhibits/schema.json");
+        let museum = include_str!("../../../theater/src/museum.ts");
+        assert!(schema.contains("\"synthetic\": { \"const\": false }"));
+        assert!(museum.contains("Synthetic artifact"));
+    }
     use cc_sim::SlowDisk;
 
     #[test]

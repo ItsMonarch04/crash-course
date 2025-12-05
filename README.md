@@ -132,4 +132,4 @@ publishes an altered simulator as a website cannot keep those changes closed.
 
 ---
 
-**Version:** v0.15.7
+**Version:** v0.15.8

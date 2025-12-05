@@ -1882,6 +1882,7 @@ pub enum EventKind {
     Compact = 27,
     Fault = 28,
     CheckerNote = 29,
+    SyntheticKataEnabled = 30,
 }
 
 impl EventKind {
@@ -1917,6 +1918,7 @@ impl EventKind {
             Self::Compact => "Compact",
             Self::Fault => "Fault",
             Self::CheckerNote => "CheckerNote",
+            Self::SyntheticKataEnabled => "SyntheticKataEnabled",
         }
     }
 
@@ -1955,6 +1957,7 @@ impl EventKind {
             27 => Self::Compact,
             28 => Self::Fault,
             29 => Self::CheckerNote,
+            30 => Self::SyntheticKataEnabled,
             _ => return None,
         })
     }

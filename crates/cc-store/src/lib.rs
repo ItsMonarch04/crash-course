@@ -464,9 +464,20 @@ pub fn may_drop_tombstone(
     reaches_bottom_for_key: bool,
     unselected_lower_range_may_contain_key: bool,
 ) -> bool {
-    oldest_snapshot.is_none_or(|snapshot| tombstone_sequence < snapshot)
-        && reaches_bottom_for_key
-        && !unselected_lower_range_may_contain_key
+    #[cfg(feature = "kata04")]
+    {
+        let _ = reaches_bottom_for_key;
+        // Synthetic teaching defect: ignore whether the compaction reaches
+        // the bottom of the key's overlap closure.
+        return oldest_snapshot.is_none_or(|snapshot| tombstone_sequence < snapshot)
+            && !unselected_lower_range_may_contain_key;
+    }
+    #[cfg(not(feature = "kata04"))]
+    {
+        oldest_snapshot.is_none_or(|snapshot| tombstone_sequence < snapshot)
+            && reaches_bottom_for_key
+            && !unselected_lower_range_may_contain_key
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -3099,12 +3110,22 @@ mod tests {
         assert!(outputs[1].iter().all(|(key, _)| key.user_key == b"b"));
     }
 
+    #[cfg(not(feature = "kata04"))]
     #[test]
     fn trap_tombstone_survives_above_bottom_level() {
         assert!(!may_drop_tombstone(2, Some(10), false, false));
         assert!(!may_drop_tombstone(2, Some(10), true, true));
         assert!(!may_drop_tombstone(10, Some(10), true, false));
         assert!(may_drop_tombstone(2, Some(10), true, false));
+    }
+
+    #[cfg(feature = "kata04")]
+    #[test]
+    fn trap_kata_04_tombstone_gc_is_found_within_budget() {
+        assert!(
+            may_drop_tombstone(2, Some(10), false, false),
+            "the synthetic defect drops a tombstone above the bottom level"
+        );
     }
 
     fn sample_compaction_publication() -> StorePlan {
