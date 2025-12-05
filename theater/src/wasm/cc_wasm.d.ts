@@ -1,26 +1,26 @@
 /* tslint:disable */
 /* eslint-disable */
+export function drop_checkpoint(handle: SimHandle, checkpoint_id: bigint): void;
+export function trace_page(handle: SimHandle, cursor: bigint, max_events: number): string;
 /**
- * Retain one complete in-memory simulator image.  `SimCluster: Clone`
- * deliberately includes scheduler/RNG/network/disk/driver volatile state;
- * this is not a replay-from-zero token disguised as a checkpoint.
+ * Append a data-described fault to the same persistent run used by `step`.
  */
-export function checkpoint(handle: SimHandle): bigint;
+export function inject(handle: SimHandle, action_json: string): void;
+export function restore(handle: SimHandle, checkpoint_id: bigint): string;
+export function history_verdict(handle: SimHandle): string;
 export function state(handle: SimHandle): string;
 export function trace_hash(handle: SimHandle): string;
 /**
  * Advance one persistent simulator by a virtual-time budget.
  */
 export function step(handle: SimHandle, virtual_ns: bigint): string;
-export function history_verdict(handle: SimHandle): string;
 export function init(spec_json: string): SimHandle;
-export function restore(handle: SimHandle, checkpoint_id: bigint): string;
 /**
- * Append a data-described fault to the same persistent run used by `step`.
+ * Retain one complete in-memory simulator image.  `SimCluster: Clone`
+ * deliberately includes scheduler/RNG/network/disk/driver volatile state;
+ * this is not a replay-from-zero token disguised as a checkpoint.
  */
-export function inject(handle: SimHandle, action_json: string): void;
-export function trace_page(handle: SimHandle, cursor: bigint, max_events: number): string;
-export function drop_checkpoint(handle: SimHandle, checkpoint_id: bigint): void;
+export function checkpoint(handle: SimHandle): bigint;
 export class SimHandle {
   private constructor();
   free(): void;

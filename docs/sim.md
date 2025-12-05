@@ -45,6 +45,15 @@ additional delay. This is distinct from the `DiskDegrade` one-shot EIO fault
 used in fault profiles; N3's file-backed store will consume the remaining
 operation categories.
 
+Database-surface campaigns use dedicated profiles rather than relabelling
+`rough`. `batch` activates the replicated `ATOMIC_BATCH` feature after
+simulated CCHL observations, then issues multi-command batches checked as one
+atomic transition. `follower-read` routes `GET` to a non-leader after a v3
+ReadIndex grant. `follower-read-v2` keeps the same client mix against v2
+capability observations so a missing feature returns an error instead of a
+local linearizable read. `stale-read` records tagged local observations and
+checks them only against the reported applied watermark after TTL filtering.
+
 Persistent storage faults are explicit scenario data as well: `EnospcFrom`
 rejects later space-growing writes, `DiskQuota` caps the simulated allocated
 bytes, and `BitRotAtRest` flips one byte immediately after its selected fsync.

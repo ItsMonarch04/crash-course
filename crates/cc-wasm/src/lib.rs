@@ -103,6 +103,7 @@ fn theater_spec(seed: Seed, profile: FaultProfile, node_count: Option<u64>) -> R
         ops_per_second: 10,
         keyspace: 16,
         set_ttl: matches!(profile, FaultProfile::Ttl).then_some(Duration::from_millis(125)),
+        kind: profile.workload_kind(),
     };
     spec
 }

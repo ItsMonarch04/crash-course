@@ -87,15 +87,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use cc_checker::{
-    CheckerConfig, History, LivenessReport, Operation, OperationKind, Outcome, Verdict, check,
-    check_liveness, cross_check_linearizable_sessions,
+    CheckerConfig, ConsistencyMode, History, LivenessReport, Operation, OperationKind, Outcome,
+    StaleReadEvidence, StaleReadVerdict, Verdict, check, check_liveness, check_stale_reads,
+    cross_check_linearizable_sessions,
 };
-use cc_cluster::{NodeConfig, NodeError, RecoveredNode};
+use cc_cluster::{NodeConfig, NodeError, PROTOCOL_VERSION, RecoveredNode, SEMANTIC_VERSION_V3};
 use cc_core::{
-    ClientId, ClusterPolicy, Duration, EventKind, NodeId, Seed, Time, TimerId, Trace, Xoshiro256pp,
-    fnv1a,
+    ClientId, ClusterPolicy, Duration, EventKind, NodeId, RequestSeq, Seed, Time, TimerId, Trace,
+    Xoshiro256pp, fnv1a,
 };
-use cc_env::{Effect, FileId, Input, IoResult, WireMsg, decode_peer_frame, encode_peer_frame};
+use cc_env::{
+    Effect, FEATURE_ATOMIC_BATCH, FEATURE_FOLLOWER_READ, FileId, Input, IoResult, WireMsg,
+    decode_peer_frame, encode_peer_frame,
+};
 use cc_host::{BootState, Driver, DriverPoll, HostError, Usage};
 use cc_kv::{KvCommand, KvReply, decode_reply, encode_command};
 use cc_raft::{RaftConfig, Role};
@@ -1075,6 +1079,7 @@ pub struct SimCluster {
     pending: BTreeMap<u64, PendingOperation>,
     actors: BTreeMap<u64, WorkloadActor>,
     history: History,
+    stale_evidence: Vec<StaleReadEvidence>,
 }
 
 impl SimCluster {
@@ -1171,7 +1176,9 @@ impl SimCluster {
             pending: BTreeMap::new(),
             actors: BTreeMap::new(),
             history: History::default(),
+            stale_evidence: Vec::new(),
         };
+        cluster.observe_live_capabilities()?;
         if let Some(kata) = ACTIVE_KATA {
             cluster.record(
                 Time::from_nanos(0),
@@ -1474,6 +1481,27 @@ impl SimCluster {
                 .into_iter()
                 .map(|violation| format!("session/{}: {}", violation.name, violation.detail)),
         );
+        match check_stale_reads(&self.history, &self.stale_evidence) {
+            StaleReadVerdict::Valid { .. } => {}
+            StaleReadVerdict::Invalid {
+                operation_id,
+                reason,
+            } => invariant_violations.push(format!("stale-read/{operation_id}: {reason}")),
+            StaleReadVerdict::Undecided {
+                operation_id,
+                reason,
+            } => {
+                if matches!(self.spec.profile, FaultProfile::StaleRead)
+                    || self
+                        .history
+                        .operations
+                        .iter()
+                        .any(|operation| operation.consistency == ConsistencyMode::StaleLocal)
+                {
+                    invariant_violations.push(format!("stale-read/{operation_id}: {reason}"));
+                }
+            }
+        }
         let trace_invariants_ok = invariant_violations.is_empty();
         let completed_operations = self
             .history
@@ -1745,7 +1773,7 @@ impl SimCluster {
             }
             Err(_) => return Err(ClusterError::Network { from, to }),
         };
-        if used != frame.len() || wire.proto_version != cc_raft::PROTOCOL_VERSION {
+        if used != frame.len() || !cc_raft::supports_protocol_version(wire.proto_version) {
             return Err(ClusterError::Network { from, to });
         }
         self.record(
@@ -1783,28 +1811,52 @@ impl SimCluster {
         if self.total_issued >= MAX_OPERATIONS_PER_RUN {
             return Ok(());
         }
-        let Some(leader) = self.leader() else {
-            self.schedule(
-                self.now + CLIENT_RETRY,
-                ClusterEventKind::ClientIssue {
-                    client,
-                    sequence,
-                    operation,
-                },
-            );
+        if matches!(operation, WorkloadOperation::Batch { .. }) && !self.ensure_atomic_batch()? {
+            self.retry_client(client, sequence, operation);
             return Ok(());
-        };
-        let command = encode_command(&command_for(&operation));
-        let kind = operation_kind(&operation);
+        }
+        match &operation {
+            WorkloadOperation::ReadFollower { .. } => {
+                self.issue_follower_read(client, sequence, operation)
+            }
+            WorkloadOperation::ReadStale { .. } => {
+                self.issue_stale_read(client, sequence, operation)
+            }
+            _ => self.issue_leader_command(client, sequence, operation),
+        }
+    }
+
+    fn retry_client(&mut self, client: u64, sequence: u64, operation: WorkloadOperation) {
+        self.schedule(
+            self.now + CLIENT_RETRY,
+            ClusterEventKind::ClientIssue {
+                client,
+                sequence,
+                operation,
+            },
+        );
+    }
+
+    fn open_pending(
+        &mut self,
+        client: u64,
+        sequence: u64,
+        operation: &WorkloadOperation,
+        target: NodeId,
+    ) -> u64 {
+        let kind = operation_kind(operation);
         let id = self.next_operation_id;
         self.next_operation_id = self.next_operation_id.saturating_add(1);
         let mut history_operation = Operation::open(id, kind, self.now);
         history_operation.client = client;
         history_operation.sequence = sequence;
-        history_operation.deadline = match &operation {
-            WorkloadOperation::Set { ttl: Some(ttl), .. } => Some(self.host_time(leader) + *ttl),
+        history_operation.deadline = match operation {
+            WorkloadOperation::Set { ttl: Some(ttl), .. } => Some(self.host_time(target) + *ttl),
             _ => None,
         };
+        if matches!(operation, WorkloadOperation::ReadStale { .. }) {
+            history_operation.consistency = ConsistencyMode::StaleLocal;
+        }
         self.pending.insert(
             id,
             PendingOperation {
@@ -1815,12 +1867,25 @@ impl SimCluster {
         self.total_issued = self.total_issued.saturating_add(1);
         self.record(
             self.now,
-            Some(leader),
+            Some(target),
             EventKind::ClientInvoke,
             id.to_le_bytes().to_vec(),
         );
-        // Reads pass through Driver as ordinary unsessioned commands; the
-        // core chooses its ReadIndex path from the canonical command bytes.
+        id
+    }
+
+    fn issue_leader_command(
+        &mut self,
+        client: u64,
+        sequence: u64,
+        operation: WorkloadOperation,
+    ) -> Result<(), ClusterError> {
+        let Some(leader) = self.leader() else {
+            self.retry_client(client, sequence, operation);
+            return Ok(());
+        };
+        let command = encode_command(&command_for(&operation));
+        let id = self.open_pending(client, sequence, &operation, leader);
         let input = Input::ClientRequest {
             client: ClientId::new(client),
             req: cc_core::RequestSeq::new(sequence),
@@ -1833,42 +1898,259 @@ impl SimCluster {
                     self.now + CLIENT_TIMEOUT,
                     ClusterEventKind::ClientTimeout(id),
                 );
+                Ok(())
             }
-            Err(ClusterError::Node {
-                error:
-                    NodeError::NotLeader
-                    | NodeError::Raft(
-                        cc_raft::RaftError::Busy
-                        | cc_raft::RaftError::NotLeader
-                        | cc_raft::RaftError::ReadBarrierNotReady,
-                    ),
-                ..
-            })
-            | Err(ClusterError::Host {
-                error:
-                    HostError::Node(
-                        NodeError::NotLeader
-                        | NodeError::Raft(
-                            cc_raft::RaftError::Busy
-                            | cc_raft::RaftError::NotLeader
-                            | cc_raft::RaftError::ReadBarrierNotReady,
-                        ),
-                    ),
-                ..
-            }) => {
+            Err(error) if is_retryable_client_error(&error) => {
                 self.pending.remove(&id);
-                self.schedule(
-                    self.now + CLIENT_RETRY,
-                    ClusterEventKind::ClientIssue {
-                        client,
-                        sequence,
-                        operation,
-                    },
-                );
+                self.retry_client(client, sequence, operation);
+                Ok(())
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn issue_follower_read(
+        &mut self,
+        client: u64,
+        sequence: u64,
+        operation: WorkloadOperation,
+    ) -> Result<(), ClusterError> {
+        self.observe_live_capabilities()?;
+        let Some(follower) = self.non_leader() else {
+            self.retry_client(client, sequence, operation);
+            return Ok(());
+        };
+        let command = command_for(&operation);
+        let id = self.open_pending(client, sequence, &operation, follower);
+        let now = self.host_time(follower);
+        let outcome = {
+            let slot = self
+                .nodes
+                .get_mut(&follower)
+                .expect("invariant: follower slot exists");
+            let driver = slot
+                .driver
+                .as_mut()
+                .expect("invariant: follower has a driver");
+            driver.follower_read(
+                now,
+                ClientId::new(client),
+                RequestSeq::new(sequence),
+                command,
+            )
+        };
+        match outcome {
+            Ok((_, effects)) => {
+                self.consume_effects(follower, effects)?;
+                self.schedule(
+                    self.now + CLIENT_TIMEOUT,
+                    ClusterEventKind::ClientTimeout(id),
+                );
+                Ok(())
+            }
+            Err(error) if is_unavailable_follower_read(&error) => {
+                let Some(mut pending) = self.pending.remove(&id) else {
+                    return Ok(());
+                };
+                if matches!(self.spec.profile, FaultProfile::FollowerReadV2) {
+                    pending.operation.complete = Some(self.now);
+                    pending.operation.outcome = Outcome::Error;
+                    self.history.push(pending.operation);
+                    self.record(
+                        self.now,
+                        Some(follower),
+                        EventKind::ClientFail,
+                        id.to_le_bytes().to_vec(),
+                    );
+                    self.schedule_next(client);
+                } else {
+                    self.retry_client(client, sequence, operation);
+                }
+                Ok(())
+            }
+            Err(error) if is_retryable_host_error(&error) => {
+                self.pending.remove(&id);
+                self.retry_client(client, sequence, operation);
+                Ok(())
+            }
+            Err(error) => {
+                self.pending.remove(&id);
+                Err(cluster_host_error(follower, error))
+            }
+        }
+    }
+
+    fn issue_stale_read(
+        &mut self,
+        client: u64,
+        sequence: u64,
+        operation: WorkloadOperation,
+    ) -> Result<(), ClusterError> {
+        let Some(node) = self.non_leader().or_else(|| self.leader()) else {
+            self.retry_client(client, sequence, operation);
+            return Ok(());
+        };
+        let WorkloadOperation::ReadStale { key } = &operation else {
+            return Ok(());
+        };
+        let read_time = self.host_time(node);
+        let snapshot = {
+            let slot = self.nodes.get(&node).expect("invariant: node slot exists");
+            let driver = slot.driver.as_ref().expect("invariant: node has a driver");
+            let kv = &driver.node().kv;
+            if kv.applied_index.get() == 0 {
+                None
+            } else {
+                let raw = kv.store.get(key, None::<cc_store::Snapshot>);
+                let reply = kv.read(KvCommand::Get { key: key.clone() }, read_time).ok();
+                Some((kv.applied_index.get(), kv.applied_term.get(), raw, reply))
+            }
+        };
+        let Some((applied_index, applied_term, raw, Some(reply))) = snapshot else {
+            self.retry_client(client, sequence, operation);
+            return Ok(());
+        };
+        let id = self.open_pending(client, sequence, &operation, node);
+        let deadline = match (&raw, &reply) {
+            (Some(_), KvReply::Value(None)) => Some(read_time),
+            _ => None,
+        };
+        self.stale_evidence.push(StaleReadEvidence {
+            operation_id: id,
+            applied_index,
+            applied_term,
+            traced_index: applied_index,
+            traced_term: applied_term,
+            read_time,
+            value_at_traced_index: raw,
+            deadline,
+        });
+        let Some(mut pending) = self.pending.remove(&id) else {
+            return Ok(());
+        };
+        pending.operation.complete = Some(self.now);
+        pending.operation.outcome = reply_to_outcome(&pending.operation.kind, &reply);
+        self.history.push(pending.operation);
+        self.record(
+            self.now,
+            Some(node),
+            EventKind::ClientOk,
+            id.to_le_bytes().to_vec(),
+        );
+        self.schedule_next(client);
+        Ok(())
+    }
+
+    fn ensure_atomic_batch(&mut self) -> Result<bool, ClusterError> {
+        self.observe_live_capabilities()?;
+        let Some(leader) = self.leader() else {
+            return Ok(false);
+        };
+        let already = self
+            .nodes
+            .get(&leader)
+            .and_then(|slot| slot.driver.as_ref())
+            .is_some_and(|driver| {
+                driver.node().active_features() & cc_core::ATOMIC_BATCH_FEATURE != 0
+            });
+        if already {
+            return Ok(true);
+        }
+        let now = self.host_time(leader);
+        let outcome = {
+            let slot = self
+                .nodes
+                .get_mut(&leader)
+                .expect("invariant: leader slot exists");
+            let driver = slot
+                .driver
+                .as_mut()
+                .expect("invariant: leader has a driver");
+            driver.activate_atomic_batch(now)
+        };
+        match outcome {
+            Ok((_, effects)) => {
+                self.record(
+                    self.now,
+                    Some(leader),
+                    EventKind::ConfChange,
+                    b"activate-atomic-batch".to_vec(),
+                );
+                self.consume_effects(leader, effects)?;
+                Ok(false)
+            }
+            Err(HostError::Node(
+                NodeError::FeatureDisabled
+                | NodeError::NotLeader
+                | NodeError::PersistencePending
+                | NodeError::Raft(_),
+            )) => Ok(false),
+            Err(error) => Err(cluster_host_error(leader, error)),
+        }
+    }
+
+    fn advertised_capability(&self) -> (u16, u64) {
+        if matches!(self.spec.profile, FaultProfile::FollowerReadV2) {
+            (PROTOCOL_VERSION, 0)
+        } else {
+            (
+                SEMANTIC_VERSION_V3,
+                FEATURE_FOLLOWER_READ | FEATURE_ATOMIC_BATCH,
+            )
+        }
+    }
+
+    fn observe_live_capabilities(&mut self) -> Result<(), ClusterError> {
+        let (semantic, features) = self.advertised_capability();
+        let ids: Vec<NodeId> = self
+            .nodes
+            .keys()
+            .copied()
+            .filter(|id| self.is_up(*id))
+            .collect();
+        for observer in &ids {
+            for peer in &ids {
+                if observer == peer {
+                    continue;
+                }
+                let slot = self
+                    .nodes
+                    .get_mut(observer)
+                    .expect("invariant: observer slot exists");
+                let driver = slot
+                    .driver
+                    .as_mut()
+                    .expect("invariant: observer has a driver");
+                driver
+                    .observe_peer_capability(*peer, semantic, features)
+                    .map_err(|error| cluster_host_error(*observer, error))?;
+            }
         }
         Ok(())
+    }
+
+    fn forget_peer_everywhere(&mut self, peer: NodeId) {
+        for (id, slot) in &mut self.nodes {
+            if *id == peer {
+                continue;
+            }
+            if let Some(driver) = slot.driver.as_mut() {
+                driver.forget_peer_capability(peer);
+            }
+        }
+    }
+
+    fn non_leader(&self) -> Option<NodeId> {
+        let leader = self.leader();
+        self.nodes.iter().find_map(|(id, slot)| {
+            if slot.status != cc_sim::NodeStatus::Up || slot.driver.is_none() || Some(*id) == leader
+            {
+                return None;
+            }
+            let driver = slot.driver.as_ref()?;
+            let role = driver.role();
+            matches!(role, Role::Follower | Role::Learner).then_some(*id)
+        })
     }
 
     fn handle_timeout(&mut self, id: u64) {
@@ -1921,6 +2203,7 @@ impl SimCluster {
                 // A crash is a process death: every byte of volatile state goes
                 // with it. Dropping the composition is what makes the restart
                 // path exercise recovery instead of resuming a paused node.
+                self.forget_peer_everywhere(node);
                 if let Some(slot) = self.nodes.get_mut(&node) {
                     slot.status = cc_sim::NodeStatus::Crashed;
                     slot.driver = None;
@@ -1944,10 +2227,12 @@ impl SimCluster {
                     if let Some(slot) = self.nodes.get_mut(&node) {
                         slot.status = cc_sim::NodeStatus::Up;
                     }
+                    self.observe_live_capabilities()?;
                     self.schedule(self.now, ClusterEventKind::Tick(node));
                 }
             }
             FaultAction::Wipe { node } => {
+                self.forget_peer_everywhere(node);
                 let disk_model = self.spec.config.disk_model;
                 let seed = self.spec.seed;
                 if let Some(slot) = self.nodes.get_mut(&node) {
@@ -3067,15 +3352,13 @@ fn link_config(profile: FaultProfile) -> LinkConfig {
     let mut config = LinkConfig::default();
     match profile {
         FaultProfile::Calm => {}
-        FaultProfile::Gentle => {
-            config.base_delay = Duration::from_millis(2);
-            config.drop = cc_core::P16::new(128);
-            config.duplicate = cc_core::P16::new(64);
-        }
         FaultProfile::Rough
         | FaultProfile::Membership
         | FaultProfile::Corruption
-        | FaultProfile::Ttl => {
+        | FaultProfile::Ttl
+        | FaultProfile::Batch
+        | FaultProfile::FollowerRead
+        | FaultProfile::StaleRead => {
             config.base_delay = Duration::from_millis(2);
             config.jitter = cc_core::DelayDist::Uniform {
                 low: Duration::default(),
@@ -3083,6 +3366,11 @@ fn link_config(profile: FaultProfile) -> LinkConfig {
             };
             config.drop = cc_core::P16::new(256);
             config.duplicate = cc_core::P16::new(128);
+        }
+        FaultProfile::Gentle | FaultProfile::FollowerReadV2 => {
+            config.base_delay = Duration::from_millis(2);
+            config.drop = cc_core::P16::new(128);
+            config.duplicate = cc_core::P16::new(64);
         }
         FaultProfile::Brutal | FaultProfile::Wipe | FaultProfile::Starve => {
             config.base_delay = Duration::from_millis(3);
@@ -3105,7 +3393,9 @@ fn simulated_cluster_id(seed: Seed) -> [u8; 16] {
 
 fn command_for(operation: &WorkloadOperation) -> KvCommand {
     match operation {
-        WorkloadOperation::Get { key } => KvCommand::Get { key: key.clone() },
+        WorkloadOperation::Get { key }
+        | WorkloadOperation::ReadFollower { key }
+        | WorkloadOperation::ReadStale { key } => KvCommand::Get { key: key.clone() },
         WorkloadOperation::Set { key, value, ttl } => KvCommand::Set {
             key: key.clone(),
             value: value.clone(),
@@ -3116,24 +3406,43 @@ fn command_for(operation: &WorkloadOperation) -> KvCommand {
             key: key.clone(),
             delta: 1,
         },
+        WorkloadOperation::Batch { commands } => KvCommand::Batch {
+            commands: commands.iter().map(command_for).collect(),
+        },
     }
 }
 
 fn operation_kind(operation: &WorkloadOperation) -> OperationKind {
     match operation {
-        WorkloadOperation::Get { key } => OperationKind::Get { key: key.clone() },
+        WorkloadOperation::Get { key }
+        | WorkloadOperation::ReadFollower { key }
+        | WorkloadOperation::ReadStale { key } => OperationKind::Get { key: key.clone() },
         WorkloadOperation::Set { key, value, .. } => OperationKind::Set {
             key: key.clone(),
             value: value.clone(),
         },
         WorkloadOperation::Del { key } => OperationKind::Del { key: key.clone() },
         WorkloadOperation::Incr { key } => OperationKind::Incr { key: key.clone() },
+        WorkloadOperation::Batch { commands } => OperationKind::Batch {
+            commands: commands.iter().map(operation_kind).collect(),
+        },
     }
 }
 
 fn reply_to_outcome(kind: &OperationKind, reply: &KvReply) -> Outcome {
     match (kind, reply) {
         (_, KvReply::Error(_) | KvReply::BatchError { .. }) => Outcome::Error,
+        (OperationKind::Batch { commands }, KvReply::Batch(replies))
+            if commands.len() == replies.len() =>
+        {
+            Outcome::Batch {
+                replies: commands
+                    .iter()
+                    .zip(replies)
+                    .map(|(command, reply)| reply_to_outcome(command, reply))
+                    .collect(),
+            }
+        }
         (OperationKind::Set { .. }, KvReply::Ok) => Outcome::Ok,
         (OperationKind::Del { .. }, KvReply::Integer(_)) => Outcome::Ok,
         (OperationKind::Get { .. }, KvReply::Value(value)) => Outcome::Value(value.clone()),
@@ -3145,6 +3454,54 @@ fn reply_to_outcome(kind: &OperationKind, reply: &KvReply) -> Outcome {
         (_, KvReply::Conditional(value)) => Outcome::Cas(*value),
         (_, KvReply::Scan(_)) => Outcome::Error,
         (_, KvReply::Batch(_)) => Outcome::Error,
+    }
+}
+
+fn is_retryable_host_error(error: &HostError) -> bool {
+    matches!(
+        error,
+        HostError::Node(
+            NodeError::NotLeader
+                | NodeError::FeatureDisabled
+                | NodeError::PersistencePending
+                | NodeError::Raft(
+                    cc_raft::RaftError::Busy
+                        | cc_raft::RaftError::NotLeader
+                        | cc_raft::RaftError::ReadBarrierNotReady
+                )
+        )
+    )
+}
+
+fn is_unavailable_follower_read(error: &HostError) -> bool {
+    matches!(
+        error,
+        HostError::Node(NodeError::Environment(
+            "follower read unavailable"
+                | "follower read leader unknown"
+                | "follower read capability unknown"
+                | "follower read feature unavailable"
+                | "duplicate follower read route"
+        ))
+    )
+}
+
+fn is_retryable_client_error(error: &ClusterError) -> bool {
+    match error {
+        ClusterError::Host { error, .. } => is_retryable_host_error(error),
+        ClusterError::Node {
+            error:
+                NodeError::NotLeader
+                | NodeError::FeatureDisabled
+                | NodeError::PersistencePending
+                | NodeError::Raft(
+                    cc_raft::RaftError::Busy
+                    | cc_raft::RaftError::NotLeader
+                    | cc_raft::RaftError::ReadBarrierNotReady,
+                ),
+            ..
+        } => true,
+        _ => false,
     }
 }
 
@@ -3674,6 +4031,7 @@ mod tests {
             ops_per_second: 30,
             keyspace: 8,
             set_ttl: None,
+            kind: cc_sim::WorkloadKind::Mixed,
         };
         spec.plan = FaultPlan::default();
         spec.plan.push(FaultAt {
@@ -4614,5 +4972,113 @@ mod tests {
             median >= 80,
             "median reduction {median}% is below the plan's 80% bar (samples {reductions:?})"
         );
+    }
+
+    #[test]
+    fn trap_batch_profile_is_globally_atomic() {
+        let mut spec = RunSpec::standard(Seed::new(0xb01), FaultProfile::Batch);
+        spec.config.end_time = Time::from_nanos(6_000_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.kind = cc_sim::WorkloadKind::Batch;
+        spec.plan = FaultPlan::default();
+        let run = run_spec(spec, RecorderLevel::Gate).expect("batch profile run");
+        assert!(run.healthy(), "{:?}", run.invariant_violations);
+        assert!(matches!(run.verdict, Verdict::Linearizable { .. }));
+        assert!(
+            run.history
+                .operations
+                .iter()
+                .any(|operation| matches!(operation.kind, OperationKind::Batch { .. })),
+            "batch profile must propose at least one atomic batch"
+        );
+    }
+
+    #[test]
+    fn trap_follower_read_profile_completes_a_non_leader_get() {
+        let mut spec = RunSpec::standard(Seed::new(0xf01), FaultProfile::FollowerRead);
+        spec.config.end_time = Time::from_nanos(6_000_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.kind = cc_sim::WorkloadKind::FollowerRead;
+        spec.plan = FaultPlan::default();
+        let run = run_spec(spec, RecorderLevel::Gate).expect("follower-read profile run");
+        assert!(run.healthy(), "{:?}", run.invariant_violations);
+        assert!(matches!(run.verdict, Verdict::Linearizable { .. }));
+        assert!(
+            run.history.operations.iter().any(|operation| {
+                matches!(operation.kind, OperationKind::Get { .. })
+                    && operation.complete.is_some()
+                    && operation.consistency == ConsistencyMode::Strong
+            }),
+            "follower-read profile must complete a strong GET"
+        );
+    }
+
+    #[test]
+    fn trap_follower_read_v2_profile_never_serves_local_state_as_linearizable() {
+        let mut spec = RunSpec::standard(Seed::new(0xf02), FaultProfile::FollowerReadV2);
+        spec.config.end_time = Time::from_nanos(4_000_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.kind = cc_sim::WorkloadKind::FollowerRead;
+        spec.plan = FaultPlan::default();
+        let run = run_spec(spec, RecorderLevel::Gate).expect("mixed-v2 follower-read run");
+        assert!(run.healthy(), "{:?}", run.invariant_violations);
+        assert!(matches!(run.verdict, Verdict::Linearizable { .. }));
+        assert!(
+            run.history.operations.iter().all(|operation| {
+                operation.consistency != ConsistencyMode::StaleLocal
+                    || operation.outcome == Outcome::Error
+                    || operation.complete.is_none()
+            }),
+            "v2 fallback must not launder a local read as linearizable"
+        );
+    }
+
+    #[test]
+    fn trap_stale_read_profile_evidence_matches_applied_index() {
+        let mut spec = RunSpec::standard(Seed::new(0x501), FaultProfile::StaleRead);
+        spec.config.end_time = Time::from_nanos(6_000_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.kind = cc_sim::WorkloadKind::StaleRead;
+        spec.plan = FaultPlan::default();
+        let run = run_spec(spec, RecorderLevel::Gate).expect("stale-read profile run");
+        assert!(run.healthy(), "{:?}", run.invariant_violations);
+        assert!(
+            run.history
+                .operations
+                .iter()
+                .any(
+                    |operation| operation.consistency == ConsistencyMode::StaleLocal
+                        && operation.complete.is_some()
+                ),
+            "stale-read profile must complete a local observation"
+        );
+        assert!(matches!(run.verdict, Verdict::Linearizable { .. }));
+    }
+
+    #[test]
+    fn trap_sim_observes_cchl_capability_before_feature_activation() {
+        let mut spec = RunSpec::standard(Seed::new(0xb02), FaultProfile::Batch);
+        spec.config.end_time = Time::from_nanos(2_000_000_000);
+        spec.end_time = spec.config.end_time;
+        spec.workload.clients = 0;
+        spec.plan = FaultPlan::default();
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .advance(Duration::from_millis(800))
+            .expect("elect leader");
+        let leader = cluster.leader().expect("leader");
+        let capabilities = cluster
+            .nodes
+            .get(&leader)
+            .and_then(|slot| slot.driver.as_ref())
+            .map(|driver| driver.node().peer_capabilities())
+            .expect("leader capabilities");
+        assert!(
+            capabilities.iter().any(|(_, semantic, features)| {
+                *semantic == SEMANTIC_VERSION_V3 && features & FEATURE_ATOMIC_BATCH != 0
+            }),
+            "simulated CCHL observations must advertise atomic-batch before activation"
+        );
+        assert!(cluster.ensure_atomic_batch().is_ok());
     }
 }

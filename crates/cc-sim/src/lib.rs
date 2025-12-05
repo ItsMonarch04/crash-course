@@ -1023,6 +1023,10 @@ pub enum FaultProfile {
     Wipe,
     Starve,
     Ttl,
+    Batch,
+    FollowerRead,
+    FollowerReadV2,
+    StaleRead,
 }
 
 impl FaultProfile {
@@ -1038,6 +1042,10 @@ impl FaultProfile {
             "wipe" => Self::Wipe,
             "starve" => Self::Starve,
             "ttl" => Self::Ttl,
+            "batch" => Self::Batch,
+            "follower-read" => Self::FollowerRead,
+            "follower-read-v2" => Self::FollowerReadV2,
+            "stale-read" => Self::StaleRead,
             _ => return None,
         })
     }
@@ -1054,6 +1062,28 @@ impl FaultProfile {
             Self::Wipe => "wipe",
             Self::Starve => "starve",
             Self::Ttl => "ttl",
+            Self::Batch => "batch",
+            Self::FollowerRead => "follower-read",
+            Self::FollowerReadV2 => "follower-read-v2",
+            Self::StaleRead => "stale-read",
+        }
+    }
+
+    #[must_use]
+    pub const fn workload_kind(self) -> WorkloadKind {
+        match self {
+            Self::Batch => WorkloadKind::Batch,
+            Self::FollowerRead | Self::FollowerReadV2 => WorkloadKind::FollowerRead,
+            Self::StaleRead => WorkloadKind::StaleRead,
+            Self::Calm
+            | Self::Gentle
+            | Self::Rough
+            | Self::Brutal
+            | Self::Membership
+            | Self::Corruption
+            | Self::Wipe
+            | Self::Starve
+            | Self::Ttl => WorkloadKind::Mixed,
         }
     }
 }
@@ -1210,6 +1240,15 @@ impl FaultPlan {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorkloadKind {
+    #[default]
+    Mixed,
+    Batch,
+    FollowerRead,
+    StaleRead,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkloadSpec {
     pub clients: u64,
@@ -1218,6 +1257,7 @@ pub struct WorkloadSpec {
     /// Relative expiry attached to generated SETs. A TTL workload uses only
     /// SET/GET so expiry visibility is isolated from numeric semantics.
     pub set_ttl: Option<Duration>,
+    pub kind: WorkloadKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1234,6 +1274,15 @@ pub enum WorkloadOperation {
         key: Vec<u8>,
     },
     Incr {
+        key: Vec<u8>,
+    },
+    Batch {
+        commands: Vec<WorkloadOperation>,
+    },
+    ReadFollower {
+        key: Vec<u8>,
+    },
+    ReadStale {
         key: Vec<u8>,
     },
 }
@@ -1259,32 +1308,71 @@ impl WorkloadActor {
 
     #[must_use]
     pub fn next_operation(&mut self) -> (u64, WorkloadOperation) {
-        let key_number = self.rng.range_u64(0, self.spec.keyspace.max(1));
-        let key = format!("key-{key_number}").into_bytes();
-        let operation = if self.spec.set_ttl.is_some() {
-            match self.rng.range_u64(0, 100) {
-                0..=59 => WorkloadOperation::Get { key },
-                _ => WorkloadOperation::Set {
-                    key,
-                    value: self.rng.u64().to_le_bytes().to_vec(),
-                    ttl: self.spec.set_ttl,
-                },
+        let key = self.next_key();
+        let operation = match self.spec.kind {
+            WorkloadKind::Batch => self.next_batch_mix(key),
+            WorkloadKind::FollowerRead => match self.rng.range_u64(0, 100) {
+                0..=39 => self.next_set(key),
+                _ => WorkloadOperation::ReadFollower { key },
+            },
+            WorkloadKind::StaleRead => match self.rng.range_u64(0, 100) {
+                0..=39 => self.next_set(key),
+                _ => WorkloadOperation::ReadStale { key },
+            },
+            WorkloadKind::Mixed if self.spec.set_ttl.is_some() => {
+                match self.rng.range_u64(0, 100) {
+                    0..=59 => WorkloadOperation::Get { key },
+                    _ => self.next_set(key),
+                }
             }
-        } else {
-            match self.rng.range_u64(0, 100) {
+            WorkloadKind::Mixed => match self.rng.range_u64(0, 100) {
                 0..=49 => WorkloadOperation::Get { key },
-                50..=79 => WorkloadOperation::Set {
-                    key,
-                    value: self.rng.u64().to_le_bytes().to_vec(),
-                    ttl: None,
-                },
+                50..=79 => self.next_set(key),
                 80..=89 => WorkloadOperation::Del { key },
                 _ => WorkloadOperation::Incr { key },
-            }
+            },
         };
         let sequence = self.next_sequence;
         self.next_sequence += 1;
         (sequence, operation)
+    }
+
+    fn next_key(&mut self) -> Vec<u8> {
+        let key_number = self.rng.range_u64(0, self.spec.keyspace.max(1));
+        format!("key-{key_number}").into_bytes()
+    }
+
+    fn next_set(&mut self, key: Vec<u8>) -> WorkloadOperation {
+        WorkloadOperation::Set {
+            key,
+            value: self.rng.u64().to_le_bytes().to_vec(),
+            ttl: self.spec.set_ttl,
+        }
+    }
+
+    fn next_simple(&mut self, key: Vec<u8>) -> WorkloadOperation {
+        match self.rng.range_u64(0, 4) {
+            0 => WorkloadOperation::Get { key },
+            1 => self.next_set(key),
+            2 => WorkloadOperation::Del { key },
+            _ => WorkloadOperation::Incr { key },
+        }
+    }
+
+    fn next_batch_mix(&mut self, key: Vec<u8>) -> WorkloadOperation {
+        match self.rng.range_u64(0, 100) {
+            0..=19 => WorkloadOperation::Get { key },
+            20..=39 => self.next_set(key),
+            _ => {
+                let count = 2_u64.saturating_add(self.rng.range_u64(0, 3));
+                let mut commands = Vec::new();
+                for _ in 0..count {
+                    let key = self.next_key();
+                    commands.push(self.next_simple(key));
+                }
+                WorkloadOperation::Batch { commands }
+            }
+        }
     }
 }
 
@@ -1295,6 +1383,7 @@ impl Default for WorkloadSpec {
             ops_per_second: 50,
             keyspace: 512,
             set_ttl: None,
+            kind: WorkloadKind::Mixed,
         }
     }
 }
@@ -1389,6 +1478,9 @@ pub fn materialize_fault_plan(
                 | FaultProfile::Membership
                 | FaultProfile::Wipe
                 | FaultProfile::Starve
+                | FaultProfile::Batch
+                | FaultProfile::FollowerRead
+                | FaultProfile::StaleRead
         ) {
             plan.push(FaultAt {
                 at: at_percent(span, 30, &mut rng),
@@ -1539,6 +1631,103 @@ pub fn materialize_fault_plan(
         action: FaultAction::Heal,
     });
     plan
+}
+
+#[cfg(test)]
+mod workload_tests {
+    use super::*;
+
+    #[test]
+    fn trap_batch_workload_emits_multi_command_batches() {
+        let spec = WorkloadSpec {
+            kind: WorkloadKind::Batch,
+            ..WorkloadSpec::default()
+        };
+        let mut actor = WorkloadActor::new(1, Seed::new(7), spec);
+        let mut saw_batch = false;
+        for _ in 0..64 {
+            match actor.next_operation().1 {
+                WorkloadOperation::Batch { commands } => {
+                    assert!(commands.len() >= 2);
+                    assert!(commands.iter().all(|command| {
+                        !matches!(
+                            command,
+                            WorkloadOperation::Batch { .. }
+                                | WorkloadOperation::ReadFollower { .. }
+                                | WorkloadOperation::ReadStale { .. }
+                        )
+                    }));
+                    saw_batch = true;
+                }
+                WorkloadOperation::Get { .. }
+                | WorkloadOperation::Set { .. }
+                | WorkloadOperation::Del { .. }
+                | WorkloadOperation::Incr { .. } => {}
+                WorkloadOperation::ReadFollower { .. } | WorkloadOperation::ReadStale { .. } => {
+                    panic!("batch mix must not emit follower or stale reads")
+                }
+            }
+        }
+        assert!(saw_batch, "batch mix must emit at least one atomic batch");
+    }
+
+    #[test]
+    fn trap_follower_and_stale_workloads_route_reads_explicitly() {
+        let mut follower = WorkloadActor::new(
+            1,
+            Seed::new(11),
+            WorkloadSpec {
+                kind: WorkloadKind::FollowerRead,
+                ..WorkloadSpec::default()
+            },
+        );
+        let mut stale = WorkloadActor::new(
+            1,
+            Seed::new(11),
+            WorkloadSpec {
+                kind: WorkloadKind::StaleRead,
+                ..WorkloadSpec::default()
+            },
+        );
+        assert!((0..32).any(|_| {
+            matches!(
+                follower.next_operation().1,
+                WorkloadOperation::ReadFollower { .. }
+            )
+        }));
+        assert!((0..32).any(|_| {
+            matches!(
+                stale.next_operation().1,
+                WorkloadOperation::ReadStale { .. }
+            )
+        }));
+    }
+
+    #[test]
+    fn trap_new_profiles_parse_and_select_workload_kind() {
+        assert_eq!(FaultProfile::parse("batch"), Some(FaultProfile::Batch));
+        assert_eq!(
+            FaultProfile::parse("follower-read"),
+            Some(FaultProfile::FollowerRead)
+        );
+        assert_eq!(
+            FaultProfile::parse("follower-read-v2"),
+            Some(FaultProfile::FollowerReadV2)
+        );
+        assert_eq!(
+            FaultProfile::parse("stale-read"),
+            Some(FaultProfile::StaleRead)
+        );
+        assert_eq!(FaultProfile::Batch.workload_kind(), WorkloadKind::Batch);
+        assert_eq!(
+            FaultProfile::FollowerReadV2.workload_kind(),
+            WorkloadKind::FollowerRead
+        );
+        assert_eq!(
+            FaultProfile::StaleRead.workload_kind(),
+            WorkloadKind::StaleRead
+        );
+    }
 }
 
 /// Place a fault at a fraction of the run, with jitter of one percent, so a
