@@ -80,12 +80,13 @@ for (let expected = 1; expected <= adrNumbers.at(-1); expected += 1) {
 
 const register = resolve(root, "tests/test-register.tsv");
 const [header, ...rows] = readFileSync(register, "utf8").trimEnd().split("\n");
-if (header !== "id\tstatus\trequirement\ttest") {
+if (header !== "phase\tgate\tharness\tpackage\tname\trequirement\tstatus") {
   errors.push("test register header differs from the checked-in schema");
 }
 for (const [index, row] of rows.entries()) {
-  if (row.split("\t").length !== 4) {
-    errors.push(`test register row ${index + 2} is not four-column TSV`);
+  const columns = row.split("\t");
+  if (columns.length !== 7 || columns.some((column) => column.length === 0)) {
+    errors.push(`test register row ${index + 2} is not a complete seven-column record`);
   }
 }
 

@@ -20,7 +20,7 @@ concurrency:
 jobs:
   bounded-campaigns:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - run: node scripts/check-version-coherence.mjs
@@ -38,6 +38,20 @@ jobs:
       - run: cargo run --locked -p cc-swarm -- run --profile membership --seeds 10000 --jobs 4 --require-beacon membership-change
       - run: cargo run --locked -p cc-swarm -- run --profile wipe --seeds 2000 --jobs 4 --require-beacon snapshot-install
       - run: cargo run --locked -p cc-swarm -- run --profile brutal --seeds 2000 --jobs 4 --require-beacon disk-loss
+      - run: cargo run --locked -p cc-swarm -- run --profile batch --seeds 10000 --jobs 4
+      - run: cargo run --locked -p cc-swarm -- run --profile follower-read --seeds 10000 --jobs 4
+      - run: cargo run --locked -p cc-swarm -- run --profile follower-read-v2 --seeds 2000 --jobs 4
+      - run: cargo run --locked -p cc-swarm -- run --profile stale-read --seeds 2000 --jobs 4
       - run: cargo run --locked -p cc-swarm -- regress
       - run: ./scripts/ci/sim-throughput.sh
       - run: ./scripts/ci/porcupine-crosscheck.sh
+
+  membership-demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+        with:
+          toolchain: stable
+      - run: CC_MEMBERSHIP_RUNS=20 bash scripts/demo-membership.sh

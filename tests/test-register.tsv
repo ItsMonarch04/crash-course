@@ -1,215 +1,605 @@
-id	status	requirement	test
-C0.1	implemented	Current CCBK v1 node-clone archives import only through the explicit fresh-identity path	trap_legacy_backup_import_never_reuses_node_identity
-C0.2	implemented	Current CCST and CCMT readers preserve canonical fixture bytes	golden_byte_layout_vectors
-C0.3	implemented	A 2c733f3 node-clone CCBK archive is refused without target mutation	trap_legacy_backup_is_explicitly_refused
-C0.4	implemented	A 2c733f3 CCTR trace remains readable by the current decoder	trap_trace_reads_legacy_cctr_fixture
-C0.5	implemented	A 2c733f3 CC-HISTORY v1 receipt remains readable by the current decoder	trap_history_reads_legacy_v1_fixture
-C0.6	implemented	A 2c733f3 CCWL segment remains recoverable by the current WAL reader	trap_legacy_wal_fixture_is_recoverable
-C0.7	implemented	A 2c733f3 CCST table remains readable by the current store reader	trap_legacy_sst_fixture_is_readable
-C0.8	implemented	Current logical CCBK v2 bytes use the production checkpoint-envelope codec	golden_ccbk_v2
-C0.8	implemented	A 2c733f3 CCMT metadata record still boots the current store reader	trap_legacy_meta_fixture_boots_store
-C0.9	implemented	A 2c733f3 CCKV command remains readable by the current command decoder	trap_legacy_command_fixture_is_readable
-C0.10	implemented	A 2c733f3 CCPF frame remains readable by the current frame decoder	trap_legacy_peer_frame_fixture_is_readable
-C0.11	implemented	A raised CCID reader floor is refused before opening other node state	trap_ccid_refuses_future_reader_before_opening_state
-N0.2.1	implemented	Imported ambient clocks are rejected in deterministic crates	trap_imported_clock_is_detected
-N0.3.1	implemented	Unknown vote responses never form quorum	trap_unknown_vote_response_cannot_form_quorum
-N0.3.2	implemented	Learner responses never commit an entry	trap_learner_never_counts_toward_quorum
-N0.3.3	implemented	Joint elections require both majorities	trap_joint_election_requires_both_majorities
-N0.3.4	implemented	Configuration takes effect on follower append	trap_config_on_append_changes_joint_quorum_before_commit
-N0.3.5	implemented	Membership recovers from log and snapshot	trap_membership_recovers_from_log_and_snapshot
-N0.3.6	implemented	Learners receive entries but never vote	trap_learners_receive_entries_but_never_vote
-N0.3.7	implemented	An isolated leader steps down after CheckQuorum	trap_checkquorum_steps_down_isolated_leader
-N0.3.8	implemented	Only one configuration change is in flight	trap_leave_joint_waits_for_committed_enter_joint
-N0.3.9	implemented	Leadership transfer waits for durable intent and a caught-up target	trap_leadership_transfer_waits_for_committed_intent_and_caught_up_target
-N0.3.10	implemented	TimeoutNow follows normal durable election flow	trap_timeout_now_uses_normal_term_and_vote_fsync
-N0.3.11	implemented	Transfer workflow identity survives CCSN compaction and recovery	trap_leadership_transfer_identity_survives_ccsn_compaction
-N0.3.12	implemented	Wrong transfer target or stale intent cannot finish	trap_wrong_target_or_stale_transfer_cannot_complete
-N0.3.13	implemented	Rejected config does not mutate membership	trap_rejected_config_proposal_does_not_mutate_membership
-N0.3.14	implemented	Truncating config restores prior membership	trap_truncated_uncommitted_config_restores_prior_membership
-N0.3.15	implemented	Cluster policy has a canonical v1 encoding	golden_cluster_policy_v1
-N0.3.16	implemented	Cluster policy codec is bounded and canonical	trap_cluster_policy_codec_is_bounded_and_canonical
-N0.3.17	implemented	A policy hash cannot substitute for exact policy bytes	trap_forged_matching_policy_hash_cannot_bypass_exact_bytes
-N0.3.18	implemented	Configuration and admin replies encode canonically	golden_cccf_v1_and_ccar_v1
-N0.3.19	implemented	Absent admin identity is canonical	trap_config_envelope_admin_absence_is_canonical
-N0.3.20	implemented	Peer addresses reject noncanonical forms	trap_membership_address_codec_is_canonical
-N0.3.21	implemented	Unknown config tags fail closed	trap_unknown_config_tag_fails_closed
-N0.4.1	implemented	Every committed entry advances both apply cursors	trap_every_committed_entry_advances_both_applied_indices
-N0.4.2	implemented	Duplicate commands advance the log cursor without reapply	trap_duplicate_advances_index_without_reapplying
-N0.4.3	implemented	Deterministic command errors are cached and applied	trap_command_error_is_cached_and_applied
-N0.4.4	implemented	A successful CAS writes exactly once	trap_cas_writes_once
-N0.4.5	implemented	Committed apply never returns Busy	trap_committed_apply_never_returns_busy
-N0.4.6	implemented	Malformed committed proposals fail closed	trap_malformed_committed_proposal_fails_closed
-N0.4.7	implemented	Expired session retries cannot mutate	trap_expired_session_retry_does_not_apply
-N0.4.8	implemented	Same sequence and different bytes never mutate	trap_same_sequence_different_command_never_mutates
-N0.4.9	implemented	User and admin session namespaces are distinct	trap_user_and_admin_session_namespaces_cannot_alias
-N0.4.10	implemented	User and admin entries share one atomic session table	trap_user_and_admin_entries_share_one_atomic_session_table
-N0.4.11	implemented	Leader logical time survives snapshot restore	trap_last_leader_time_survives_snapshot_and_restore
-N0.4.12	implemented	Conditional SET is one replicated apply	trap_conditional_set_is_one_replicated_apply
-N0.4.13	implemented	Failed conditional SET preserves value and TTL	trap_failed_conditional_set_preserves_value_and_ttl
-N0.4.14	implemented	Expired keys count as absent for conditional SET	trap_conditional_set_treats_expired_key_as_absent
-N0.5.1	implemented	Snapshot base is the log origin	trap_snapshot_base_is_the_log_origin
-N0.5.2	implemented	Append matches the snapshot base	trap_append_matches_snapshot_base
-N0.5.3	implemented	Same index with a different snapshot term is rejected	trap_same_index_different_term_snapshot_is_rejected
-N0.5.4	implemented	Equal snapshot pins are reference counted	trap_equal_watermark_snapshot_pins_are_reference_counted
-N0.6.1	implemented	History v2 preserves binary keys and values	trap_history_v2_round_trips_binary_keys_and_values
-N0.6.2	implemented	History v2 preserves open operations	trap_history_v2_preserves_open_operations
-N0.6.3	implemented	History rejects malformed hex and duplicate operation ids	trap_history_rejects_invalid_hex_and_duplicate_ids
-N0.6.4	implemented	A chunk cannot claim an empty initial state	trap_chunk_cannot_claim_an_empty_initial_state
-N0.6.5	implemented	Planted lost acknowledgements are rejected	trap_real_history_detects_planted_lost_ack
-N0.6.6	implemented	Resurrection reports every nonnil post-delete value	trap_classifies_resurrection
-N1.1.1	implemented	Recovery does not claim an unproven applied watermark	trap_restore_refuses_unproven_applied_watermark
-N1.2.1	implemented	Application envelopes are canonical	proposal_envelope_round_trips_through_public_builder
-N1.2.2	implemented	KV replies are canonical	golden_cckr_v1_round_trips_and_rejects_corruption
-N1.2.3	implemented	CCKR scan count is bounded by remaining bytes	trap_cckr_scan_count_is_bounded_by_remaining_bytes
-N1.2.4	implemented	CCAP absent session fields are canonical	trap_ccap_session_absence_is_canonical
-N1.2.5	implemented	Volatile route ids never enter Raft payload	trap_plain_route_ids_never_enter_raft_payload
-N1.2.6	implemented	Follower apply emits no client-route reply	trap_follower_apply_emits_no_client_route_reply
-N1.2.7	implemented	Leadership loss and truncation drop client routes	trap_route_is_dropped_on_leadership_loss_or_truncation
-N1.3.1	implemented	Vote replies wait for successful hard-state persistence	trap_vote_reply_waits_for_successful_hard_state_fsync
-N1.3.2	implemented	Append replies wait for successful log persistence	trap_append_reply_waits_for_successful_log_fsync
-N1.3.3	implemented	Failed fsync suppresses pending continuation	trap_failed_fsync_suppresses_continuation
-N1.3.4	implemented	Unknown or duplicate persistence completions fail closed	trap_unknown_or_duplicate_io_completion_fails_closed
-N1.3.5	implemented	A pending synchronous I/O continuation blocks new input	trap_node_processes_no_input_while_sync_io_is_blocked
-N1.3.6	implemented	Effect order survives multiple durability barriers	trap_effect_order_survives_two_barriers
-N1.4.1	implemented	Durable-log recovery is idempotent	trap_log_recovery_is_idempotent
-N1.4.2	implemented	Torn final log tail recovers to a prefix	trap_log_torn_tail_is_prefix_safe
-N1.4.3	implemented	Mid-segment log corruption fails closed	trap_log_midsegment_corruption_fails_closed
-N1.4.4	implemented	Hard-state term regression is corruption	trap_lower_hard_term_is_corruption
-N1.4.5	implemented	Vote change in one term is corruption	trap_vote_change_in_one_term_is_corruption
-N1.4.6	implemented	Snapshot marks require a verified durable snapshot	trap_snapshot_mark_requires_durable_snapshot
-N1.4.7	implemented	Genesis recovery requires exact CCID and policy	trap_genesis_policy_must_match_ccid_and_recovery_config
-N1.4.8	implemented	Log recovery canonicalizes filesystem segment enumeration	trap_log_recovery_sorts_enumerated_segments_by_sequence
-N1.5.1	implemented	Shared driver correlates write and fsync before continuation	trap_driver_correlates_write_and_fsync_before_continuation
-N1.5.2	implemented	Shared driver rejects unknown I/O completions	trap_driver_rejects_unknown_or_failed_io_completion
-N1.5.3	implemented	Shared driver ignores stale timer generations	trap_driver_ignores_stale_timer_generation
-N1.5.4	implemented	Shared driver releases a delayed outcome exactly once	trap_driver_release_is_exactly_once
-N1.5.5	implemented	Critical host write failure carries I/O and file identity	trap_driver_failed_critical_write_is_a_durability_error
-N1.6.1	implemented	Strict config rejects missing defaults and duplicate identity	trap_strict_config_rejects_defaults_and_duplicate_identity
-N1.6.2	implemented	Cluster IDs have one nonzero lowercase hexadecimal representation	trap_cluster_id_has_one_nonzero_canonical_text_form
-N1.6.3	implemented	Join rejects mismatched node or foreign cluster identity	trap_join_rejects_foreign_cluster_data
-N1.6.4	implemented	CCID rejects corruption and removed-directory reuse before listen	trap_removed_membership_forces_terminal_ccid_before_listen
-N1.6.5	implemented	CCID refuses a symlinked data directory before opening state	trap_ccid_refuses_a_symlinked_data_directory_before_opening_state
-N1.6.6	implemented	Pre-N1 command journals are refused without mutation	trap_pre_upgrade_data_dir_is_refused_before_writes
-N1.6.7	implemented	CC.REQUEST only admits one state-changing command	trap_cc_request_rejects_reads_and_multikey_commands
-N1.6.8	implemented	CCHL advertises the CCRP semantic version used by the adapter	trap_hello_advertises_the_same_semantic_version_as_ccrp
-N1.7.1	implemented	Input journal pairs each input with its effect batch	trap_journal_record_pairs_input_and_effects
-N1.7.2	implemented	Input journal discards only a torn final record	trap_input_journal_is_prefix_durable
-N1.7.3	implemented	Input journal rejects complete-record CRC corruption	trap_input_journal_rejects_complete_crc_corruption
-N1.7.4	implemented	A capped journal is marked as a replayable prefix	trap_capped_journal_never_claims_complete
-N1.7.5	implemented	Recorder creates private files and rejects symlink paths	trap_record_path_permissions_and_symlinks_are_rejected
-N1.7.6	implemented	Replay consumes recorded block reads and their service time	trap_replay_consumes_recorded_block_reads_and_service_time
-N1.7.7	implemented	Replay rejects a changed recorded block-read order	trap_replay_rejects_block_read_request_order_divergence
-N1.7.8	implemented	Required recording refuses an unrecorded invocation	trap_record_required_refuses_unrecorded_mode
-N1.7.9	implemented	Replay starts only from the captured boot image	trap_replay_starts_from_captured_boot_image
-N1.7.10	implemented	Terminal recording footers are synced and carry their status	trap_terminal_recording_footer_is_synced_and_labeled
-N1.7.11	implemented	Failed block reads retain service time through recording and replay	trap_failed_block_read_keeps_recorded_service_time
-N1.7.12	implemented	A bounded real-host run emits a synced complete CCIJ footer	trap_bounded_run_can_finish_a_complete_recording
-N1.7.13	implemented	A real-host CCIJ receipt replays with identical effects	trap_real_host_effects_match_replay
-N1.7.14	implemented	CCIJ writer rejects a timestamp regression before it reaches disk	trap_record_writer_rejects_nonmonotonic_transition_time
-N1.8.1	implemented	Cluster scheduler enforces its configured per-instant event cap	trap_single_scheduler_enforces_per_instant_limit
-N1.8.2	implemented	Simulator recovery uses the framed cc-log durable prefix	trap_simulator_recovers_framed_cc_log_prefix
-N1.8.3	implemented	Shared simulator event queue preserves virtual-time FIFO ordering	equal_time_events_use_insertion_order
-N1.8.4	implemented	Wiped simulator node catches up without an out-of-band state copy	trap_wipe_has_no_out_of_band_state_copy
-N1.8.5	implemented	Wasm theater wraps the same Driver-backed simulator	trap_wasm_wraps_the_same_driver_backed_simcluster
-N1.8.6	implemented	Crash discards volatile simulator state	trap_crash_discards_volatile_state
-N1.8.7	implemented	Restart recovers hard state, log, and membership from durable bytes	trap_restart_recovers_hard_state_log_and_membership_from_disk
-N1.8.8	implemented	Simulator nodes use one Driver boundary and the cc-log durable vocabulary	trap_architecture_has_one_host_boundary_and_one_raft_log
-N2.1.1	implemented	CCHL v1 round trips canonically	golden_cchl_vectors
-N2.1.2	implemented	CCRP v1 round trips canonically	golden_ccrp_vectors
-N2.1.3	implemented	Peer hello requires a version overlap	trap_peer_hello_requires_version_overlap
-N2.1.4	implemented	Fragmented or coalesced hello preserves first frame	trap_fragmented_or_coalesced_hello_preserves_first_frame
-N2.1.5	implemented	Peer hello rejects policy mismatches	trap_peer_hello_rejects_cluster_policy_mismatch
-N2.1.6	implemented	Peer hello rejects unavailable required features	trap_peer_hello_rejects_missing_required_feature
-N2.1.7	implemented	CCRP preserves ReadIndex round	trap_ccrp_preserves_read_round
-N2.1.8	implemented	CCRP count is bounded by remaining bytes	trap_ccrp_count_is_bounded_by_remaining_bytes
-N2.1.9	implemented	CCRP rejects noncanonical options	trap_ccrp_rejects_noncanonical_options
-N2.1.10	implemented	Snapshot chunks and acknowledgements are canonical	trap_snapshot_chunk_done_and_ack_offsets_are_canonical
-N2.1.11	implemented	TimeoutNow requires a nonzero intent	trap_timeout_now_codec_requires_nonzero_intent
-N2.1.12	implemented	CCPF and CCRP semantic versions agree	trap_ccpf_and_ccrp_semantic_versions_must_match
-N2.1.13	implemented	Unknown CCRP tags return typed errors	trap_unknown_message_tag_is_a_typed_error
-N2.2.1	implemented	Simulator sends complete CCPF/CCRP frame bytes without a message side channel	trap_simulator_has_no_message_side_channel
-N2.2.2	implemented	Network byte reservations release for delivery and horizon cancellation	trap_network_byte_charge_releases_for_every_delivery_outcome
-N2.2.3	implemented	Transport trace payloads use canonical binary fingerprints	trap_trace_payloads_do_not_use_debug_format
-N2.2.4	implemented	Unexpected valid-outer CCRP decode failures stop the simulator	trap_valid_frame_decode_failure_is_an_invariant
-N2.3.1	implemented	Replayed snapshot chunks are idempotent	trap_replayed_snapshot_chunk_is_idempotent
-N2.3.2	implemented	Corrupt CCPF frames never reach the Raft decoder	trap_corrupt_frame_never_reaches_raft_decoder
-N2.3.3	implemented	Truncated CCPF frames never reach the Raft decoder	trap_truncated_frame_is_rejected_before_allocation
-N2.3.4	implemented	Rechecksummed malformed CCRP never reaches the state machine	trap_rechecksummed_malformed_ccrp_never_reaches_state_machine
-N2.3.5	implemented	Heal clears sustained frame faults and replay bytes	trap_heal_clears_sustained_link_fault_without_leaking_bytes
-N2.3.6	implemented	Replayed Append frames are idempotent	trap_replayed_append_is_idempotent
-N3.1.1	implemented	Store watermark publication is atomic	trap_store_watermark_is_atomic_with_write_batch
-N3.2.1	implemented	SST v2 has golden vectors	golden_sst_v2_vectors
-N3.2.2	implemented	SST v2 validates block/index/bloom boundaries	trap_block_index_seek_matches_linear_scan
-N3.2.3	implemented	SST v2 rejects noncanonical internal keys	trap_out_of_order_internal_keys_are_rejected
-N3.2.4	implemented	SST v2 keeps an oversized valid entry in one bounded block	trap_oversized_entry_gets_its_own_bounded_block
-N3.2.5	implemented	SST v2 can reject a missing key at its bloom boundary	trap_bloom_negative_avoids_data_read
-N3.3.1	implemented	A synchronous block read charges only the requesting operation	trap_sync_read_delays_its_own_reply
-N3.3.2	implemented	A short block read fails closed	trap_short_block_read_fails_closed
-N3.4.1	implemented	CCMF edits replay atomically and CCMT names their checked generation	manifest_v2_round_trips_atomic_edits_and_meta_pointer
-N3.4.2	implemented	Only a torn final CCMF record is ignored during prefix recovery	trap_manifest_torn_tail_replays_only_complete_edit_prefix
-N3.4.3	implemented	Manifest generation compaction writes one complete next snapshot	trap_manifest_compaction_rewrites_a_complete_next_generation
-N4.1.1	implemented	Host limits reject zero admission caps	trap_host_limits_reject_zero_admission_caps
-N4.1.2	implemented	Driver class queues are bounded and deliver I/O before clients	trap_every_host_queue_has_a_limit
-N4.1.3	implemented	Driver input bytes are reserved before queue admission	trap_driver_queue_byte_limit_is_charged_before_admission
-N4.2.1	implemented	Stop-and-wait streamed snapshot lifecycle is bounded, durably marked, and safely restarts/retries	trap_streamed_snapshot_lifecycle_is_bounded
-N4.3.1	implemented	Driver footprint exposes deterministic current, peak, and limit queue-byte charges	trap_footprint_counts_encoded_queue_bytes
-N4.5.1	implemented	Slow disk delays durability completion before dependent traffic	trap_slow_disk_preserves_election_safety
-N4.5.2	implemented	A crash drops delayed durability continuations	trap_crash_discards_a_delayed_durability_continuation
-N4.5.3	implemented	ENOSPC suppresses a dependent vote reply and enters StorageFault	trap_enospc_fails_closed_before_a_vote_reply
-N4.5.4	implemented	At-rest bit rot is detected during recovery and never served	trap_bitrot_is_detected_not_served
-N4.5.5	implemented	Persistent disk-fault trace specifications preserve their selected fields	persistent_disk_fault_specs_round_trip_all_selected_fields
-N4.6.1	implemented	CCBK v2 restore creates a fresh cluster and node identity	trap_restore_creates_fresh_cluster_identity
-N5.1.1	implemented	Checker emits a deterministic minimal witness	trap_minimal_witness_is_deterministic
-N5.1.2	implemented	An exhausted witness budget never returns a passing subset	trap_witness_budget_never_returns_a_passing_subset
-N5.2.1	implemented	Anomaly classifier uses only certain real-time order	trap_classifier_does_not_order_concurrent_operations
-N5.2.2	implemented	Anomaly classifier labels stale reads without an intervening write	trap_classifies_stale_read
-N5.5.1	implemented	Trace reads current binary and JSON export forms	trap_trace_reads_current_binary_and_json_exports
-N6.1.1	implemented	Seed ledger deduplicates byte-identical campaign outcomes	trap_ledger_dedupes_identical_rows
-N6.1.2	implemented	Campaign resume skips only prior successful ledger rows	trap_resume_skips_only_prior_ok_by_default
-N6.2.1	implemented	Shards partition seeds exactly once and validate bounds	trap_shards_partition_seed_range_exactly
-N7.1.1	implemented	Compatibility matrix is enforced	trap_compatibility_matrix_is_enforced
-N7.1.2	implemented	Current CCSN golden is decoded by its owning reader	trap_snapshot_ordering
-N7.1.3	implemented	Current SST data-block golden is checksum protected	trap_block_crc_detects_bit_flip
-N7.1.4	implemented	Current RESP golden is parsed without inline fallback	trap_inline_commands_are_rejected
-N7.1.5	implemented	Current store-WAL golden replays after its manifest watermark	trap_store_wal_replays_only_after_manifest_watermark
-N8.1.1	implemented	Real membership operations use replicated config	trap_real_host_effects_match_replay
-N8.1.2	implemented	Learner add and promotion are replicated config transitions	trap_learner_add_and_promotion_are_replicated_config_transitions
-N8.2.1	implemented	Non-loopback listeners require an explicit unsafe opt-in	trap_non_loopback_bind_requires_the_flag
-N8.2.2	implemented	Unsafe listener warning includes the actual bound address	trap_unsafe_warning_names_actual_listener
-N9.1.1	implemented	Every rendered theater control has a contract row and functional controls change observable state	every control changes observable state
-N9.1.2	implemented	Theater packet loss maps to an effective LinkDegrade P16 value	trap_packet_loss_uses_the_effective_link_p16_value
-N9.1.3	implemented	Theater disk latency maps to effective persistent SlowDisk service time	trap_slow_disk_reports_the_effective_persistent_delay
-N9.2.1	implemented	Timeline markers use stable trace-sequence keys and emit no duplicate-key console error	timeline markers render without duplicate React keys
-N10.1.1	implemented	Batch applies atomically or not at all	trap_batch_applies_atomically_or_not_at_all
-N10.1.2	implemented	Batch command encoding has a fixed v3 vector	golden_cckv_batch_v3
-N10.1.3	implemented	Batch reply encoding uses the v3 envelope	golden_cckr_batch_reply_v3
-N10.1.4	implemented	Batch admission respects immutable policy caps	trap_batch_respects_size_caps
-N10.1.5	implemented	Batch failures identify the first failing subcommand	trap_batch_failure_reports_the_failing_index
-N10.1.6	implemented	Batch session retries deduplicate the complete atomic unit	trap_batch_dedup_is_one_unit
-N10.1.7	implemented	Batch reads observe earlier subcommands	trap_batch_reads_see_prior_subcommands
-N10.1.8	implemented	Every batch TTL decision uses one replicated timestamp	trap_batch_ttl_uses_one_timestamp
-N10.1.9	implemented	Feature activation requires every learner capability	trap_batch_activation_requires_every_learner_capability
-N10.1.10	implemented	An empty batch cannot consume a session sequence	trap_empty_batch_does_not_consume_session_sequence
-N10.1.11	implemented	Oversized batch replies publish no mutations	trap_oversized_batch_reply_aborts_before_publish
-N10.1.12	implemented	Nested batches are rejected	trap_nested_batch_is_rejected
-N10.2.1	implemented	Follower read waits for ReadIndex	trap_follower_read_waits_for_readindex
-N10.2.2	implemented	Follower grants from another term are ignored	trap_follower_read_grant_requires_current_term
-N10.2.3	implemented	Follower TTL evaluation uses leader-supplied read time	trap_follower_read_uses_leader_time_for_ttl
-N10.2.4	implemented	Follower-read tags require the negotiated feature bit	trap_follower_read_tags_require_negotiated_feature_bit
-N10.2.5	implemented	Ordinary reads remain leader reads	trap_default_read_is_leader_read
-N10.2.6	implemented	Stale local reads are excluded from linearizability	trap_stale_read_is_excluded_from_the_linearizable_history
-N10.2.7	implemented	Stale replies match traced state at the reported applied index	trap_stale_read_matches_reported_applied_index
-N10.2.8	implemented	Stale TTL filtering uses the reported read time	trap_stale_read_ttl_uses_reported_read_time
-N10.2.9	implemented	Stale reads make no contact-age freshness promise	trap_stale_read_makes_no_time_bound
-N10.3.1	implemented	Fresh restore discards source cluster and node identity before growth	trap_restored_cluster_grows_without_identity_clone
-N10.3.2	implemented	Fresh restore retains the active semantic feature floor	trap_backup_restore_preserves_active_feature_floor
-N10.3.3	implemented	Fresh restore preserves final value and TTL probes	trap_restored_cluster_matches_source_final_probes
-N11.1.1	implemented	Documentation inventory is coherent	doc_coherence
-N11.6.1	implemented	Synthetic artifacts are rejected by claims and museum boundaries	trap_synthetic_artifact_is_rejected_by_claims_and_museum
-N11.6.2	implemented	Default workspace builds enable no synthetic kata	trap_default_build_enables_no_kata
-N11.6.3	implemented	Kata features are mutually exclusive	trap_kata_features_are_mutually_exclusive
-N11.6.4	implemented	Kata 01 exposes an even-voter commit quorum defect within its budget	trap_kata_01_commit_quorum_is_found_within_budget
-N11.6.5	implemented	Kata 02 exposes a denied-vote timer reset within its budget	trap_kata_02_wrong_timer_reset_is_found_within_budget
-N11.6.6	implemented	Kata 03 exposes an acknowledgement released before fsync within its budget	trap_kata_03_ack_before_fsync_is_found_within_budget
-N11.6.7	implemented	Kata 04 exposes tombstone collection above the bottom level within its budget	trap_kata_04_tombstone_gc_is_found_within_budget
-N11.6.8	implemented	Kata 05 exposes session deduplication keyed without command bytes within its budget	trap_kata_05_session_dedup_is_found_within_budget
+phase	gate	harness	package	name	requirement	status
+-	-	cargo-lib	cc-checker	budget_exhaustion_is_explicitly_undecided	Budget exhaustion is explicitly undecided	green
+-	-	cargo-lib	cc-checker	genuine_precedence_is_still_enforced	Genuine precedence is still enforced	green
+-	-	cargo-lib	cc-checker	history_document_initial_state_is_checked	History document initial state is checked	green
+-	-	cargo-lib	cc-checker	increment_lost_update_is_rejected	Increment lost update is rejected	green
+-	-	cargo-lib	cc-checker	independent_keys_are_partitioned_before_search	Independent keys are partitioned before search	green
+-	-	cargo-lib	cc-checker	legal_set_get_history_is_linearizable	Legal set get history is linearizable	green
+-	-	cargo-lib	cc-checker	operations_sharing_an_instant_are_concurrent	Operations sharing an instant are concurrent	green
+-	-	cargo-lib	cc-checker	porcupine_export_contains_invoke_and_completion_events	Porcupine export contains invoke and completion events	green
+-	-	cargo-lib	cc-checker	scan_is_checked_as_a_snapshot_legal_operation	Scan is checked as a snapshot legal operation	green
+-	-	cargo-lib	cc-checker	stale_read_is_rejected	Stale read is rejected	green
+-	-	cargo-lib	cc-checker	trace_and_liveness_reports_are_actionable	Trace and liveness reports are actionable	green
+-	-	cargo-lib	cc-checker	trap_anomaly_near_misses_remain_unclassified	Anomaly near misses remain unclassified	green
+-	-	cargo-lib	cc-checker	trap_batch_is_one_atomic_checker_transition	Batch is one atomic checker transition	green
+N0	NG0	cargo-lib	cc-checker	trap_chunk_cannot_claim_an_empty_initial_state	A chunk cannot claim an empty initial state	green
+N5	NG5	cargo-lib	cc-checker	trap_classifier_does_not_order_concurrent_operations	Anomaly classifier uses only certain real-time order	green
+N5	NG5	cargo-lib	cc-checker	trap_classifies_acked_write_lost	Classifies acked write lost	green
+N5	NG5	cargo-lib	cc-checker	trap_classifies_dirty_read	Classifies dirty read	green
+N5	NG5	cargo-lib	cc-checker	trap_classifies_duplicate_apply	Classifies duplicate apply	green
+N5	NG5	cargo-lib	cc-checker	trap_classifies_lost_update	Classifies lost update	green
+N5	NG5	cargo-lib	cc-checker	trap_classifies_non_monotonic_incr	Classifies non monotonic incr	green
+N5	NG5	cargo-lib	cc-checker	trap_classifies_replica_divergence	Classifies replica divergence	green
+N0	NG0	cargo-lib	cc-checker	trap_classifies_resurrection	Resurrection reports every nonnil post-delete value	green
+N5	NG5	cargo-lib	cc-checker	trap_classifies_stale_read	Anomaly classifier labels stale reads without an intervening write	green
+-	-	cargo-lib	cc-checker	trap_extended_anomaly_predicates_require_explicit_evidence	Extended anomaly predicates require explicit evidence	green
+-	-	cargo-lib	cc-checker	trap_failed_batch_cannot_publish_partial_state	Failed batch cannot publish partial state	green
+C0	C0	cargo-lib	cc-checker	trap_history_reads_legacy_v1_fixture	A 2c733f3 CC-HISTORY v1 receipt remains readable by the current decoder	green
+N0	NG0	cargo-lib	cc-checker	trap_history_rejects_invalid_hex_and_duplicate_ids	History rejects malformed hex and duplicate operation ids	green
+N0	NG0	cargo-lib	cc-checker	trap_history_v2_preserves_open_operations	History v2 preserves open operations	green
+N0	NG0	cargo-lib	cc-checker	trap_history_v2_round_trips_binary_keys_and_values	History v2 preserves binary keys and values	green
+N5	NG5	cargo-lib	cc-checker	trap_linearizable_implies_session_guarantees	Linearizable implies session guarantees	green
+N5	NG5	cargo-lib	cc-checker	trap_minimal_witness_is_deterministic	Checker emits a deterministic minimal witness	green
+-	-	cargo-lib	cc-checker	trap_open_op_can_be_dropped_in_the_other_direction	Open op can be dropped in the other direction	green
+-	-	cargo-lib	cc-checker	trap_open_op_semantics_allows_timeout_to_take_effect	Open op semantics allows timeout to take effect	green
+N0	NG0	cargo-lib	cc-checker	trap_real_history_detects_planted_lost_ack	Planted lost acknowledgements are rejected	green
+N0	NG0	cargo-lib	cc-checker	trap_resurrection_checker_flags_any_value_not_only_empty_bytes	Resurrection checker flags any value not only empty bytes	green
+N5	NG5	cargo-lib	cc-checker	trap_session_crosscheck_excludes_stale_reads	Session crosscheck excludes stale reads	green
+N10	NG10	cargo-lib	cc-checker	trap_stale_read_is_excluded_from_the_linearizable_history	Stale local reads are excluded from linearizability	green
+N10	NG10	cargo-lib	cc-checker	trap_stale_read_makes_no_time_bound	Stale reads make no contact-age freshness promise	green
+N10	NG10	cargo-lib	cc-checker	trap_stale_read_matches_reported_applied_index	Stale replies match traced state at the reported applied index	green
+N10	NG10	cargo-lib	cc-checker	trap_stale_read_ttl_uses_reported_read_time	Stale TTL filtering uses the reported read time	green
+-	-	cargo-lib	cc-checker	trap_ttl_checker_allows_only_a_true_deadline_straddle	Ttl checker allows only a true deadline straddle	green
+N5	NG5	cargo-lib	cc-checker	trap_witness_budget_never_returns_a_passing_subset	An exhausted witness budget never returns a passing subset	green
+N5	NG5	cargo-lib	cc-checker	trap_witness_is_smaller_than_the_history	Witness is smaller than the history	green
+N5	NG5	cargo-lib	cc-checker	trap_witness_preserves_initial_state	Witness preserves initial state	green
+N5	NG5	cargo-lib	cc-checker	trap_witness_still_fails_the_checker	Witness still fails the checker	green
+-	-	cargo-lib	cc-checker	wing_gong_search_matches_a_brute_force_eight_operation_oracle	Wing gong search matches a brute force eight operation oracle	green
+-	-	cargo-lib	cc-cluster	checkpoint_snapshot_restores_kv_and_applied_index	Checkpoint snapshot restores kv and applied index	green
+N1	NG1	cargo-lib	cc-cluster	golden_ccap_v1	Ccap v1	green
+-	-	cargo-lib	cc-cluster	node_starts_as_follower_and_rejects_writes_until_leader	Node starts as follower and rejects writes until leader	green
+N1	NG1	cargo-lib	cc-cluster	proposal_envelope_round_trips_through_public_builder	Application envelopes are canonical	green
+-	-	cargo-lib	cc-cluster	read_waits_for_quorum_barrier_and_applied_index	Read waits for quorum barrier and applied index	green
+-	-	cargo-lib	cc-cluster	recovered_node_requires_exact_policy_and_snapshot_membership	Recovered node requires exact policy and snapshot membership	green
+N4	NG4	cargo-lib	cc-cluster	trap_active_session_is_never_evicted	Active session is never evicted	green
+N1	NG1	cargo-lib	cc-cluster	trap_append_reply_waits_for_successful_log_fsync	Append replies wait for successful log persistence	green
+N10	NG10	cargo-lib	cc-cluster	trap_backup_restore_preserves_active_feature_floor	Fresh restore retains the active semantic feature floor	green
+N10	NG10	cargo-lib	cc-cluster	trap_batch_activation_requires_every_learner_capability	Feature activation requires every learner capability	green
+N10	NG10	cargo-lib	cc-cluster	trap_batch_dedup_is_one_unit	Batch session retries deduplicate the complete atomic unit	green
+N10	NG10	cargo-lib	cc-cluster	trap_batch_requires_cluster_feature_activation	Batch requires cluster feature activation	green
+N10	NG10	cargo-lib	cc-cluster	trap_batch_respects_size_caps	Batch admission respects immutable policy caps	green
+N4	NG4	cargo-lib	cc-cluster	trap_busy_is_returned_before_memory_grows	Busy is returned before memory grows	green
+N1	NG1	cargo-lib	cc-cluster	trap_cc_request_deduplicates_across_reconnect	Cc request deduplicates across reconnect	green
+N1	NG1	cargo-lib	cc-cluster	trap_ccap_session_absence_is_canonical	CCAP absent session fields are canonical	green
+N8	NG8	cargo-lib	cc-cluster	trap_ccsn_install_restores_transfer_so_timeout_now_can_elect	Peer CCSN install restores a compacted BeginLeaderTransfer so TimeoutNow can elect	green
+-	-	cargo-lib	cc-cluster	trap_ccsn_stream_decoder_matches_complete_decoder_without_raw_image_buffer	Ccsn stream decoder matches complete decoder without raw image buffer	green
+-	-	cargo-lib	cc-cluster	trap_ccsn_stream_encoder_matches_the_frozen_canonical_bytes	Ccsn stream encoder matches the frozen canonical bytes	green
+-	-	cargo-lib	cc-cluster	trap_ccsn_v1_round_trips_logical_state_and_rejects_corruption	Ccsn v1 round trips logical state and rejects corruption	green
+N1	NG1	cargo-lib	cc-cluster	trap_client_route_generation_drops_late_reply	Client route generation drops late reply	green
+N0	NG0	cargo-lib	cc-cluster	trap_command_error_is_cached_and_applied	Deterministic command errors are cached and applied	green
+-	-	cargo-lib	cc-cluster	trap_decoded_ccsn_constructs_the_single_recovery_snapshot_value	Decoded ccsn constructs the single recovery snapshot value	green
+N10	NG10	cargo-lib	cc-cluster	trap_default_read_is_leader_read	Ordinary reads remain leader reads	green
+N0	NG0	cargo-lib	cc-cluster	trap_duplicate_advances_index_without_reapplying	Duplicate commands advance the log cursor without reapply	green
+N1	NG1	cargo-lib	cc-cluster	trap_effect_order_survives_two_barriers	Effect order survives multiple durability barriers	green
+N10	NG10	cargo-lib	cc-cluster	trap_empty_batch_does_not_consume_session_sequence	An empty batch cannot consume a session sequence	green
+N0	NG0	cargo-lib	cc-cluster	trap_every_committed_entry_advances_both_applied_indices	Every committed entry advances both apply cursors	green
+N8	NG8	cargo-lib	cc-cluster	trap_expired_membership_request_cannot_restart_transition	Expired membership request cannot restart transition	green
+N0	NG0	cargo-lib	cc-cluster	trap_expired_session_retry_does_not_apply	Expired session retries cannot mutate	green
+N4	NG4	cargo-lib	cc-cluster	trap_expiry_is_replicated_not_local	Expiry is replicated not local	green
+N1	NG1	cargo-lib	cc-cluster	trap_failed_fsync_suppresses_continuation	Failed fsync suppresses pending continuation	green
+N1	NG1	cargo-lib	cc-cluster	trap_follower_apply_emits_no_client_route_reply	Follower apply emits no client-route reply	green
+N10	NG10	cargo-lib	cc-cluster	trap_follower_read_grant_requires_current_term	Follower grants from another term are ignored	green
+N10	NG10	cargo-lib	cc-cluster	trap_follower_read_tags_require_negotiated_feature_bit	Follower-read tags require the negotiated feature bit	green
+N10	NG10	cargo-lib	cc-cluster	trap_follower_read_uses_leader_time_for_ttl	Follower TTL evaluation uses leader-supplied read time	green
+N10	NG10	cargo-lib	cc-cluster	trap_follower_read_waits_for_readindex	Follower read waits for ReadIndex	green
+N0	NG0	cargo-lib	cc-cluster	trap_forged_matching_policy_hash_cannot_bypass_exact_bytes	A policy hash cannot substitute for exact policy bytes	green
+N4	NG4	cargo-lib	cc-cluster	trap_full_session_table_still_answers_duplicate	Full session table still answers duplicate	green
+N4	NG4	cargo-lib	cc-cluster	trap_host_limits_cannot_change_committed_apply_result	Host limits cannot change committed apply result	green
+N4	NG4	cargo-lib	cc-cluster	trap_idle_cluster_proposes_no_sweeps	Idle cluster proposes no sweeps	green
+N11	NG11	cargo-lib	cc-cluster	trap_kata_05_session_dedup_is_found_within_budget	Kata 05 exposes session deduplication keyed without command bytes within its budget	green
+N0	NG0	cargo-lib	cc-cluster	trap_leadership_transfer_identity_survives_ccsn_compaction	Transfer workflow identity survives CCSN compaction and recovery	green
+N4	NG4	cargo-lib	cc-cluster	trap_logical_state_charge_matches_encoded_ccsn_length	Logical state charge matches encoded ccsn length	green
+N0	NG0	cargo-lib	cc-cluster	trap_malformed_committed_proposal_fails_closed	Malformed committed proposals fail closed	green
+N8	NG8	cargo-lib	cc-cluster	trap_membership_preflight_rejects_quorum_loss	Membership preflight rejects quorum loss	green
+N8	NG8	cargo-lib	cc-cluster	trap_membership_request_id_cannot_alias_another_operation	Membership request id cannot alias another operation	green
+N8	NG8	cargo-lib	cc-cluster	trap_membership_retry_is_idempotent	Membership retry is idempotent	green
+N1	NG1	cargo-lib	cc-cluster	trap_node_processes_no_input_while_sync_io_is_blocked	A pending synchronous I/O continuation blocks new input	green
+N4	NG4	cargo-lib	cc-cluster	trap_only_one_expiry_sweep_is_inflight	Only one expiry sweep is inflight	green
+N1	NG1	cargo-lib	cc-cluster	trap_peer_identity_must_match_inner_frame	Peer identity must match inner frame	green
+N4	NG4	cargo-lib	cc-cluster	trap_pending_admin_workflow_session_cannot_expire	Pending admin workflow session cannot expire	green
+N4	NG4	cargo-lib	cc-cluster	trap_pending_client_routes_are_bounded_and_dropped_on_stepdown	Pending client routes are bounded and dropped on stepdown	green
+N1	NG1	cargo-lib	cc-cluster	trap_plain_route_ids_never_enter_raft_payload	Volatile route ids never enter Raft payload	green
+N1	NG1	cargo-lib	cc-cluster	trap_restore_refuses_unproven_applied_watermark	Recovery does not claim an unproven applied watermark	green
+N10	NG10	cargo-lib	cc-cluster	trap_restored_cluster_grows_without_identity_clone	Fresh restore discards source cluster and node identity before growth	green
+N10	NG10	cargo-lib	cc-cluster	trap_restored_cluster_matches_source_final_probes	Fresh restore preserves final value and TTL probes	green
+N1	NG1	cargo-lib	cc-cluster	trap_route_is_dropped_on_leadership_loss_or_truncation	Leadership loss and truncation drop client routes	green
+N0	NG0	cargo-lib	cc-cluster	trap_same_sequence_different_command_never_mutates	Same sequence and different bytes never mutate	green
+N4	NG4	cargo-lib	cc-cluster	trap_session_byte_limit_counts_request_and_reply	Session byte limit counts request and reply	green
+N4	NG4	cargo-lib	cc-cluster	trap_session_table_is_bounded	Session table is bounded	green
+-	-	cargo-lib	cc-cluster	trap_single_voter_election_still_waits_for_hard_state_fsync	Single voter election still waits for hard state fsync	green
+N4	NG4	cargo-lib	cc-cluster	trap_uncommitted_log_is_bounded_under_partition	Uncommitted log is bounded under partition	green
+N1	NG1	cargo-lib	cc-cluster	trap_unknown_or_duplicate_io_completion_fails_closed	Unknown or duplicate persistence completions fail closed	green
+N0	NG0	cargo-lib	cc-cluster	trap_user_and_admin_entries_share_one_atomic_session_table	User and admin entries share one atomic session table	green
+N0	NG0	cargo-lib	cc-cluster	trap_user_and_admin_session_namespaces_cannot_alias	User and admin session namespaces are distinct	green
+N1	NG1	cargo-lib	cc-cluster	trap_vote_reply_waits_for_successful_hard_state_fsync	Vote replies wait for successful hard-state persistence	green
+-	-	cargo-lib	cc-core	crc32c_published_vector	Crc32c published vector	green
+-	-	cargo-lib	cc-core	decoder_rejects_oversized_length	Decoder rejects oversized length	green
+N0	NG0	cargo-lib	cc-core	golden_ccar_v1	Ccar v1	green
+N0	NG0	cargo-lib	cc-core	golden_cccf_v1	Cccf v1	green
+N0	NG0	cargo-lib	cc-core	golden_cccf_v1_and_ccar_v1	Configuration and admin replies encode canonically	green
+N0	NG0	cargo-lib	cc-core	golden_cluster_policy_v1	Cluster policy has a canonical v1 encoding	green
+-	-	cargo-lib	cc-core	golden_membership_state_v1_round_trips_joint_projection	Membership state v1 round trips joint projection	green
+-	-	cargo-lib	cc-core	ids_have_stable_display	Ids have stable display	green
+-	-	cargo-lib	cc-core	malformed_trace_inputs_are_total	Malformed trace inputs are total	green
+-	-	cargo-lib	cc-core	stream_is_domain_separated_and_repeatable	Stream is domain separated and repeatable	green
+-	-	cargo-lib	cc-core	time_arithmetic_is_checked	Time arithmetic is checked	green
+-	-	cargo-lib	cc-core	trace_json_is_stable_and_escaped	Trace json is stable and escaped	green
+-	-	cargo-lib	cc-core	trace_round_trip_is_byte_stable	Trace round trip is byte stable	green
+N1	NG1	cargo-lib	cc-core	trap_cluster_id_has_one_nonzero_canonical_text_form	Cluster IDs have one nonzero lowercase hexadecimal representation	green
+N0	NG0	cargo-lib	cc-core	trap_cluster_policy_codec_is_bounded_and_canonical	Cluster policy codec is bounded and canonical	green
+N0	NG0	cargo-lib	cc-core	trap_config_envelope_admin_absence_is_canonical	Absent admin identity is canonical	green
+N4	NG4	cargo-lib	cc-core	trap_host_limits_reject_zero_admission_caps	Host limits reject zero admission caps	green
+N4	NG4	cargo-lib	cc-core	trap_invalid_limits_fail_boot	Invalid limits fail boot	green
+N0	NG0	cargo-lib	cc-core	trap_membership_address_codec_is_canonical	Peer addresses reject noncanonical forms	green
+N0	NG0	cargo-lib	cc-core	trap_unknown_config_tag_fails_closed	Unknown config tags fail closed	green
+N4	NG4	cargo-lib	cc-core	trap_wasm_accepts_stream_totals_larger_than_usize	Wasm accepts stream totals larger than usize	green
+-	-	cargo-bin	cc-detlint	explicit_host_boundary_line_is_the_only_clock_escape	Explicit host boundary line is the only clock escape	green
+-	-	cargo-bin	cc-detlint	scanner_finds_forbidden_sources	Scanner finds forbidden sources	green
+N0	NG0	cargo-bin	cc-detlint	trap_imported_clock_is_detected	Imported ambient clocks are rejected in deterministic crates	green
+-	-	cargo-lib	cc-env	boundary_input_and_effect_codecs_round_trip	Boundary input and effect codecs round trip	green
+-	-	cargo-lib	cc-env	file_ids_have_ordered_stable_variants	File ids have ordered stable variants	green
+N2	NG2	cargo-lib	cc-env	golden_cchl_vectors	CCHL v1 round trips canonically	green
+-	-	cargo-lib	cc-env	peer_frame_checksum_rejects_corruption	Peer frame checksum rejects corruption	green
+-	-	cargo-lib	cc-env	peer_frame_round_trip_and_stream_prefix_are_bounded	Peer frame round trip and stream prefix are bounded	green
+N2	NG2	cargo-lib	cc-env	trap_fragmented_or_coalesced_hello_preserves_first_frame	Fragmented or coalesced hello preserves first frame	green
+C0	C0	cargo-lib	cc-env	trap_legacy_peer_frame_fixture_is_readable	A 2c733f3 CCPF frame remains readable by the current frame decoder	green
+N7	NG7	cargo-lib	cc-env	trap_mixed_build_negotiates_semantic_v2	Mixed build negotiates semantic v2	green
+N2	NG2	cargo-lib	cc-env	trap_peer_hello_rejects_cluster_policy_mismatch	Peer hello rejects policy mismatches	green
+N2	NG2	cargo-lib	cc-env	trap_peer_hello_rejects_missing_required_feature	Peer hello rejects unavailable required features	green
+N2	NG2	cargo-lib	cc-env	trap_peer_hello_requires_version_overlap	Peer hello requires a version overlap	green
+N7	NG7	cargo-lib	cc-env	trap_rolling_upgrade_rejects_cluster_policy_drift	Rolling upgrade rejects cluster policy drift	green
+N7	NG7	cargo-lib	cc-env	trap_unsupported_feature_is_never_silently_downgraded	Unsupported feature is never silently downgraded	green
+N1	NG1	cargo-lib	cc-host	trap_bounded_peer_queue_drops_instead_of_blocking_consensus	Bounded peer queue drops instead of blocking consensus	green
+N1	NG1	cargo-lib	cc-host	trap_capped_journal_never_claims_complete	A capped journal is marked as a replayable prefix	green
+-	-	cargo-lib	cc-host	trap_competing_snapshot_rejection_is_canonical_after_progress	Competing snapshot rejection is canonical after progress	green
+N4	NG4	cargo-lib	cc-host	trap_delayed_old_transfer_cannot_evict_new_staging	Delayed old transfer cannot evict new staging	green
+N1	NG1	cargo-lib	cc-host	trap_driver_correlates_write_and_fsync_before_continuation	Shared driver correlates write and fsync before continuation	green
+N1	NG1	cargo-lib	cc-host	trap_driver_failed_critical_write_is_a_durability_error	Critical host write failure carries I/O and file identity	green
+N1	NG1	cargo-lib	cc-host	trap_driver_ignores_stale_timer_generation	Shared driver ignores stale timer generations	green
+N4	NG4	cargo-lib	cc-host	trap_driver_queue_byte_limit_is_charged_before_admission	Driver input bytes are reserved before queue admission	green
+N1	NG1	cargo-lib	cc-host	trap_driver_rejects_unknown_or_failed_io_completion	Shared driver rejects unknown I/O completions	green
+N1	NG1	cargo-lib	cc-host	trap_driver_release_is_exactly_once	Shared driver releases a delayed outcome exactly once	green
+N1	NG1	cargo-lib	cc-host	trap_driver_retains_effects_until_sync_service_elapses	Driver retains effects until sync service elapses	green
+-	-	cargo-lib	cc-host	trap_durable_log_trigger_starts_one_coalesced_local_checkpoint	Durable log trigger starts one coalesced local checkpoint	green
+N4	NG4	cargo-lib	cc-host	trap_every_host_queue_has_a_limit	Driver class queues are bounded and deliver I/O before clients	green
+N1	NG1	cargo-lib	cc-host	trap_failed_block_read_delays_its_own_error	Failed block read delays its own error	green
+N1	NG1	cargo-lib	cc-host	trap_failed_block_read_keeps_recorded_service_time	Failed block reads retain service time through recording and replay	green
+N3	NG3	cargo-lib	cc-host	trap_failed_sync_read_charges_service_before_error	Failed sync read charges service before error	green
+N4	NG4	cargo-lib	cc-host	trap_file_backed_scans_and_compaction_respect_open_file_cap	File backed scans and compaction respect open file cap	green
+N4	NG4	cargo-lib	cc-host	trap_follower_checkpoint_reclaims_its_own_log_prefix	Follower checkpoint reclaims its own log prefix	green
+N4	NG4	cargo-lib	cc-host	trap_footprint_counts_encoded_queue_bytes	Driver footprint exposes deterministic current, peak, and limit queue-byte charges	green
+N1	NG1	cargo-lib	cc-host	trap_input_journal_is_prefix_durable	Input journal discards only a torn final record	green
+N1	NG1	cargo-lib	cc-host	trap_input_journal_rejects_complete_crc_corruption	Input journal rejects complete-record CRC corruption	green
+N1	NG1	cargo-lib	cc-host	trap_journal_record_pairs_input_and_effects	Input journal pairs each input with its effect batch	green
+N11	NG11	cargo-lib	cc-host	trap_kata_03_ack_before_fsync_is_found_within_budget	Kata 03 exposes an acknowledgement released before fsync within its budget	green
+N4	NG4	cargo-lib	cc-host	trap_leader_sends_snapshot_when_log_prefix_is_gone	Leader sends snapshot when log prefix is gone	green
+N1	NG1	cargo-lib	cc-host	trap_log_prefix_discard_follows_snapshot_mark_and_dir_fsync	Log prefix discard follows snapshot mark and dir fsync	green
+N4	NG4	cargo-lib	cc-host	trap_lost_final_snapshot_ack_does_not_reinstall	Lost final snapshot ack does not reinstall	green
+N4	NG4	cargo-lib	cc-host	trap_maintenance_reserve_serializes_space_amplifying_jobs	Maintenance reserve serializes space amplifying jobs	green
+N4	NG4	cargo-lib	cc-host	trap_raft_and_store_wal_hard_caps_fail_closed	Raft and store wal hard caps fail closed	green
+-	-	cargo-lib	cc-host	trap_recorded_boot_image_is_bounded_and_canonical	Recorded boot image is bounded and canonical	green
+-	-	cargo-lib	cc-host	trap_recovered_driver_appends_after_verified_wal_prefix	Recovered driver appends after verified wal prefix	green
+N1	NG1	cargo-lib	cc-host	trap_replay_consumes_recorded_block_reads_and_service_time	Replay consumes recorded block reads and their service time	green
+N1	NG1	cargo-lib	cc-host	trap_replay_rejects_block_read_request_order_divergence	Replay rejects a changed recorded block-read order	green
+N4	NG4	cargo-lib	cc-host	trap_snapshot_buffer_cannot_exceed_limit	Snapshot buffer cannot exceed limit	green
+N4	NG4	cargo-lib	cc-host	trap_snapshot_crc_failure_does_not_advance_apply	Snapshot crc failure does not advance apply	green
+N4	NG4	cargo-lib	cc-host	trap_snapshot_duplicate_chunk_is_idempotent	Snapshot duplicate chunk is idempotent	green
+N4	NG4	cargo-lib	cc-host	trap_snapshot_gap_is_rejected	Snapshot gap is rejected	green
+N4	NG4	cargo-lib	cc-host	trap_snapshot_install_serializes_with_apply_and_local_checkpoint	Snapshot install serializes with apply and local checkpoint	green
+N4	NG4	cargo-lib	cc-host	trap_snapshot_reads_never_observe_staging_state	Snapshot reads never observe staging state	green
+N4	NG4	cargo-lib	cc-host	trap_snapshot_restart_from_zero_after_lost_ack_is_safe	Snapshot restart from zero after lost ack is safe	green
+-	-	cargo-lib	cc-host	trap_snapshot_sender_is_discarded_after_leader_term_ends	Snapshot sender is discarded after leader term ends	green
+N4	NG4	cargo-lib	cc-host	trap_snapshot_staging_is_bounded	Snapshot staging is bounded	green
+-	-	cargo-lib	cc-host	trap_store_wal_cursor_switches_before_compaction_rename_is_exposed	Store wal cursor switches before compaction rename is exposed	green
+-	-	cargo-lib	cc-host	trap_streamed_journal_header_and_frames_match_complete_encoding	Streamed journal header and frames match complete encoding	green
+N4	NG4	cargo-lib	cc-host	trap_streamed_snapshot_lifecycle_is_bounded	Stop-and-wait streamed snapshot lifecycle is bounded, durably marked, and safely restarts/retries	green
+N3	NG3	cargo-lib	cc-host	trap_sync_read_blocks_same_node_inputs	Sync read blocks same node inputs	green
+-	-	cargo-lib	cc-kv	command_codec_round_trip	Command codec round trip	green
+-	-	cargo-lib	cc-kv	extended_command_codec_round_trips	Extended command codec round trips	green
+N10	NG10	cargo-lib	cc-kv	golden_cckr_batch_reply_v3	Batch reply encoding uses the v3 envelope	green
+N1	NG1	cargo-lib	cc-kv	golden_cckr_v1	Cckr v1	green
+N1	NG1	cargo-lib	cc-kv	golden_cckr_v1_round_trips_and_rejects_corruption	KV replies are canonical	green
+N10	NG10	cargo-lib	cc-kv	golden_cckv_batch_v3	Batch command encoding has a fixed v3 vector	green
+-	-	cargo-lib	cc-kv	rmw_family_is_atomic_and_preserves_documented_ttl_rules	Rmw family is atomic and preserves documented ttl rules	green
+-	-	cargo-lib	cc-kv	sessions_deduplicate_and_reject_stale_sequences	Sessions deduplicate and reject stale sequences	green
+-	-	cargo-lib	cc-kv	trap_applied_index_atomicity	Applied index atomicity	green
+N10	NG10	cargo-lib	cc-kv	trap_batch_applies_atomically_or_not_at_all	Batch applies atomically or not at all	green
+N10	NG10	cargo-lib	cc-kv	trap_batch_failure_reports_the_failing_index	Batch failures identify the first failing subcommand	green
+N10	NG10	cargo-lib	cc-kv	trap_batch_reads_see_prior_subcommands	Batch reads observe earlier subcommands	green
+-	-	cargo-lib	cc-kv	trap_batch_reply_flags_are_canonical	Batch reply flags are canonical	green
+N10	NG10	cargo-lib	cc-kv	trap_batch_ttl_uses_one_timestamp	Every batch TTL decision uses one replicated timestamp	green
+N0	NG0	cargo-lib	cc-kv	trap_cas_writes_once	A successful CAS writes exactly once	green
+N1	NG1	cargo-lib	cc-kv	trap_cckr_scan_count_is_bounded_by_remaining_bytes	CCKR scan count is bounded by remaining bytes	green
+N0	NG0	cargo-lib	cc-kv	trap_committed_apply_never_returns_busy	Committed apply never returns Busy	green
+N0	NG0	cargo-lib	cc-kv	trap_conditional_set_is_one_replicated_apply	Conditional SET is one replicated apply	green
+N0	NG0	cargo-lib	cc-kv	trap_conditional_set_treats_expired_key_as_absent	Expired keys count as absent for conditional SET	green
+N4	NG4	cargo-lib	cc-kv	trap_deadline_index_survives_snapshot_and_restore	Deadline index survives snapshot and restore	green
+N4	NG4	cargo-lib	cc-kv	trap_expired_key_is_invisible_before_sweep	Expired key is invisible before sweep	green
+N0	NG0	cargo-lib	cc-kv	trap_failed_conditional_set_preserves_value_and_ttl	Failed conditional SET preserves value and TTL	green
+N0	NG0	cargo-lib	cc-kv	trap_last_leader_time_survives_snapshot_and_restore	Leader logical time survives snapshot restore	green
+C0	C0	cargo-lib	cc-kv	trap_legacy_command_fixture_is_readable	A 2c733f3 CCKV command remains readable by the current command decoder	green
+-	-	cargo-lib	cc-kv	trap_logical_snapshot_preserves_visible_sequences_and_deadlines	Logical snapshot preserves visible sequences and deadlines	green
+N10	NG10	cargo-lib	cc-kv	trap_nested_batch_is_rejected	Nested batches are rejected	green
+N10	NG10	cargo-lib	cc-kv	trap_oversized_batch_reply_aborts_before_publish	Oversized batch replies publish no mutations	green
+-	-	cargo-lib	cc-kv	trap_sessions_in_snapshot	Sessions in snapshot	green
+N4	NG4	cargo-lib	cc-kv	trap_sweep_is_bounded_per_entry	Sweep is bounded per entry	green
+-	-	cargo-lib	cc-kv	trap_ttl_replica_clock_uses_leader_time_only	Ttl replica clock uses leader time only	green
+-	-	cargo-lib	cc-log	trap_framed_host_stream_recovers_a_prefix_after_torn_tail	Framed host stream recovers a prefix after torn tail	green
+-	-	cargo-lib	cc-log	trap_framed_host_stream_rejects_complete_corruption	Framed host stream rejects complete corruption	green
+N1	NG1	cargo-lib	cc-log	trap_genesis_policy_must_match_ccid_and_recovery_config	Genesis recovery requires exact CCID and policy	green
+-	-	cargo-lib	cc-log	trap_installed_snapshot_mark_can_rebase_a_follower_without_old_entries	Installed snapshot mark can rebase a follower without old entries	green
+N1	NG1	cargo-lib	cc-log	trap_log_midsegment_corruption_fails_closed	Mid-segment log corruption fails closed	green
+N1	NG1	cargo-lib	cc-log	trap_log_recovery_is_idempotent	Durable-log recovery is idempotent	green
+N1	NG1	cargo-lib	cc-log	trap_log_recovery_sorts_enumerated_segments_by_sequence	Log recovery canonicalizes filesystem segment enumeration	green
+N1	NG1	cargo-lib	cc-log	trap_log_torn_tail_is_prefix_safe	Torn final log tail recovers to a prefix	green
+-	-	cargo-lib	cc-log	trap_log_write_is_not_published_before_fsync	Log write is not published before fsync	green
+N1	NG1	cargo-lib	cc-log	trap_lower_hard_term_is_corruption	Hard-state term regression is corruption	green
+-	-	cargo-lib	cc-log	trap_snapshot_mark_requires_durable_log_position	Snapshot mark requires durable log position	green
+N1	NG1	cargo-lib	cc-log	trap_snapshot_mark_requires_durable_snapshot	Snapshot marks require a verified durable snapshot	green
+N1	NG1	cargo-lib	cc-log	trap_vote_change_in_one_term_is_corruption	Vote change in one term is corruption	green
+N11	NG11	cargo-bin	cc-node	doc_coherence	Documentation inventory is coherent	green
+-	-	cargo-lib	cc-node	emit_c0_identity_fixtures_when_requested	Emit c0 identity fixtures when requested	green
+C0	C0	cargo-bin	cc-node	golden_ccbk_v2	Current logical CCBK v2 bytes use the production checkpoint-envelope codec	green
+N4	NG4	cargo-bin	cc-node	trap_backup_and_restore_paths_reject_symlinks_and_overwrite	Backup and restore paths reject symlinks and overwrite	green
+N4	NG4	cargo-bin	cc-node	trap_backup_is_one_consistent_applied_index	Backup is one consistent applied index	green
+N7	NG7	cargo-bin	cc-node	trap_backup_recovery_is_not_reported_as_old_binary_downgrade	Backup recovery is not reported as old binary downgrade	green
+-	-	cargo-lib	cc-node	trap_boot_clock_never_moves_below_recovered_floor	Boot clock never moves below recovered floor	green
+-	-	cargo-lib	cc-node	trap_boot_restores_a_restore_origin_checkpoint_named_by_its_durable_mark	Boot restores a restore origin checkpoint named by its durable mark	green
+N1	NG1	cargo-lib	cc-node	trap_bounded_run_can_finish_a_complete_recording	A bounded real-host run emits a synced complete CCIJ footer	green
+-	-	cargo-lib	cc-node	trap_capped_recording_is_a_labeled_replayable_prefix	Capped recording is a labeled replayable prefix	green
+N1	NG1	cargo-lib	cc-node	trap_cc_request_rejects_reads_and_multikey_commands	CC.REQUEST only admits one state-changing command	green
+N1	NG1	cargo-bin	cc-node	trap_ccid_lifecycle_rejects_removed_directory_reactivation	Ccid lifecycle rejects removed directory reactivation	green
+N1	NG1	cargo-bin	cc-node	trap_ccid_minima_only_increase	Ccid minima only increase	green
+N1	NG1	cargo-bin	cc-node	trap_ccid_refuses_a_symlinked_data_directory_before_opening_state	CCID refuses a symlinked data directory before opening state	green
+C0	C0	cargo-bin	cc-node	trap_ccid_refuses_future_reader_before_opening_state	A raised CCID reader floor is refused before opening other node state	green
+N1	NG1	cargo-bin	cc-node	trap_cluster_id_is_required_and_not_the_label	Cluster id is required and not the label	green
+N4	NG4	cargo-bin	cc-node	trap_cluster_policy_hash_matches_genesis_ccid_and_snapshot	Cluster policy hash matches genesis ccid and snapshot	green
+N1	NG1	cargo-bin	cc-node	trap_cluster_policy_mismatch_refuses_before_service	Cluster policy mismatch refuses before service	green
+N7	NG7	cargo-bin	cc-node	trap_compatibility_matrix_is_enforced	Compatibility matrix is enforced	green
+N10	NG10	cargo-lib	cc-node	trap_dirty_transaction_never_proposes	Dirty transaction never proposes	green
+N10	NG10	cargo-lib	cc-node	trap_entryv3_fsyncs_ccid_before_log_ack	Entryv3 fsyncs ccid before log ack	green
+N7	NG7	cargo-bin	cc-node	trap_every_supported_persisted_golden_decodes	Every supported persisted golden decodes	green
+N10	NG10	cargo-lib	cc-node	trap_exec_cannot_claim_reconnect_dedup_without_a_batch_envelope	Exec cannot claim reconnect dedup without a batch envelope	green
+N10	NG10	cargo-lib	cc-node	trap_exec_disconnect_discards_queue	Exec disconnect discards queue	green
+N4	NG4	cargo-lib	cc-node	trap_expireat_overflow_is_rejected	Expireat overflow is rejected	green
+N1	NG1	cargo-lib	cc-node	trap_hello_advertises_the_same_semantic_version_as_ccrp	CCHL advertises the CCRP semantic version used by the adapter	green
+N4	NG4	cargo-lib	cc-node	trap_host_thread_count_and_stack_reservations_are_bounded	Host thread count and stack reservations are bounded	green
+N8	NG8	cargo-bin	cc-node	trap_hostname_with_any_nonloopback_answer_is_unsafe	Hostname with any nonloopback answer is unsafe	green
+N1	NG1	cargo-bin	cc-node	trap_join_rejects_foreign_cluster_data	Join rejects mismatched node or foreign cluster identity	green
+N8	NG8	cargo-bin	cc-node	trap_join_rejects_unhonorable_cluster_policy_before_identity_publish	Join rejects unhonorable cluster policy before identity publish	green
+N8	NG8	cargo-lib	cc-node	trap_join_serves_only_after_active_ccid_fsync	Join serves only after active ccid fsync	green
+C0	C0	cargo-bin	cc-node	trap_legacy_backup_import_never_reuses_node_identity	Current CCBK v1 node-clone archives import only through the explicit fresh-identity path	green
+C0	C0	cargo-bin	cc-node	trap_legacy_backup_is_explicitly_refused	A 2c733f3 node-clone CCBK archive is refused without target mutation	green
+N4	NG4	cargo-bin	cc-node	trap_legacy_backup_is_not_counted_as_cluster_complete	Legacy backup is not counted as cluster complete	green
+N4	NG4	cargo-bin	cc-node	trap_legacy_session_without_command_never_wildcard_matches	Legacy session without command never wildcard matches	green
+N8	NG8	cargo-bin	cc-node	trap_metrics_listener_obeys_bind_safety	Metrics listener obeys bind safety	green
+-	-	cargo-bin	cc-node	trap_metrics_page_remains_local_and_dependency_free	Metrics page remains local and dependency free	green
+-	-	cargo-lib	cc-node	trap_metrics_snapshot_is_bounded_and_covers_every_footprint	Metrics snapshot is bounded and covers every footprint	green
+-	-	cargo-lib	cc-node	trap_multi_queue_is_closed_and_does_not_expand_multikey_writes	Multi queue is closed and does not expand multikey writes	green
+N1	NG1	cargo-lib	cc-node	trap_no_second_replication_protocol	No second replication protocol	green
+N1	NG1	cargo-bin	cc-node	trap_node_config_rejects_a_noncanonical_cluster_id	Node configuration refuses a cluster id that is absent or not canonical lowercase hexadecimal	green
+N7	NG7	cargo-bin	cc-node	trap_node_directory_rejects_cluster_policy_drift	A data directory whose CCID policy hash differs from this build is refused before service	green
+N8	NG8	cargo-bin	cc-node	trap_non_loopback_bind_requires_the_flag	Non-loopback listeners require an explicit unsafe opt-in	green
+N7	NG7	cargo-bin	cc-node	trap_old_build_refuses_new_directory_before_mutation	Old build refuses new directory before mutation	green
+-	-	cargo-lib	cc-node	trap_only_follower_read_messages_require_the_follower_read_feature	Only follower read messages require the follower read feature	green
+N1	NG1	cargo-lib	cc-node	trap_plain_resp_has_no_reconnect_dedup_claim	Plain resp has no reconnect dedup claim	green
+N1	NG1	cargo-lib	cc-node	trap_plain_resp_route_id_never_aliases_persisted_session	Plain resp route id never aliases persisted session	green
+N1	NG1	cargo-bin	cc-node	trap_pre_upgrade_data_dir_is_refused_before_writes	Pre-N1 command journals are refused without mutation	green
+N1	NG1	cargo-lib	cc-node	trap_real_clock_boot_is_bounded_by_recovered_time	Real clock boot is bounded by recovered time	green
+N1	NG1	cargo-lib	cc-node	trap_real_clock_out_of_range_refuses_service	Real clock out of range refuses service	green
+N1	NG1	cargo-lib	cc-node	trap_real_clock_samples_wall_epoch_once	Real clock samples wall epoch once	green
+N8	NG8	cargo-test	cc-node	trap_real_host_effects_match_replay	Real membership operations use replicated config	green
+-	-	cargo-test	cc-node	trap_real_membership_demo_3_to_5	Real membership demo 3 to 5	green
+N7	NG7	cargo-test	cc-node	trap_real_rolling_upgrade_keeps_every_ack	Real rolling upgrade keeps every ack	green
+N1	NG1	cargo-lib	cc-node	trap_record_path_permissions_and_symlinks_are_rejected	Recorder creates private files and rejects symlink paths	green
+N1	NG1	cargo-lib	cc-node	trap_record_required_refuses_unrecorded_mode	Required recording refuses an unrecorded invocation	green
+N1	NG1	cargo-lib	cc-node	trap_record_writer_rejects_nonmonotonic_transition_time	CCIJ writer rejects a timestamp regression before it reaches disk	green
+N1	NG1	cargo-bin	cc-node	trap_removed_membership_forces_terminal_ccid_before_listen	CCID rejects corruption and removed-directory reuse before listen	green
+N8	NG8	cargo-lib	cc-node	trap_removed_node_stops_serving_clients	Removed node stops serving clients	green
+N1	NG1	cargo-lib	cc-node	trap_resp_conditional_set_has_no_host_preread	Resp conditional set has no host preread	green
+N4	NG4	cargo-lib	cc-node	trap_restart_time_never_regresses_ttl	Restart time never regresses ttl	green
+N4	NG4	cargo-bin	cc-node	trap_restore_creates_fresh_cluster_identity	CCBK v2 restore creates a fresh cluster and node identity	green
+N4	NG4	cargo-bin	cc-node	trap_restore_discards_source_admin_sessions_and_workflows	Restore discards source admin sessions and workflows	green
+N4	NG4	cargo-bin	cc-node	trap_restore_never_clones_node_identity	Restore never clones node identity	green
+N4	NG4	cargo-bin	cc-node	trap_restore_preserves_ttl_time_floor	Restore preserves ttl time floor	green
+N4	NG4	cargo-bin	cc-node	trap_restore_rejects_host_that_cannot_honor_cluster_policy	Restore rejects host that cannot honor cluster policy	green
+N4	NG4	cargo-bin	cc-node	trap_restore_rejects_oversized_or_trailing_bundle	Restore rejects oversized or trailing bundle	green
+N4	NG4	cargo-bin	cc-node	trap_restore_rejects_source_cluster_id_reuse	Restore rejects source cluster id reuse	green
+N4	NG4	cargo-bin	cc-node	trap_restore_rejects_unsupported_active_feature	Restore rejects unsupported active feature	green
+N4	NG4	cargo-bin	cc-node	trap_restore_validates_every_checkpoint_record_crc	Restore validates every checkpoint record crc	green
+N4	NG4	cargo-bin	cc-node	trap_selfcheck_deep_is_read_only	Selfcheck deep is read only	green
+-	-	cargo-lib	cc-node	trap_snapshot_recovery_selects_only_the_newest_published_generation	Snapshot recovery selects only the newest published generation	green
+N7	NG7	cargo-bin	cc-node	trap_storage_marker_defines_downgrade_boundary	Storage marker defines downgrade boundary	green
+N1	NG1	cargo-bin	cc-node	trap_strict_config_rejects_defaults_and_duplicate_identity	Strict config rejects missing defaults and duplicate identity	green
+N1	NG1	cargo-lib	cc-node	trap_terminal_recording_footer_is_synced_and_labeled	Terminal recording footers are synced and carry their status	green
+N8	NG8	cargo-bin	cc-node	trap_unsafe_warning_names_actual_listener	Unsafe listener warning includes the actual bound address	green
+N1	NG1	cargo-bin	cc-node	trap_unsupported_ccid_refuses_before_cleanup	Unsupported ccid refuses before cleanup	green
+N10	NG10	cargo-bin	cc-node	trap_v2_binary_refuses_v3_log_before_cleanup	V2 binary refuses v3 log before cleanup	green
+N10	NG10	cargo-lib	cc-node	trap_v2_peer_never_serves_local_state_as_linearizable	V2 peer never serves local state as linearizable	green
+N10	NG10	cargo-lib	cc-node	trap_v3_capability_is_advertised_only_after_local_ccid_fsync	V3 capability is advertised only after local ccid fsync	green
+-	-	cargo-lib	cc-raft	bounded_real_raft_state_space_is_safe	Bounded real raft state space is safe	green
+N2	NG2	cargo-lib	cc-raft	golden_ccrp_vectors	CCRP v1 round trips canonically	green
+-	-	cargo-lib	cc-raft	invariants_hold_for_empty_node	Invariants hold for empty node	green
+-	-	cargo-lib	cc-raft	leader_appends_noop_and_read_waits_for_commit	Leader appends noop and read waits for commit	green
+-	-	cargo-lib	cc-raft	message_soup_campaign_100k_schedules	Message soup campaign 100k schedules	green
+-	-	cargo-lib	cc-raft	pre_vote_then_vote_persists_before_grant	Pre vote then vote persists before grant	green
+-	-	cargo-lib	cc-raft	trap_ack_before_fsync_is_represented_by_persist_effect_order	Ack before fsync is represented by persist effect order	green
+N8	NG8	cargo-lib	cc-raft	trap_admin_transfer_reports_success_only_after_target_leads	Admin transfer reports success only after target leads	green
+-	-	cargo-lib	cc-raft	trap_append_carrying_a_v3_entry_declares_semantic_v3	Append carrying a v3 entry declares semantic v3	green
+-	-	cargo-lib	cc-raft	trap_append_entries_rejects_a_gap_from_a_compacted_leader	Append entries rejects a gap from a compacted leader	green
+N0	NG0	cargo-lib	cc-raft	trap_append_matches_snapshot_base	Append matches the snapshot base	green
+-	-	cargo-lib	cc-raft	trap_atomic_batch_feature_changes_only_when_activation_commits	Atomic batch feature changes only when activation commits	green
+-	-	cargo-lib	cc-raft	trap_candidate_same_term_append_steps_down	Candidate same term append steps down	green
+N2	NG2	cargo-lib	cc-raft	trap_ccrp_count_is_bounded_by_remaining_bytes	CCRP count is bounded by remaining bytes	green
+N2	NG2	cargo-lib	cc-raft	trap_ccrp_preserves_read_round	CCRP preserves ReadIndex round	green
+N2	NG2	cargo-lib	cc-raft	trap_ccrp_rejects_noncanonical_options	CCRP rejects noncanonical options	green
+-	-	cargo-lib	cc-raft	trap_checkpoint_uses_applied_membership_not_appended_leave	Checkpoint uses applied membership not appended leave	green
+N0	NG0	cargo-lib	cc-raft	trap_checkquorum_steps_down_isolated_leader	An isolated leader steps down after CheckQuorum	green
+-	-	cargo-lib	cc-raft	trap_config_in_snapshot_keeps_current_membership	Config in snapshot keeps current membership	green
+N0	NG0	cargo-lib	cc-raft	trap_config_on_append_changes_joint_quorum_before_commit	Configuration takes effect on follower append	green
+-	-	cargo-lib	cc-raft	trap_figure8_does_not_commit_prior_term_without_current_term_entry	Figure8 does not commit prior term without current term entry	green
+N0	NG0	cargo-lib	cc-raft	trap_follower_applies_config_on_append	Follower applies config on append	green
+N10	NG10	cargo-lib	cc-raft	trap_follower_read_tags_require_semantic_v3	Follower read tags require semantic v3	green
+N8	NG8	cargo-lib	cc-raft	trap_join_discovery_membership_never_grants_a_vote	Join discovery membership never grants a vote	green
+N0	NG0	cargo-lib	cc-raft	trap_joint_election_requires_both_majorities	Joint elections require both majorities	green
+N11	NG11	cargo-lib	cc-raft	trap_kata_01_commit_quorum_is_found_within_budget	Kata 01 exposes an even-voter commit quorum defect within its budget	green
+N11	NG11	cargo-lib	cc-raft	trap_kata_02_wrong_timer_reset_is_found_within_budget	Kata 02 exposes a denied-vote timer reset within its budget	green
+N0	NG0	cargo-lib	cc-raft	trap_leadership_transfer_recovers_or_finishes_after_crash	Leadership transfer recovers or finishes after crash	green
+-	-	cargo-lib	cc-raft	trap_leadership_transfer_timeout_appends_matching_finish	Leadership transfer timeout appends matching finish	green
+N0	NG0	cargo-lib	cc-raft	trap_leadership_transfer_waits_for_committed_intent_and_caught_up_target	Leadership transfer waits for durable intent and a caught-up target	green
+N8	NG8	cargo-lib	cc-raft	trap_learner_add_and_promotion_are_replicated_config_transitions	Learner add and promotion are replicated config transitions	green
+N0	NG0	cargo-lib	cc-raft	trap_learner_append_response_cannot_commit	Learner append response cannot commit	green
+N0	NG0	cargo-lib	cc-raft	trap_learner_never_counts_toward_quorum	Learner responses never commit an entry	green
+N0	NG0	cargo-lib	cc-raft	trap_learners_receive_entries_but_never_vote	Learners receive entries but never vote	green
+-	-	cargo-lib	cc-raft	trap_leave_joint_offers_the_final_entry_to_removed_voters	Leave joint offers the final entry to removed voters	green
+N0	NG0	cargo-lib	cc-raft	trap_leave_joint_waits_for_committed_enter_joint	Only one configuration change is in flight	green
+N0	NG0	cargo-lib	cc-raft	trap_membership_recovers_from_log_and_snapshot	Membership recovers from log and snapshot	green
+-	-	cargo-lib	cc-raft	trap_new_leader_resumes_committed_joint_admin_workflow	New leader resumes committed joint admin workflow	green
+N0	NG0	cargo-lib	cc-raft	trap_only_one_config_change_can_be_in_flight	Only one config change can be in flight	green
+N8	NG8	cargo-lib	cc-raft	trap_promotion_refuses_a_lagging_learner	Promotion refuses a lagging learner	green
+-	-	cargo-lib	cc-raft	trap_read_barrier_survives_current_term_snapshot_compaction	Read barrier survives current term snapshot compaction	green
+-	-	cargo-lib	cc-raft	trap_readindex_noop	Readindex noop	green
+N0	NG0	cargo-lib	cc-raft	trap_rejected_config_proposal_does_not_mutate_membership	Rejected config does not mutate membership	green
+-	-	cargo-lib	cc-raft	trap_removed_leader_stepdown_timing_waits_for_leave_joint	Removed leader stepdown timing waits for leave joint	green
+-	-	cargo-lib	cc-raft	trap_removed_node_disruption_is_rejected_by_membership_vote_rule	Removed node disruption is rejected by membership vote rule	green
+N2	NG2	cargo-lib	cc-raft	trap_replayed_snapshot_chunk_is_idempotent	Replayed snapshot chunks are idempotent	green
+N8	NG8	cargo-lib	cc-raft	trap_replicated_address_book_beats_stale_local_config	Replicated address book beats stale local config	green
+-	-	cargo-lib	cc-raft	trap_revote_after_crash_is_blocked_by_persisted_vote	Revote after crash is blocked by persisted vote	green
+N0	NG0	cargo-lib	cc-raft	trap_same_index_different_term_snapshot_is_rejected	Same index with a different snapshot term is rejected	green
+N8	NG8	cargo-lib	cc-raft	trap_second_config_change_is_rejected_while_one_is_in_flight	Second config change is rejected while one is in flight	green
+-	-	cargo-lib	cc-raft	trap_single_voter_commits_local_noop_and_proposal_after_persistence	Single voter commits local noop and proposal after persistence	green
+N0	NG0	cargo-lib	cc-raft	trap_snapshot_base_is_the_log_origin	Snapshot base is the log origin	green
+N2	NG2	cargo-lib	cc-raft	trap_snapshot_chunk_done_and_ack_offsets_are_canonical	Snapshot chunks and acknowledgements are canonical	green
+-	-	cargo-lib	cc-raft	trap_snapshot_follower_conflict_points_to_first_missing_suffix	Snapshot follower conflict points to first missing suffix	green
+N7	NG7	cargo-lib	cc-raft	trap_snapshot_ordering	Current CCSN golden is decoded by its owning reader	green
+-	-	cargo-lib	cc-raft	trap_stale_append_does_not_reset_but_current_leader_conflict_does	Stale append does not reset but current leader conflict does	green
+-	-	cargo-lib	cc-raft	trap_stale_snapshot_install_is_ignored	Stale snapshot install is ignored	green
+-	-	cargo-lib	cc-raft	trap_stale_vote_tally_cannot_elect_in_a_later_term	Stale vote tally cannot elect in a later term	green
+N2	NG2	cargo-lib	cc-raft	trap_timeout_now_codec_requires_nonzero_intent	TimeoutNow requires a nonzero intent	green
+N8	NG8	cargo-lib	cc-raft	trap_timeout_now_survives_snapshot_compaction_of_the_intent	TimeoutNow still elects after the Begin intent is compacted out of the log	green
+N0	NG0	cargo-lib	cc-raft	trap_timeout_now_uses_normal_term_and_vote_fsync	TimeoutNow follows normal durable election flow	green
+-	-	cargo-lib	cc-raft	trap_transfer_to_current_leader_finishes_durably	Transfer to current leader finishes durably	green
+-	-	cargo-lib	cc-raft	trap_transfer_triggers_when_target_catches_up_after_intent_apply	Transfer triggers when target catches up after intent apply	green
+N0	NG0	cargo-lib	cc-raft	trap_truncated_uncommitted_config_restores_prior_membership	Truncating config restores prior membership	green
+N2	NG2	cargo-lib	cc-raft	trap_unknown_message_tag_is_a_typed_error	Unknown CCRP tags return typed errors	green
+N0	NG0	cargo-lib	cc-raft	trap_unknown_vote_response_cannot_form_quorum	Unknown vote responses never form quorum	green
+N0	NG0	cargo-lib	cc-raft	trap_wrong_target_or_stale_transfer_cannot_complete	Wrong transfer target or stale intent cannot finish	green
+-	-	cargo-lib	cc-resp	admin_membership_controls_are_closed_and_typed	Admin membership controls are closed and typed	green
+-	-	cargo-lib	cc-resp	batch_uses_one_nested_array_and_preserves_subcommands	Batch uses one nested array and preserves subcommands	green
+-	-	cargo-lib	cc-resp	command_table_maps_rmw_and_ttl_family	Command table maps rmw and ttl family	green
+-	-	cargo-lib	cc-resp	command_table_maps_ttl_and_nx	Command table maps ttl and nx	green
+-	-	cargo-lib	cc-resp	malformed_batch_shape_is_rejected_before_execution	Malformed batch shape is rejected before execution	green
+-	-	cargo-lib	cc-resp	malformed_bulk_is_total	Malformed bulk is total	green
+-	-	cargo-lib	cc-resp	pipelined_frames_parse_without_dropping_the_suffix	Pipelined frames parse without dropping the suffix	green
+-	-	cargo-lib	cc-resp	read_wrappers_preserve_the_inner_closed_command	Read wrappers preserve the inner closed command	green
+-	-	cargo-lib	cc-resp	resp_round_trip_nested_values	Resp round trip nested values	green
+-	-	cargo-lib	cc-resp	transaction_controls_are_closed_zero_argument_commands	Transaction controls are closed zero argument commands	green
+-	-	cargo-lib	cc-resp	trap_cc_request_keeps_the_caller_identity_outside_the_inner_command	Cc request keeps the caller identity outside the inner command	green
+N7	NG7	cargo-lib	cc-resp	trap_inline_commands_are_rejected	Current RESP golden is parsed without inline fallback	green
+-	-	cargo-lib	cc-sim	bitrot_flips_one_durable_byte_after_the_selected_fsync	Bitrot flips one durable byte after the selected fsync	green
+-	-	cargo-lib	cc-sim	calibrated_disk_model_samples_the_current_operation_only	Calibrated disk model samples the current operation only	green
+-	-	cargo-lib	cc-sim	clock_skew_changes_lifecycle_clock_not_node_membership	Clock skew changes lifecycle clock not node membership	green
+-	-	cargo-lib	cc-sim	disk_can_make_a_torn_prefix	Disk can make a torn prefix	green
+-	-	cargo-lib	cc-sim	disk_cross_file_reordering_is_lost_without_each_fsync	Disk cross file reordering is lost without each fsync	green
+-	-	cargo-lib	cc-sim	disk_faults_are_one_shot_and_file_local	Disk faults are one shot and file local	green
+-	-	cargo-lib	cc-sim	disk_models_page_cache_loss	Disk models page cache loss	green
+-	-	cargo-lib	cc-sim	disk_quota_and_enospc_reject_growth_without_corrupting_existing_bytes	Disk quota and enospc reject growth without corrupting existing bytes	green
+N1	NG1	cargo-lib	cc-sim	equal_time_events_use_insertion_order	Shared simulator event queue preserves virtual-time FIFO ordering	green
+-	-	cargo-lib	cc-sim	every_generated_fault_lands_inside_the_run_and_before_the_heal	Every generated fault lands inside the run and before the heal	green
+-	-	cargo-lib	cc-sim	fault_plan_is_materialized_and_survivability_is_explicit	Fault plan is materialized and survivability is explicit	green
+-	-	cargo-lib	cc-sim	generated_plans_cover_the_whole_fault_palette	Generated plans cover the whole fault palette	green
+-	-	cargo-lib	cc-sim	generated_plans_heal_thirty_election_timeouts_before_the_end	Generated plans heal thirty election timeouts before the end	green
+-	-	cargo-lib	cc-sim	lifecycle_applies_crash_restart_and_wipe	Lifecycle applies crash restart and wipe	green
+-	-	cargo-lib	cc-sim	network_byte_cap_applies_to_each_duplicate_copy	Network byte cap applies to each duplicate copy	green
+-	-	cargo-lib	cc-sim	network_duplicate_delivery_is_explicit	Network duplicate delivery is explicit	green
+-	-	cargo-lib	cc-sim	network_max_inflight_drops_until_completion	Network max inflight drops until completion	green
+-	-	cargo-lib	cc-sim	network_partition_is_directional_and_delivery_is_seeded	Network partition is directional and delivery is seeded	green
+-	-	cargo-lib	cc-sim	selfcheck_is_repeatable	Selfcheck is repeatable	green
+-	-	cargo-lib	cc-sim	shrinker_deletes_irrelevant_actions_and_keeps_failure	Shrinker deletes irrelevant actions and keeps failure	green
+-	-	cargo-lib	cc-sim	slow_disk_is_persistent_and_operation_specific	Slow disk is persistent and operation specific	green
+N10	NG10	cargo-lib	cc-sim	trap_batch_workload_emits_multi_command_batches	Batch workload mix emits multi-command atomic batches	green
+N4	NG4	cargo-lib	cc-sim	trap_data_directory_quota_counts_live_temp_and_staging_bytes	Data directory quota counts live temp and staging bytes	green
+N4	NG4	cargo-lib	cc-sim	trap_disk_quota_counts_snapshot_staging	Disk quota counts snapshot staging	green
+N10	NG10	cargo-lib	cc-sim	trap_follower_and_stale_workloads_route_reads_explicitly	Follower and stale workloads emit explicit non-leader reads	green
+N10	NG10	cargo-lib	cc-sim	trap_new_profiles_parse_and_select_workload_kind	Batch, follower-read, and stale-read profiles parse and select workload kind	green
+-	-	cargo-lib	cc-sim	trap_rename_is_not_durable_until_the_directory_is_synced	Rename is not durable until the directory is synced	green
+N4	NG4	cargo-lib	cc-sim	trap_snapshot_install_is_atomic_across_crash	Snapshot install is atomic across crash	green
+-	-	cargo-lib	cc-sim	wipe_profile_plans_are_survivable_500k	Wipe profile plans are survivable 500k	green
+-	-	cargo-lib	cc-sim	workload_actor_is_repeatable_and_sequence_addressable	Workload actor is repeatable and sequence addressable	green
+-	-	cargo-lib	cc-store	compaction_preserves_newest_value_and_drops_old_files	Compaction preserves newest value and drops old files	green
+-	-	cargo-lib	cc-store	corruption_campaign_has_no_silent_wrong_answers	Corruption campaign has no silent wrong answers	green
+-	-	cargo-lib	cc-store	flush_checkpoint_boot_and_restore	Flush checkpoint boot and restore	green
+C0	C0	cargo-lib	cc-store	golden_byte_layout_vectors	Current CCST and CCMT readers preserve canonical fixture bytes	green
+N3	NG3	cargo-lib	cc-store	golden_sst_v2_vectors	SST v2 has golden vectors	green
+N3	NG3	cargo-lib	cc-store	manifest_v2_round_trips_atomic_edits_and_meta_pointer	CCMF edits replay atomically and CCMT names their checked generation	green
+-	-	cargo-lib	cc-store	oracle_differential_campaign_1k_x_200k	Oracle differential campaign 1k x 200k	green
+-	-	cargo-lib	cc-store	oracle_differential_for_small_sequences	Oracle differential for small sequences	green
+-	-	cargo-lib	cc-store	scan_is_ordered_and_bounded	Scan is ordered and bounded	green
+-	-	cargo-lib	cc-store	sstable_round_trip_bloom_and_crc	Sstable round trip bloom and crc	green
+-	-	cargo-lib	cc-store	store_config_from_parts_keeps_wal_limits_inside_store_ownership	Store config from parts keeps wal limits inside store ownership	green
+N4	NG4	cargo-lib	cc-store	trap_backup_pin_survives_concurrent_compaction	Backup pin survives concurrent compaction	green
+N7	NG7	cargo-lib	cc-store	trap_block_crc_detects_bit_flip	Current SST data-block golden is checksum protected	green
+N3	NG3	cargo-lib	cc-store	trap_block_index_seek_matches_linear_scan	SST v2 validates block/index/bloom boundaries	green
+N3	NG3	cargo-lib	cc-store	trap_bloom_negative_avoids_data_read	SST v2 can reject a missing key at its bloom boundary	green
+N4	NG4	cargo-lib	cc-store	trap_checkpoint_pin_blocks_tombstone_gc	Checkpoint pin blocks tombstone gc	green
+N3	NG3	cargo-lib	cc-store	trap_compaction_budget_bounds_live_memory	Compaction budget bounds live memory	green
+N3	NG3	cargo-lib	cc-store	trap_compaction_crash_leaves_readable_store	Compaction crash leaves readable store	green
+N4	NG4	cargo-lib	cc-store	trap_compaction_enospc_keeps_inputs	Compaction enospc keeps inputs	green
+N3	NG3	cargo-lib	cc-store	trap_compaction_never_deletes_inputs_early	Compaction never deletes inputs early	green
+N3	NG3	cargo-lib	cc-store	trap_compaction_output_failure_keeps_inputs	Compaction output failure keeps inputs	green
+N3	NG3	cargo-lib	cc-store	trap_compaction_score_uses_exact_integer_order	Compaction score uses exact integer order	green
+N3	NG3	cargo-lib	cc-store	trap_compaction_selection_closes_over_all_overlaps	Compaction selection closes over all overlaps	green
+-	-	cargo-lib	cc-store	trap_compaction_starvation_keeps_reads_available_between_jobs	Compaction starvation keeps reads available between jobs	green
+N0	NG0	cargo-lib	cc-store	trap_equal_watermark_snapshot_pins_are_reference_counted	Equal snapshot pins are reference counted	green
+N3	NG3	cargo-lib	cc-store	trap_every_storage_publish_step_has_a_crash_point	Every storage publish step has a crash point	green
+-	-	cargo-lib	cc-store	trap_file_backed_v2_boot_retains_only_metadata_and_reads_blocks	File backed v2 boot retains only metadata and reads blocks	green
+N3	NG3	cargo-lib	cc-store	trap_footer_crc_and_offsets_are_checked	Footer crc and offsets are checked	green
+N3	NG3	cargo-lib	cc-store	trap_ghost_sst_fails_closed	Ghost sst fails closed	green
+N11	NG11	cargo-lib	cc-store	trap_kata_04_tombstone_gc_is_found_within_budget	Kata 04 exposes tombstone collection above the bottom level within its budget	green
+C0	C0	cargo-lib	cc-store	trap_legacy_meta_fixture_boots_store	A 2c733f3 CCMT metadata record still boots the current store reader	green
+C0	C0	cargo-lib	cc-store	trap_legacy_sst_fixture_is_readable	A 2c733f3 CCST table remains readable by the current store reader	green
+N3	NG3	cargo-lib	cc-store	trap_manifest_compaction_rewrites_a_complete_next_generation	Manifest generation compaction writes one complete next snapshot	green
+-	-	cargo-lib	cc-store	trap_manifest_ghost_fails_closed	Manifest ghost fails closed	green
+N4	NG4	cargo-lib	cc-store	trap_manifest_only_checkpoint_is_not_log_authority	Manifest only checkpoint is not log authority	green
+-	-	cargo-lib	cc-store	trap_manifest_orphan_is_ignored_at_boot	Manifest orphan is ignored at boot	green
+-	-	cargo-lib	cc-store	trap_manifest_rejects_complete_checksum_and_watermark_regressions	Manifest rejects complete checksum and watermark regressions	green
+N3	NG3	cargo-lib	cc-store	trap_manifest_rejects_file_number_and_watermark_regression	Manifest rejects file number and watermark regression	green
+N3	NG3	cargo-lib	cc-store	trap_manifest_rewrite_is_atomic_under_every_crash_point	Manifest rewrite is atomic under every crash point	green
+N3	NG3	cargo-lib	cc-store	trap_manifest_torn_tail_replays_only_complete_edit_prefix	Only a torn final CCMF record is ignored during prefix recovery	green
+N3	NG3	cargo-lib	cc-store	trap_meta_torn_write_falls_back_to_fully_durable_generation	Meta torn write falls back to fully durable generation	green
+N3	NG3	cargo-lib	cc-store	trap_no_valid_manifest_fails_closed	No valid manifest fails closed	green
+N3	NG3	cargo-lib	cc-store	trap_orphan_sst_is_gc_safe	Orphan sst is gc safe	green
+N3	NG3	cargo-lib	cc-store	trap_out_of_order_internal_keys_are_rejected	SST v2 rejects noncanonical internal keys	green
+N3	NG3	cargo-lib	cc-store	trap_output_split_never_splits_one_user_key	Output split never splits one user key	green
+N3	NG3	cargo-lib	cc-store	trap_oversized_entry_gets_its_own_bounded_block	SST v2 keeps an oversized valid entry in one bounded block	green
+N3	NG3	cargo-lib	cc-store	trap_read_amp_counter_matches_physical_reads	Read amp counter matches physical reads	green
+N4	NG4	cargo-lib	cc-store	trap_referenced_sst_cap_compacts_before_physical_exhaustion	Referenced sst cap compacts before physical exhaustion	green
+N3	NG3	cargo-lib	cc-store	trap_restart_prefix_cannot_escape_previous_key	Restart prefix cannot escape previous key	green
+N3	NG3	cargo-lib	cc-store	trap_scan_stops_reading_at_limit	Scan stops reading at limit	green
+N3	NG3	cargo-lib	cc-store	trap_short_block_read_fails_closed	A short block read fails closed	green
+N4	NG4	cargo-lib	cc-store	trap_snapshot_mark_requires_matching_manifest_checkpoint	Snapshot mark requires matching manifest checkpoint	green
+N3	NG3	cargo-lib	cc-store	trap_storage_marker_precedes_first_v2_byte	Storage marker precedes first v2 byte	green
+N3	NG3	cargo-lib	cc-store	trap_store_cannot_boot_ahead_of_raft_log	Store cannot boot ahead of raft log	green
+N3	NG3	cargo-lib	cc-store	trap_store_gap_below_log_base_requires_snapshot	Store gap below log base requires snapshot	green
+N7	NG7	cargo-lib	cc-store	trap_store_wal_replays_only_after_manifest_watermark	Current store-WAL golden replays after its manifest watermark	green
+N3	NG3	cargo-lib	cc-store	trap_store_watermark_is_atomic_with_write_batch	Store watermark publication is atomic	green
+N3	NG3	cargo-lib	cc-store	trap_store_watermark_preserves_last_leader_time	Store watermark preserves last leader time	green
+N3	NG3	cargo-lib	cc-store	trap_sync_read_delays_its_own_reply	A synchronous block read charges only the requesting operation	green
+N3	NG3	cargo-lib	cc-store	trap_tombstone_survives_above_bottom_level	Tombstone survives above bottom level	green
+-	-	cargo-lib	cc-store	trap_v2_image_requires_the_storage_fence_and_reboots_from_exact_meta	V2 image requires the storage fence and reboots from exact meta	green
+N3	NG3	cargo-lib	cc-store	trap_valid_meta_with_bad_target_fails_closed	Valid meta with bad target fails closed	green
+N3	NG3	cargo-lib	cc-store	trap_write_amp_accounting_balances_bytes	Write amp accounting balances bytes	green
+-	-	cargo-lib	cc-store	v2_round_trip_preserves_internal_order_and_bloom	V2 round trip preserves internal order and bloom	green
+-	-	cargo-lib	cc-store	wal_first_put_get_delete_and_mvcc_snapshot	Wal first put get delete and mvcc snapshot	green
+-	-	cargo-lib	cc-swarm	calm_five_node_cluster_elects_and_captures_real_history	Calm five node cluster elects and captures real history	green
+-	-	cargo-lib	cc-swarm	cluster_traces_are_byte_deterministic_under_every_fault_profile	Cluster traces are byte deterministic under every fault profile	green
+-	-	cargo-lib	cc-swarm	coverage_and_plan_mutation_are_deterministic	Coverage and plan mutation are deterministic	green
+-	-	cargo-lib	cc-swarm	membership_profile_moves_the_voting_set	Membership profile moves the voting set	green
+N4	NG4	cargo-bin	cc-swarm	persistent_disk_fault_specs_round_trip_all_selected_fields	Persistent disk-fault trace specifications preserve their selected fields	green
+-	-	cargo-lib	cc-swarm	planted_all_wipe_failure_shrinks_past_irrelevant_faults	Planted all wipe failure shrinks past irrelevant faults	green
+-	-	cargo-lib	cc-swarm	reads_are_served_through_the_read_index_barrier	Reads are served through the read index barrier	green
+-	-	cargo-lib	cc-swarm	scripted_leader_crash_restart_catches_up_from_surviving_cluster	Scripted leader crash restart catches up from surviving cluster	green
+-	-	cargo-lib	cc-swarm	semantic_diff_reports_the_first_changed_field	Semantic diff reports the first changed field	green
+-	-	cargo-bin	cc-swarm	slow_disk_fault_spec_preserves_every_service_delay	Slow disk fault spec preserves every service delay	green
+-	-	cargo-lib	cc-swarm	sometimes_beacons_count_reached_states	Sometimes beacons count reached states	green
+-	-	cargo-lib	cc-swarm	trap_active_kata_is_visible_in_trace_and_artifact_type	Active kata is visible in trace and artifact type	green
+N1	NG1	cargo-lib	cc-swarm	trap_architecture_has_one_host_boundary_and_one_raft_log	Simulator nodes use one Driver boundary and the cc-log durable vocabulary	green
+N10	NG10	cargo-lib	cc-swarm	trap_batch_profile_is_globally_atomic	Batch profile applies each batch as one linearizable transition	green
+N4	NG4	cargo-lib	cc-swarm	trap_bitrot_is_detected_not_served	At-rest bit rot is detected during recovery and never served	green
+N2	NG2	cargo-lib	cc-swarm	trap_ccpf_and_ccrp_semantic_versions_must_match	CCPF and CCRP semantic versions agree	green
+N6	NG6	cargo-lib	cc-swarm	trap_corpus_replay_is_panic_free	Corpus replay is panic free	green
+N2	NG2	cargo-lib	cc-swarm	trap_corrupt_frame_never_reaches_raft_decoder	Corrupt CCPF frames never reach the Raft decoder	green
+N4	NG4	cargo-lib	cc-swarm	trap_crash_discards_a_delayed_durability_continuation	A crash drops delayed durability continuations	green
+N1	NG1	cargo-lib	cc-swarm	trap_crash_discards_volatile_state	Crash discards volatile simulator state	green
+N6	NG6	cargo-lib	cc-swarm	trap_declared_length_cannot_exceed_allocation_budget	Declared length cannot exceed allocation budget	green
+N11	NG11	cargo-lib	cc-swarm	trap_default_build_enables_no_kata	Default workspace builds enable no synthetic kata	green
+N4	NG4	cargo-lib	cc-swarm	trap_enospc_fails_closed_before_a_vote_reply	ENOSPC suppresses a dependent vote reply and enters StorageFault	green
+N4	NG4	cargo-lib	cc-swarm	trap_enospc_never_loses_acked_writes	Enospc never loses acked writes	green
+N6	NG6	cargo-lib	cc-swarm	trap_every_decoder_is_in_the_fuzz_inventory	Every decoder is in the fuzz inventory	green
+N6	NG6	cargo-lib	cc-swarm	trap_every_format_has_a_corpus	Every format has a corpus	green
+N5	NG5	cargo-lib	cc-swarm	trap_explain_emits_parseable_svg	Explain emits parseable svg	green
+N5	NG5	cargo-lib	cc-swarm	trap_explain_obeys_output_cap	Explain obeys output cap	green
+N5	NG5	cargo-lib	cc-swarm	trap_explain_xml_escapes_labels	Explain xml escapes labels	green
+N10	NG10	cargo-lib	cc-swarm	trap_follower_read_profile_completes_a_non_leader_get	Follower-read profile completes a strong GET on a non-leader	green
+N10	NG10	cargo-lib	cc-swarm	trap_follower_read_v2_profile_never_serves_local_state_as_linearizable	Mixed-v2 follower-read profile never labels local state linearizable	green
+N4	NG4	cargo-lib	cc-swarm	trap_footprint_returns_to_baseline_after_heal	Footprint returns to baseline after heal	green
+N2	NG2	cargo-lib	cc-swarm	trap_heal_clears_sustained_link_fault_without_leaking_bytes	Heal clears sustained frame faults and replay bytes	green
+N11	NG11	cargo-lib	cc-swarm	trap_kata_features_are_mutually_exclusive	Kata features are mutually exclusive	green
+-	-	cargo-bin	cc-swarm	trap_kata_ledger_cannot_generate_production_summary	Kata ledger cannot generate production summary	green
+N6	NG6	cargo-lib	cc-swarm	trap_ledger_conflict_never_selects_verdict	Ledger conflict never selects verdict	green
+N6	NG6	cargo-lib	cc-swarm	trap_ledger_dedupes_identical_rows	Seed ledger deduplicates byte-identical campaign outcomes	green
+N6	NG6	cargo-lib	cc-swarm	trap_malformed_interior_ledger_row_fails	Malformed interior ledger row fails	green
+N6	NG6	cargo-lib	cc-swarm	trap_merge_rejects_missing_shard	Merge rejects missing shard	green
+N6	NG6	cargo-lib	cc-swarm	trap_minimizer_reduces_a_planted_crash	Minimizer reduces a planted crash	green
+-	-	cargo-bin	cc-swarm	trap_named_disk_profile_is_canonical_and_does_not_change_defaults	Named disk profile is canonical and does not change defaults	green
+N2	NG2	cargo-lib	cc-swarm	trap_network_byte_charge_releases_for_every_delivery_outcome	Network byte reservations release for delivery and horizon cancellation	green
+N6	NG6	cargo-lib	cc-swarm	trap_partial_final_line_is_discarded	Partial final line is discarded	green
+N2	NG2	cargo-lib	cc-swarm	trap_rechecksummed_malformed_ccrp_never_reaches_state_machine	Rechecksummed malformed CCRP never reaches the state machine	green
+-	-	cargo-bin	cc-swarm	trap_replay_rejects_boot_metadata_mismatch	Replay rejects boot metadata mismatch	green
+N1	NG1	cargo-bin	cc-swarm	trap_replay_starts_from_captured_boot_image	Replay starts only from the captured boot image	green
+N2	NG2	cargo-lib	cc-swarm	trap_replayed_append_is_idempotent	Replayed Append frames are idempotent	green
+N1	NG1	cargo-lib	cc-swarm	trap_restart_recovers_hard_state_log_and_membership_from_disk	Restart recovers hard state, log, and membership from durable bytes	green
+N6	NG6	cargo-lib	cc-swarm	trap_resume_skips_only_prior_ok_by_default	Campaign resume skips only prior successful ledger rows	green
+N6	NG6	cargo-lib	cc-swarm	trap_shards_partition_seed_range_exactly	Shards partition seeds exactly once and validate bounds	green
+N3	NG3	cargo-lib	cc-swarm	trap_sim_live_read_sees_page_cache_but_restart_sees_durable_bytes	Sim live read sees page cache but restart sees durable bytes	green
+N10	NG10	cargo-lib	cc-swarm	trap_sim_observes_cchl_capability_before_feature_activation	Simulated CCHL observations advertise atomic-batch before activation	green
+N2	NG2	cargo-lib	cc-swarm	trap_simulator_has_no_message_side_channel	Simulator sends complete CCPF/CCRP frame bytes without a message side channel	green
+N1	NG1	cargo-lib	cc-swarm	trap_simulator_recovers_framed_cc_log_prefix	Simulator recovery uses the framed cc-log durable prefix	green
+N1	NG1	cargo-lib	cc-swarm	trap_single_scheduler_enforces_per_instant_limit	Cluster scheduler enforces its configured per-instant event cap	green
+N4	NG4	cargo-lib	cc-swarm	trap_slow_disk_preserves_election_safety	Slow disk delays durability completion before dependent traffic	green
+N10	NG10	cargo-lib	cc-swarm	trap_stale_read_profile_evidence_matches_applied_index	Stale-read profile evidence matches the reported applied watermark	green
+N4	NG4	cargo-lib	cc-swarm	trap_storage_fault_serves_no_unproven_read	Storage fault serves no unproven read	green
+N11	NG11	cargo-lib	cc-swarm	trap_synthetic_artifact_is_rejected_by_claims_and_museum	Synthetic artifacts are rejected by claims and museum boundaries	green
+-	-	cargo-lib	cc-swarm	trap_synthetic_ledger_is_typed_and_cannot_merge_with_production	Synthetic ledger is typed and cannot merge with production	green
+N2	NG2	cargo-lib	cc-swarm	trap_trace_payloads_do_not_use_debug_format	Transport trace payloads use canonical binary fingerprints	green
+N5	NG5	cargo-bin	cc-swarm	trap_trace_reads_current_binary_and_json_exports	Trace reads current binary and JSON export forms	green
+C0	C0	cargo-bin	cc-swarm	trap_trace_reads_legacy_cctr_fixture	A 2c733f3 CCTR trace remains readable by the current decoder	green
+N5	NG5	cargo-bin	cc-swarm	trap_trace_rejects_malformed_length_at_offset	Trace rejects malformed length at offset	green
+N5	NG5	cargo-bin	cc-swarm	trap_trace_unknown_event_is_skippable	Trace unknown event is skippable	green
+N2	NG2	cargo-lib	cc-swarm	trap_truncated_frame_is_rejected_before_allocation	Truncated CCPF frames never reach the Raft decoder	green
+N2	NG2	cargo-lib	cc-swarm	trap_valid_frame_decode_failure_is_an_invariant	Unexpected valid-outer CCRP decode failures stop the simulator	green
+N6	NG6	cargo-lib	cc-swarm	trap_wall_time_difference_cannot_create_seed_conflict	Wall time difference cannot create seed conflict	green
+N1	NG1	cargo-lib	cc-swarm	trap_wipe_has_no_out_of_band_state_copy	Wiped simulator node catches up without an out-of-band state copy	green
+N4	NG4	cargo-lib	cc-swarm	trap_wiped_node_rejoins_only_via_snapshot	Wiped node rejoins only via snapshot	green
+-	-	cargo-lib	cc-wal	append_flush_commit_and_recover	Append flush commit and recover	green
+-	-	cargo-lib	cc-wal	crash_after_write_before_fsync_loses_the_page_cache_record	Crash after write before fsync loses the page cache record	green
+-	-	cargo-lib	cc-wal	crash_before_write_completes_leaves_no_record	Crash before write completes leaves no record	green
+-	-	cargo-lib	cc-wal	crash_during_multi_record_batch_keeps_only_durable_prefix	Crash during multi record batch keeps only durable prefix	green
+-	-	cargo-lib	cc-wal	crash_during_segment_roll_preserves_old_segment	Crash during segment roll preserves old segment	green
+-	-	cargo-lib	cc-wal	crash_during_truncate_after_recovery_is_idempotent	Crash during truncate after recovery is idempotent	green
+-	-	cargo-lib	cc-wal	double_crash_during_recovery_has_same_prefix	Double crash during recovery has same prefix	green
+-	-	cargo-lib	cc-wal	page_cache_writes_disappear_without_commit	Page cache writes disappear without commit	green
+-	-	cargo-lib	cc-wal	prefix_durability_campaign_1m	Prefix durability campaign 1m	green
+-	-	cargo-lib	cc-wal	prefix_durability_property_for_many_deterministic_sequences	Prefix durability property for many deterministic sequences	green
+-	-	cargo-lib	cc-wal	recovery_is_idempotent_after_tail_truncate	Recovery is idempotent after tail truncate	green
+-	-	cargo-lib	cc-wal	rolls_segments_without_splitting_records	Rolls segments without splitting records	green
+-	-	cargo-lib	cc-wal	torn_mid_record_at_sector_boundary_is_tail_safe	Torn mid record at sector boundary is tail safe	green
+-	-	cargo-lib	cc-wal	torn_tail_is_truncated	Torn tail is truncated	green
+C0	C0	cargo-lib	cc-wal	trap_legacy_wal_fixture_is_recoverable	A 2c733f3 CCWL segment remains recoverable by the current WAL reader	green
+-	-	cargo-lib	cc-wal	trap_midlog_corruption_failstop	Midlog corruption failstop	green
+-	-	cargo-lib	cc-wasm	bridge_steps_one_persistent_cluster_and_exposes_real_nodes	Bridge steps one persistent cluster and exposes real nodes	green
+-	-	cargo-lib	cc-wasm	init_honours_the_requested_cluster_size	Init honours the requested cluster size	green
+-	-	cargo-lib	cc-wasm	init_rejects_a_cluster_size_outside_the_offered_set	Init rejects a cluster size outside the offered set	green
+-	-	cargo-lib	cc-wasm	inject_appends_fault_data_to_same_run	Inject appends fault data to same run	green
+-	-	cargo-lib	cc-wasm	trap_abi_rejects_unknown_actions_and_invalid_ids_without_mutation	Abi rejects unknown actions and invalid ids without mutation	green
+-	-	cargo-lib	cc-wasm	trap_checkpoint_restore_replays_identical_complete_state	Checkpoint restore replays identical complete state	green
+-	-	cargo-lib	cc-wasm	trap_packet_loss_preserves_other_effective_link_fields	Packet loss preserves other effective link fields	green
+N9	NG9	cargo-lib	cc-wasm	trap_packet_loss_uses_the_effective_link_p16_value	Theater packet loss maps to an effective LinkDegrade P16 value	green
+N9	NG9	cargo-lib	cc-wasm	trap_slow_disk_reports_the_effective_persistent_delay	Theater disk latency maps to effective persistent SlowDisk service time	green
+-	-	cargo-lib	cc-wasm	trap_wasm_state_and_trace_pages_obey_the_abi_byte_cap	Wasm state and trace pages obey the abi byte cap	green
+N1	NG1	cargo-lib	cc-wasm	trap_wasm_wraps_the_same_driver_backed_simcluster	Wasm theater wraps the same Driver-backed simulator	green
+-	-	playwright	theater	cluster size, node selection, stepping, and fault readouts are live	Cluster size, node selection, stepping, and fault readouts are live	green
+-	-	playwright	theater	contrast gate	Contrast gate	green
+N9	NG9	playwright	theater	every control changes observable state	Every rendered theater control has a contract row and functional controls change observable state	green
+-	-	playwright	theater	guided lesson hands control back and embed mode is chromeless	Guided lesson hands control back and embed mode is chromeless	green
+-	-	playwright	theater	hero scenario elects, survives a leader kill, and shares its run	Hero scenario elects, survives a leader kill, and shares its run	green
+-	-	playwright	theater	hero scenario is completable by keyboard alone	Hero scenario is completable by keyboard alone	green
+-	-	playwright	theater	museum ABI compatibility is explicit and bounded	Museum ABI compatibility is explicit and bounded	green
+-	-	playwright	theater	reduced motion disables autoplay	Reduced motion disables autoplay	green
+-	-	playwright	theater	responsive text mirror avoids two-dimensional page scrolling	Responsive text mirror avoids two-dimensional page scrolling	green
+-	-	playwright	theater	scrub restores from the nearest checkpoint	Scrub restores from the nearest checkpoint	green
+-	-	playwright	theater	scrubbed trace matches uninterrupted trace	Scrubbed trace matches uninterrupted trace	green
+-	-	playwright	theater	text mirror reports role changes	Text mirror reports role changes	green
+N9	NG9	playwright	theater	timeline markers render without duplicate React keys	Timeline markers use stable trace-sequence keys and emit no duplicate-key console error	green
+-	-	playwright	theater	wasm handles are freed on every error	Wasm handles are freed on every error	green
+-	-	playwright	theater	wasm state and trace pages obey the ABI byte cap	Wasm state and trace pages obey the ABI byte cap	green
