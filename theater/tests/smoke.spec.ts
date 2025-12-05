@@ -272,7 +272,18 @@ test("museum ABI compatibility is explicit and bounded", async ({ page }) => {
     } catch (error) {
       oversized = String(error);
     }
-    return { legacy: legacy.exhibits[0], oversized };
+    let synthetic = "";
+    try {
+      parseMuseum({
+        schema_version: 2,
+        theater_abi: 2,
+        build: "kata",
+        exhibits: [{ ...exhibit, synthetic: true, theater_abi: 2, horizon_ns: 5_000_000_000, checkpoint_interval_ns: 5_000_000_000 }],
+      });
+    } catch (error) {
+      synthetic = String(error);
+    }
+    return { legacy: legacy.exhibits[0], oversized, synthetic };
   });
   expect(result.legacy).toMatchObject({
     theater_abi: 1,
@@ -281,6 +292,7 @@ test("museum ABI compatibility is explicit and bounded", async ({ page }) => {
     checkpoint_interval_ns: 5_000_000_000,
   });
   expect(result.oversized).toContain("regenerate");
+  expect(result.synthetic).toContain("Synthetic artifact");
 
   await page.addInitScript(() => {
     const originalFetch = window.fetch.bind(window);

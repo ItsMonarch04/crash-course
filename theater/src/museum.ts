@@ -40,6 +40,9 @@ export const emptyManifest: MuseumManifest = {
 export function parseMuseum(value: unknown): MuseumManifest {
   if (!value || typeof value !== "object") throw new Error("Museum manifest is not an object.");
   const manifest = value as Record<string, unknown>;
+  if (manifest.synthetic === true) {
+    throw new Error("Synthetic artifacts belong to the kata wing, not the museum.");
+  }
   const schema = manifest.schema_version;
   if (schema !== 1 && schema !== 2) {
     throw new Error(`Unsupported museum schema ${String(schema)}.`);
@@ -67,6 +70,9 @@ export async function loadMuseum(): Promise<MuseumManifest> {
 function adaptExhibit(value: unknown, manifestAbi: 1 | 2, index: number): Exhibit {
   if (!isRawExhibit(value)) throw new Error(`Museum exhibit ${index} is malformed.`);
   const candidate = value as Record<string, unknown>;
+  if (candidate.synthetic === true) {
+    throw new Error(`Synthetic artifact ${String(candidate.id)} is not a museum exhibit.`);
+  }
   const abi = candidate.theater_abi ?? manifestAbi;
   if (abi !== 1 && abi !== 2) {
     throw new Error(`Unsupported Theater ABI ${String(abi)} in museum exhibit ${value.id}.`);

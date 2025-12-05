@@ -18,6 +18,7 @@
           "trace": { "type": "string" },
           "verdict": { "enum": ["fixed", "known-failure", "inconclusive"] },
           "anomaly": { "type": "string", "minLength": 1 },
+          "synthetic": { "const": false },
           "chapters": { "type": "array", "items": { "type": "string" } }
         }
       }

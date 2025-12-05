@@ -11,9 +11,11 @@ import json
 import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
-assert manifest["schema_version"] == 1
+assert manifest["schema_version"] == 2
+assert manifest.get("synthetic") is not True
 assert isinstance(manifest["build"], str) and manifest["build"]
 for exhibit in manifest["exhibits"]:
+    assert exhibit.get("synthetic") is not True
     for key in ("id", "title", "kind", "seed", "trace", "verdict", "chapters"):
         assert key in exhibit, key
 print(f"museum manifest: PASS exhibits={len(manifest['exhibits'])}")

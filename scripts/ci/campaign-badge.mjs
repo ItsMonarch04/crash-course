@@ -27,6 +27,9 @@ const profile = flag("--profile", "rough");
 let previous = { cumulative_seeds: 0, runs: 0 };
 if (input && fs.existsSync(input)) {
   previous = JSON.parse(fs.readFileSync(input, "utf8"));
+  if (previous.synthetic === true) {
+    throw new Error("synthetic campaign artifacts cannot contribute to a claims badge");
+  }
 }
 
 const cumulativeSeeds = positiveInteger(

@@ -13,7 +13,7 @@ C0.10	implemented	A 2c733f3 CCPF frame remains readable by the current frame dec
 C0.11	implemented	A raised CCID reader floor is refused before opening other node state	trap_ccid_refuses_future_reader_before_opening_state
 N0.2.1	implemented	Imported ambient clocks are rejected in deterministic crates	trap_imported_clock_is_detected
 N0.3.1	implemented	Unknown vote responses never form quorum	trap_unknown_vote_response_cannot_form_quorum
-N0.3.2	implemented	Learner responses never commit an entry	trap_learner_append_response_cannot_commit
+N0.3.2	implemented	Learner responses never commit an entry	trap_learner_never_counts_toward_quorum
 N0.3.3	implemented	Joint elections require both majorities	trap_joint_election_requires_both_majorities
 N0.3.4	implemented	Configuration takes effect on follower append	trap_config_on_append_changes_joint_quorum_before_commit
 N0.3.5	implemented	Membership recovers from log and snapshot	trap_membership_recovers_from_log_and_snapshot
@@ -22,7 +22,7 @@ N0.3.7	implemented	An isolated leader steps down after CheckQuorum	trap_checkquo
 N0.3.8	implemented	Only one configuration change is in flight	trap_leave_joint_waits_for_committed_enter_joint
 N0.3.9	implemented	Leadership transfer waits for durable intent and a caught-up target	trap_leadership_transfer_waits_for_committed_intent_and_caught_up_target
 N0.3.10	implemented	TimeoutNow follows normal durable election flow	trap_timeout_now_uses_normal_term_and_vote_fsync
-N0.3.11	implemented	Transfer workflow survives crash and recovery	trap_leadership_transfer_recovers_or_finishes_after_crash
+N0.3.11	implemented	Transfer workflow identity survives CCSN compaction and recovery	trap_leadership_transfer_identity_survives_ccsn_compaction
 N0.3.12	implemented	Wrong transfer target or stale intent cannot finish	trap_wrong_target_or_stale_transfer_cannot_complete
 N0.3.13	implemented	Rejected config does not mutate membership	trap_rejected_config_proposal_does_not_mutate_membership
 N0.3.14	implemented	Truncating config restores prior membership	trap_truncated_uncommitted_config_restores_prior_membership
@@ -56,7 +56,7 @@ N0.6.2	implemented	History v2 preserves open operations	trap_history_v2_preserve
 N0.6.3	implemented	History rejects malformed hex and duplicate operation ids	trap_history_rejects_invalid_hex_and_duplicate_ids
 N0.6.4	implemented	A chunk cannot claim an empty initial state	trap_chunk_cannot_claim_an_empty_initial_state
 N0.6.5	implemented	Planted lost acknowledgements are rejected	trap_real_history_detects_planted_lost_ack
-N0.6.6	implemented	Resurrection reports every nonnil post-delete value	trap_resurrection_checker_flags_any_value_not_only_empty_bytes
+N0.6.6	implemented	Resurrection reports every nonnil post-delete value	trap_classifies_resurrection
 N1.1.1	implemented	Recovery does not claim an unproven applied watermark	trap_restore_refuses_unproven_applied_watermark
 N1.2.1	implemented	Application envelopes are canonical	proposal_envelope_round_trips_through_public_builder
 N1.2.2	implemented	KV replies are canonical	golden_cckr_v1_round_trips_and_rejects_corruption
@@ -161,12 +161,12 @@ N4.5.5	implemented	Persistent disk-fault trace specifications preserve their sel
 N4.6.1	implemented	CCBK v2 restore creates a fresh cluster and node identity	trap_restore_creates_fresh_cluster_identity
 N5.1.1	implemented	Checker emits a deterministic minimal witness	trap_minimal_witness_is_deterministic
 N5.1.2	implemented	An exhausted witness budget never returns a passing subset	trap_witness_budget_never_returns_a_passing_subset
-N5.2.1	implemented	Anomaly classifier uses only certain real-time order	trap_anomaly_classifier_uses_only_certain_real_time_order
-N5.2.2	implemented	Anomaly classifier labels stale reads without an intervening write	trap_anomaly_classifier_labels_stale_read_without_intervening_write
+N5.2.1	implemented	Anomaly classifier uses only certain real-time order	trap_classifier_does_not_order_concurrent_operations
+N5.2.2	implemented	Anomaly classifier labels stale reads without an intervening write	trap_classifies_stale_read
 N5.5.1	implemented	Trace reads current binary and JSON export forms	trap_trace_reads_current_binary_and_json_exports
-N6.1.1	implemented	Seed ledger records campaign outcomes	trap_seed_ledger_is_append_only
-N6.1.2	implemented	Campaign resume skips only prior successful ledger rows	trap_ledger_resume_only_skips_prior_ok_rows
-N6.2.1	implemented	Shards partition seeds exactly once and validate bounds	trap_shards_partition_each_seed_once_and_validate_bounds
+N6.1.1	implemented	Seed ledger deduplicates byte-identical campaign outcomes	trap_ledger_dedupes_identical_rows
+N6.1.2	implemented	Campaign resume skips only prior successful ledger rows	trap_resume_skips_only_prior_ok_by_default
+N6.2.1	implemented	Shards partition seeds exactly once and validate bounds	trap_shards_partition_seed_range_exactly
 N7.1.1	implemented	Compatibility matrix is enforced	trap_compatibility_matrix_is_enforced
 N7.1.2	implemented	Current CCSN golden is decoded by its owning reader	trap_snapshot_ordering
 N7.1.3	implemented	Current SST data-block golden is checksum protected	trap_block_crc_detects_bit_flip
@@ -176,13 +176,40 @@ N8.1.1	implemented	Real membership operations use replicated config	trap_real_ho
 N8.1.2	implemented	Learner add and promotion are replicated config transitions	trap_learner_add_and_promotion_are_replicated_config_transitions
 N8.2.1	implemented	Non-loopback listeners require an explicit unsafe opt-in	trap_non_loopback_bind_requires_the_flag
 N8.2.2	implemented	Unsafe listener warning includes the actual bound address	trap_unsafe_warning_names_actual_listener
-N9.1.1	implemented	Every rendered theater control has a contract row and functional controls change observable state	every_control_changes_observable_state
+N9.1.1	implemented	Every rendered theater control has a contract row and functional controls change observable state	every control changes observable state
 N9.1.2	implemented	Theater packet loss maps to an effective LinkDegrade P16 value	trap_packet_loss_uses_the_effective_link_p16_value
 N9.1.3	implemented	Theater disk latency maps to effective persistent SlowDisk service time	trap_slow_disk_reports_the_effective_persistent_delay
 N9.2.1	implemented	Timeline markers use stable trace-sequence keys and emit no duplicate-key console error	timeline markers render without duplicate React keys
 N10.1.1	implemented	Batch applies atomically or not at all	trap_batch_applies_atomically_or_not_at_all
 N10.1.2	implemented	Batch command encoding has a fixed v3 vector	golden_cckv_batch_v3
 N10.1.3	implemented	Batch reply encoding uses the v3 envelope	golden_cckr_batch_reply_v3
-N10.1.4	implemented	Batch admission respects immutable policy caps	trap_batch_respects_size_caps_before_proposal
+N10.1.4	implemented	Batch admission respects immutable policy caps	trap_batch_respects_size_caps
+N10.1.5	implemented	Batch failures identify the first failing subcommand	trap_batch_failure_reports_the_failing_index
+N10.1.6	implemented	Batch session retries deduplicate the complete atomic unit	trap_batch_dedup_is_one_unit
+N10.1.7	implemented	Batch reads observe earlier subcommands	trap_batch_reads_see_prior_subcommands
+N10.1.8	implemented	Every batch TTL decision uses one replicated timestamp	trap_batch_ttl_uses_one_timestamp
+N10.1.9	implemented	Feature activation requires every learner capability	trap_batch_activation_requires_every_learner_capability
+N10.1.10	implemented	An empty batch cannot consume a session sequence	trap_empty_batch_does_not_consume_session_sequence
+N10.1.11	implemented	Oversized batch replies publish no mutations	trap_oversized_batch_reply_aborts_before_publish
+N10.1.12	implemented	Nested batches are rejected	trap_nested_batch_is_rejected
 N10.2.1	implemented	Follower read waits for ReadIndex	trap_follower_read_waits_for_readindex
+N10.2.2	implemented	Follower grants from another term are ignored	trap_follower_read_grant_requires_current_term
+N10.2.3	implemented	Follower TTL evaluation uses leader-supplied read time	trap_follower_read_uses_leader_time_for_ttl
+N10.2.4	implemented	Follower-read tags require the negotiated feature bit	trap_follower_read_tags_require_negotiated_feature_bit
+N10.2.5	implemented	Ordinary reads remain leader reads	trap_default_read_is_leader_read
+N10.2.6	implemented	Stale local reads are excluded from linearizability	trap_stale_read_is_excluded_from_the_linearizable_history
+N10.2.7	implemented	Stale replies match traced state at the reported applied index	trap_stale_read_matches_reported_applied_index
+N10.2.8	implemented	Stale TTL filtering uses the reported read time	trap_stale_read_ttl_uses_reported_read_time
+N10.2.9	implemented	Stale reads make no contact-age freshness promise	trap_stale_read_makes_no_time_bound
+N10.3.1	implemented	Fresh restore discards source cluster and node identity before growth	trap_restored_cluster_grows_without_identity_clone
+N10.3.2	implemented	Fresh restore retains the active semantic feature floor	trap_backup_restore_preserves_active_feature_floor
+N10.3.3	implemented	Fresh restore preserves final value and TTL probes	trap_restored_cluster_matches_source_final_probes
 N11.1.1	implemented	Documentation inventory is coherent	doc_coherence
+N11.6.1	implemented	Synthetic artifacts are rejected by claims and museum boundaries	trap_synthetic_artifact_is_rejected_by_claims_and_museum
+N11.6.2	implemented	Default workspace builds enable no synthetic kata	trap_default_build_enables_no_kata
+N11.6.3	implemented	Kata features are mutually exclusive	trap_kata_features_are_mutually_exclusive
+N11.6.4	implemented	Kata 01 exposes an even-voter commit quorum defect within its budget	trap_kata_01_commit_quorum_is_found_within_budget
+N11.6.5	implemented	Kata 02 exposes a denied-vote timer reset within its budget	trap_kata_02_wrong_timer_reset_is_found_within_budget
+N11.6.6	implemented	Kata 03 exposes an acknowledgement released before fsync within its budget	trap_kata_03_ack_before_fsync_is_found_within_budget
+N11.6.7	implemented	Kata 04 exposes tombstone collection above the bottom level within its budget	trap_kata_04_tombstone_gc_is_found_within_budget
+N11.6.8	implemented	Kata 05 exposes session deduplication keyed without command bytes within its budget	trap_kata_05_session_dedup_is_found_within_budget
