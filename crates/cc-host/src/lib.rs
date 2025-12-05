@@ -3601,6 +3601,100 @@ mod tests {
     }
 
     #[test]
+    fn trap_log_prefix_discard_follows_snapshot_mark_and_dir_fsync() {
+        let mut driver = driver();
+        driver.node_mut().kv.mark_applied(
+            cc_core::LogIndex::new(2),
+            cc_core::Term::new(1),
+            Time::from_nanos(1),
+        );
+        driver.node_mut().raft.applied_index = cc_core::LogIndex::new(2);
+        driver.node_mut().raft.log = vec![
+            cc_raft::Entry {
+                term: cc_core::Term::new(1),
+                index: cc_core::LogIndex::new(1),
+                kind: cc_raft::EntryKind::Noop,
+                payload: Vec::new(),
+            },
+            cc_raft::Entry {
+                term: cc_core::Term::new(1),
+                index: cc_core::LogIndex::new(2),
+                kind: cc_raft::EntryKind::Noop,
+                payload: Vec::new(),
+            },
+        ];
+        driver.limits.max_log_bytes_before_snapshot = 1;
+        driver.next_wal_offset = 1;
+        let mut effects = driver.translate(Vec::new()).expect("local checkpoint");
+        assert!(
+            !driver.node().raft.log.is_empty(),
+            "the prefix was released before any byte was durable"
+        );
+
+        // Reclaiming the log prefix is only safe once the snapshot file, its
+        // mark record, and the directory entry that names them are all
+        // durable. Until then the entries are the only recovery authority.
+        let mut files = BTreeMap::<FileId, Vec<u8>>::new();
+        let mut fsyncs = 0_u32;
+        let mut directory_synced = false;
+        while let Some(effect) = effects.pop() {
+            let (id, result) = match effect {
+                Effect::DiskWrite {
+                    file,
+                    at,
+                    bytes,
+                    id,
+                } => {
+                    let at = usize::try_from(at).expect("offset");
+                    let image = files.entry(file).or_default();
+                    if image.len() < at + bytes.len() {
+                        image.resize(at + bytes.len(), 0);
+                    }
+                    image[at..at + bytes.len()].copy_from_slice(&bytes);
+                    assert!(
+                        !driver.node().raft.log.is_empty(),
+                        "a write alone released the prefix"
+                    );
+                    (
+                        id,
+                        IoResult::Written {
+                            len: u32::try_from(bytes.len()).expect("write length"),
+                        },
+                    )
+                }
+                Effect::DiskFsync { id, .. } => {
+                    fsyncs += 1;
+                    (id, IoResult::Fsynced)
+                }
+                Effect::DiskSyncDir { id } => {
+                    directory_synced = true;
+                    (id, IoResult::Fsynced)
+                }
+                Effect::DiskRename { from, to, id } => {
+                    let image = files.remove(&from).expect("rename source");
+                    files.insert(to, image);
+                    (id, IoResult::Fsynced)
+                }
+                other => panic!("unexpected local checkpoint effect {other:?}"),
+            };
+            if driver.node().raft.log.is_empty() {
+                assert!(
+                    fsyncs > 0 && directory_synced,
+                    "the prefix was discarded before the mark and directory were durable"
+                );
+            }
+            let (_, next) = driver.complete_io(id, result).expect("checkpoint I/O");
+            effects.extend(next.into_iter().rev());
+        }
+        assert!(fsyncs > 0 && directory_synced);
+        assert!(driver.node().raft.log.is_empty());
+        assert_eq!(
+            driver.node().raft.snapshot_base(),
+            (cc_core::LogIndex::new(2), cc_core::Term::new(1))
+        );
+    }
+
+    #[test]
     fn trap_leader_sends_snapshot_when_log_prefix_is_gone() {
         let mut driver = driver();
         driver.node_mut().raft.role = cc_cluster::Role::Leader;
@@ -4161,6 +4255,78 @@ mod tests {
     }
 
     #[test]
+    fn trap_driver_retains_effects_until_sync_service_elapses() {
+        let mut driver = driver();
+        let reply = NodeEffect::ReadReply {
+            client: cc_core::ClientId::new(4),
+            sequence: 1,
+            reply: cc_kv::KvReply::Value(Some(b"served-from-a-block".to_vec())),
+        };
+        let (poll, effects) = driver
+            .defer_or_translate(
+                Time::from_nanos(100),
+                Duration::from_nanos(25),
+                Ok(vec![reply]),
+            )
+            .expect("defer a synchronous read");
+        // The reply belongs to the read that paid for it, so nothing escapes
+        // before the modelled service duration has elapsed.
+        assert_eq!(poll, DriverPoll::BlockedUntil(Time::from_nanos(125)));
+        assert!(effects.is_empty(), "a zero-latency reply escaped");
+        for early in [100, 101, 124] {
+            assert_eq!(
+                driver
+                    .release_ready(Time::from_nanos(early))
+                    .expect("still blocked"),
+                (DriverPoll::BlockedUntil(Time::from_nanos(125)), Vec::new()),
+                "the deadline moved at {early}"
+            );
+        }
+        let (poll, released) = driver
+            .release_ready(Time::from_nanos(125))
+            .expect("service elapsed");
+        assert_eq!(poll, DriverPoll::Ready);
+        assert!(matches!(
+            released.as_slice(),
+            [Effect::ClientReply { client, .. }] if client.get() == 4
+        ));
+    }
+
+    #[test]
+    fn trap_failed_block_read_delays_its_own_error() {
+        let mut driver = driver();
+        let (poll, effects) = driver
+            .defer_or_translate(
+                Time::from_nanos(40),
+                Duration::from_nanos(9),
+                Err(NodeError::Kv(cc_kv::KvError::Busy)),
+            )
+            .expect("defer a failed read");
+        // A failure pays the same service time as a success; releasing it
+        // early would report an error the storage stack has not yet produced.
+        assert_eq!(poll, DriverPoll::BlockedUntil(Time::from_nanos(49)));
+        assert!(effects.is_empty());
+        assert_eq!(
+            driver
+                .release_ready(Time::from_nanos(48))
+                .expect("still blocked"),
+            (DriverPoll::BlockedUntil(Time::from_nanos(49)), Vec::new())
+        );
+        assert_eq!(
+            driver.release_ready(Time::from_nanos(49)),
+            Err(HostError::Node(NodeError::Kv(cc_kv::KvError::Busy))),
+            "the stored error surfaces at its own deadline"
+        );
+        // Exactly once: the error is not replayed on the next release.
+        assert_eq!(
+            driver
+                .release_ready(Time::from_nanos(50))
+                .expect("error was consumed"),
+            (DriverPoll::Ready, Vec::new())
+        );
+    }
+
+    #[test]
     fn trap_sync_read_blocks_same_node_inputs() {
         let mut driver = driver();
         let mut blocks = MemoryBlockSource::default();
@@ -4234,6 +4400,56 @@ mod tests {
             "I/O is delivered before the queued client request"
         );
         assert_eq!(driver.footprint().pending_client_inputs, 1);
+    }
+
+    #[test]
+    fn trap_bounded_peer_queue_drops_instead_of_blocking_consensus() {
+        let mut config = config();
+        config.host_limits.max_pending_peer = 1;
+        let mut driver = Driver::boot(
+            config,
+            BootState::Fresh {
+                bootstrap: cc_core::MembershipState::new(
+                    [NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+                        .into_iter()
+                        .collect::<BTreeSet<_>>(),
+                )
+                .expect("membership"),
+            },
+        )
+        .expect("driver");
+        let peer_input = |from: u64| Input::Recv {
+            from: NodeId::new(from),
+            msg: cc_env::WireMsg::new(cc_raft::PROTOCOL_VERSION, vec![0; 8]),
+        };
+        driver.enqueue(peer_input(2)).expect("first peer datagram");
+        // The second datagram is refused rather than queued without bound.
+        // Raft retries its own appends, so dropping here costs a round trip
+        // while blocking the Driver would stall every other node's consensus.
+        assert_eq!(
+            driver.enqueue(peer_input(3)),
+            Err(HostError::QueueFull(InputClass::Peer))
+        );
+        assert_eq!(driver.footprint().pending_peer_inputs, 1);
+
+        // A full peer queue never closes admission for other classes: client
+        // work and I/O completions still make progress.
+        driver
+            .enqueue(Input::ClientRequest {
+                client: cc_core::ClientId::new(1),
+                req: RequestSeq::new(1),
+                session: None,
+                command: vec![1],
+            })
+            .expect("client admission survives a full peer queue");
+        assert_eq!(driver.footprint().pending_client_inputs, 1);
+
+        // Draining the peer queue restores peer admission.
+        let mut blocks = MemoryBlockSource::default();
+        let _ = driver.deliver_next(Time::from_nanos(1), &mut blocks);
+        driver
+            .enqueue(peer_input(3))
+            .expect("peer admission resumes after the queue drains");
     }
 
     #[test]

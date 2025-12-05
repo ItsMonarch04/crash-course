@@ -2812,6 +2812,71 @@ mod tests {
     }
 
     #[test]
+    fn trap_resurrection_checker_flags_any_value_not_only_empty_bytes() {
+        // An earlier checker only noticed a resurrected empty byte string, so
+        // the loudest possible failure — a real value returning after an
+        // acknowledged delete — went unreported.
+        for resurrected in [
+            Vec::new(),
+            b"v".to_vec(),
+            b"a much longer value".to_vec(),
+            vec![0_u8; 64],
+        ] {
+            let history = History {
+                operations: vec![
+                    Operation::completed(
+                        1,
+                        OperationKind::Del { key: b"k".to_vec() },
+                        Time::from_nanos(1),
+                        Time::from_nanos(2),
+                        Outcome::Ok,
+                    ),
+                    Operation::completed(
+                        2,
+                        OperationKind::Get { key: b"k".to_vec() },
+                        Time::from_nanos(3),
+                        Time::from_nanos(4),
+                        Outcome::Value(Some(resurrected.clone())),
+                    ),
+                ],
+            };
+            let report = check_no_resurrection(&history);
+            assert!(
+                !report.is_ok(),
+                "a {}-byte resurrected value went unreported",
+                resurrected.len()
+            );
+            assert!(
+                report
+                    .violations
+                    .iter()
+                    .all(|violation| violation.name == "no_resurrection")
+            );
+        }
+
+        // A absent read after the delete is the correct observation.
+        let clean = History {
+            operations: vec![
+                Operation::completed(
+                    1,
+                    OperationKind::Del { key: b"k".to_vec() },
+                    Time::from_nanos(1),
+                    Time::from_nanos(2),
+                    Outcome::Ok,
+                ),
+                Operation::completed(
+                    2,
+                    OperationKind::Get { key: b"k".to_vec() },
+                    Time::from_nanos(3),
+                    Time::from_nanos(4),
+                    Outcome::Value(None),
+                ),
+            ],
+        };
+        assert!(check_no_resurrection(&clean).is_ok());
+    }
+
+    #[test]
     fn trap_classifier_does_not_order_concurrent_operations() {
         let resurrection = History {
             operations: vec![

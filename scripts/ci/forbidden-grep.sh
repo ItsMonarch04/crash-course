@@ -21,9 +21,29 @@ cargo run --quiet -p cc-detlint -- check \
 
 # N1 permits a literal `commands.log` only in the migration-boundary refusal;
 # it must not retain an executable second replication/state-machine path.
-if rg -n \
-  'CCREPL|DurableJournal|struct HostState|fn (run_node|apply_durable|apply_replica|replicate)\b|thread::spawn' \
-  "$root_dir/crates/cc-node/src" -g '*.rs'; then
+# Scan production adapter code only: named tests hold the forbidden literals
+# as needles, matching trap_no_second_replication_protocol.
+if ! python3 - "$root_dir/crates/cc-node/src" <<'PY'
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+pattern = re.compile(
+    r"CCREPL|DurableJournal|struct HostState|"
+    r"fn (run_node|apply_durable|apply_replica|replicate)\b|"
+    r"thread::spawn"
+)
+failed = False
+for path in sorted(root.rglob("*.rs")):
+    text = path.read_text()
+    production = text.split("#[cfg(test)]", 1)[0]
+    for line_no, line in enumerate(production.splitlines(), 1):
+        if line.lstrip().startswith("//"):
+            continue
+        if pattern.search(line):
+            print(f"{path}:{line_no}:{line}")
+            failed = True
+sys.exit(1 if failed else 0)
+PY
+then
   echo "forbidden-grep: cc-node contains a legacy replication path or raw thread spawn" >&2
   exit 1
 fi

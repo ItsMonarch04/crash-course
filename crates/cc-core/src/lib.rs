@@ -2330,6 +2330,37 @@ mod tests {
         assert_eq!(AdminReply::decode(&reply.encode()), Ok(reply));
     }
 
+    fn golden_bytes(name: &str) -> Vec<u8> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        std::fs::read(root.join("tests/golden/compat-base").join(name)).expect("read golden vector")
+    }
+
+    #[test]
+    fn golden_cccf_v1() {
+        let bytes = golden_bytes("cccf-v1.bin");
+        let envelope = ConfigEnvelope::decode(&bytes).expect("decode CCCF v1 golden");
+        assert_eq!(
+            envelope.encode(),
+            bytes,
+            "CCCF v1 encoding is not canonical"
+        );
+        assert!(ConfigEnvelope::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut corrupt = bytes;
+        corrupt[0] ^= 0xff;
+        assert!(ConfigEnvelope::decode(&corrupt).is_err());
+    }
+
+    #[test]
+    fn golden_ccar_v1() {
+        let bytes = golden_bytes("ccar-v1.bin");
+        let reply = AdminReply::decode(&bytes).expect("decode CCAR v1 golden");
+        assert_eq!(reply.encode(), bytes, "CCAR v1 encoding is not canonical");
+        assert!(AdminReply::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut corrupt = bytes;
+        corrupt[0] ^= 0xff;
+        assert!(AdminReply::decode(&corrupt).is_err());
+    }
+
     #[test]
     fn trap_config_envelope_admin_absence_is_canonical() {
         let envelope = ConfigEnvelope {

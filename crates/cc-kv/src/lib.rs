@@ -2277,6 +2277,25 @@ mod tests {
     }
 
     #[test]
+    fn golden_cckr_v1() {
+        // The checked-in compatibility-base vector is the authority for CCKR
+        // v1 bytes: this build must decode it and re-encode it exactly.
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bytes = std::fs::read(root.join("tests/golden/compat-base/cckr-v1.bin"))
+            .expect("read CCKR v1 golden");
+        let reply = decode_reply(&bytes).expect("decode CCKR v1 golden");
+        assert_eq!(
+            encode_reply(&reply),
+            bytes,
+            "CCKR v1 encoding is not canonical"
+        );
+        assert!(decode_reply(&bytes[..bytes.len() - 1]).is_err());
+        let mut corrupt = bytes;
+        corrupt[0] ^= 0xff;
+        assert!(decode_reply(&corrupt).is_err());
+    }
+
+    #[test]
     fn golden_cckr_v1_round_trips_and_rejects_corruption() {
         let reply = KvReply::Scan(vec![(vec![0], vec![0xff])]);
         let encoded = encode_reply(&reply);
