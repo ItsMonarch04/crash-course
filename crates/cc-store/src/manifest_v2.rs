@@ -412,8 +412,8 @@ pub fn encode_manifest_v2(manifest: &ManifestV2) -> Result<Vec<u8>, StoreError> 
 }
 
 /// Decode a complete manifest.  A torn final record is intentionally not
-/// accepted by this strict API; boot callers that need prefix recovery use
-/// [`decode_manifest_v2_prefix`].
+/// accepted by this strict API; boot callers inside this crate that need
+/// prefix recovery use the crate-internal `decode_manifest_v2_prefix`.
 pub fn decode_manifest_v2(bytes: &[u8]) -> Result<ManifestV2, StoreError> {
     let (manifest, torn_tail) = decode_manifest_v2_prefix(bytes)?;
     if torn_tail {

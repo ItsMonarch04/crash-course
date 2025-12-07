@@ -11,6 +11,7 @@ cargo test -p cc-swarm trap_default_build_enables_no_kata
 cargo test -p cc-swarm trap_kata_features_are_mutually_exclusive
 
 pair_log="$repo_root/target/kata-mutual-exclusion.log"
+mkdir -p "$(dirname "$pair_log")"
 if cargo check -p cc-swarm --features kata01,kata02 >"$pair_log" 2>&1; then
   echo "kata01,kata02 unexpectedly compiled together" >&2
   exit 1

@@ -31,9 +31,11 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use cc_cluster::backup::BACKUP_VERSION;
 use cc_cluster::backup::{
-    BACKUP_MAGIC, BACKUP_V2_FOOTER_BYTES, BACKUP_V2_HEADER_BYTES, BACKUP_VERSION, BackupProvenance,
-    BackupV2, LEGACY_BACKUP_VERSION, snapshot_for_fresh_cluster,
+    BACKUP_MAGIC, BACKUP_V2_FOOTER_BYTES, BACKUP_V2_HEADER_BYTES, BackupProvenance, BackupV2,
+    LEGACY_BACKUP_VERSION, snapshot_for_fresh_cluster,
 };
 use cc_cluster::{CcsnSnapshot, ccsn_file_crc, decode_ccsn, encode_ccsn};
 use cc_core::{
@@ -1436,84 +1438,6 @@ fn required_admin_identity(args: &[String]) -> io::Result<(String, String)> {
     Ok((operator, sequence))
 }
 
-/// Historical CCBK v1 implementation retained only for fixture inspection.
-/// It is deliberately not exposed by the operator command: copying this
-/// archive would clone a node and cluster identity.
-#[allow(dead_code)]
-fn backup_legacy_node_clone(data_dir: &Path, output: &Path) -> io::Result<usize> {
-    if !data_dir.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "backup data directory is absent",
-        ));
-    }
-    if output.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "backup output already exists",
-        ));
-    }
-    let mut entries = Vec::new();
-    for name in ["identity.ccid", "ccdb.toml", "raft/wal.0"] {
-        let path = data_dir.join(name);
-        let data = if path.exists() {
-            fs::read(&path)?
-        } else if name == "raft/wal.0" {
-            Vec::new()
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("backup requires {}", path.display()),
-            ));
-        };
-        if data.len() > BACKUP_MAX_FILE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "backup file exceeds limit",
-            ));
-        }
-        if name == "raft/wal.0" && !data.is_empty() {
-            let recovered =
-                cc_log::recover_framed_record_stream(&data).map_err(io::Error::other)?;
-            if recovered.torn_tail_truncated || recovered.bytes_consumed != data.len() as u64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "backup refuses a torn WAL",
-                ));
-            }
-        }
-        entries.push((name.as_bytes().to_vec(), data));
-    }
-    let mut archive = Vec::new();
-    archive.extend_from_slice(BACKUP_MAGIC);
-    archive.extend_from_slice(&LEGACY_BACKUP_VERSION.to_le_bytes());
-    archive.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (name, data) in &entries {
-        archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        archive.extend_from_slice(name);
-        archive.extend_from_slice(&(data.len() as u64).to_le_bytes());
-        archive.extend_from_slice(&crc32c(data).to_le_bytes());
-        archive.extend_from_slice(data);
-    }
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let temporary = output.with_extension(format!("tmp-{}", std::process::id()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(&archive)?;
-        file.sync_all()?;
-        fs::rename(&temporary, output)?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result.map(|()| entries.len())
-}
-
 fn backup_data_dir(data_dir: &Path, output: &Path) -> io::Result<usize> {
     let (identity, mark, snapshot_bytes, snapshot) = marked_checkpoint(data_dir)?;
     let backup = BackupV2 {
@@ -1617,191 +1541,8 @@ fn encode_backup_v2(backup: &BackupV2) -> io::Result<Vec<u8>> {
     cc_cluster::backup::encode_backup_v2(backup)
 }
 
-#[allow(dead_code)]
-fn encode_backup_v2_previous_local_copy(backup: &BackupV2) -> io::Result<Vec<u8>> {
-    if backup.source_cluster_id.is_zero()
-        || backup.source_index.get() == 0
-        || backup.source_term.get() == 0
-        || backup.source_min_semantic == 0
-        || backup.source_min_semantic > MIN_SEMANTIC_READER
-        || backup.checkpoint.is_empty()
-        || backup.checkpoint.len() > BACKUP_MAX_FILE
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid backup metadata",
-        ));
-    }
-    let checkpoint_len = u64::try_from(backup.checkpoint.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "backup checkpoint length"))?;
-    let checkpoint_crc = crc32c(&backup.checkpoint);
-    let mut bytes = Vec::with_capacity(
-        BACKUP_V2_HEADER_BYTES
-            .saturating_add(backup.checkpoint.len())
-            .saturating_add(BACKUP_V2_FOOTER_BYTES),
-    );
-    bytes.extend_from_slice(BACKUP_MAGIC);
-    bytes.extend_from_slice(&BACKUP_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&backup.source_cluster_id.bytes());
-    bytes.extend_from_slice(&backup.source_index.get().to_le_bytes());
-    bytes.extend_from_slice(&backup.source_term.get().to_le_bytes());
-    bytes.extend_from_slice(&backup.source_last_leader_time.as_nanos().to_le_bytes());
-    bytes.extend_from_slice(&backup.source_policy_hash.to_le_bytes());
-    bytes.extend_from_slice(&backup.source_min_semantic.to_le_bytes());
-    bytes.extend_from_slice(&backup.source_active_features.to_le_bytes());
-    bytes.extend_from_slice(&checkpoint_len.to_le_bytes());
-    bytes.extend_from_slice(&checkpoint_crc.to_le_bytes());
-    bytes.extend_from_slice(&0_u32.to_le_bytes());
-    if bytes.len() != BACKUP_V2_HEADER_BYTES {
-        return Err(io::Error::other("backup header layout"));
-    }
-    let header_crc = crc32c(&bytes);
-    bytes[BACKUP_V2_HEADER_BYTES - 4..].copy_from_slice(&header_crc.to_le_bytes());
-    bytes.extend_from_slice(&backup.checkpoint);
-    bytes.extend_from_slice(&0_u32.to_le_bytes());
-    bytes.extend_from_slice(b"CBKE");
-    let footer = bytes.len() - BACKUP_V2_FOOTER_BYTES;
-    let bundle_crc = crc32c(&bytes);
-    bytes[footer..footer + 4].copy_from_slice(&bundle_crc.to_le_bytes());
-    Ok(bytes)
-}
-
 fn decode_backup_v2(bytes: &[u8]) -> io::Result<BackupV2> {
     cc_cluster::backup::decode_backup_v2(bytes)
-}
-
-#[allow(dead_code)]
-fn decode_backup_v2_previous_local_copy(bytes: &[u8]) -> io::Result<BackupV2> {
-    if bytes.len() < BACKUP_V2_HEADER_BYTES + BACKUP_V2_FOOTER_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "truncated backup",
-        ));
-    }
-    if &bytes[..4] != BACKUP_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid backup magic",
-        ));
-    }
-    let version = u16::from_le_bytes(bytes[4..6].try_into().expect("backup version"));
-    if version == LEGACY_BACKUP_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "legacy node backup requires an explicit legacy importer",
-        ));
-    }
-    if version != BACKUP_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported backup version",
-        ));
-    }
-    let header = &bytes[..BACKUP_V2_HEADER_BYTES];
-    let expected_header = u32::from_le_bytes(
-        header[BACKUP_V2_HEADER_BYTES - 4..]
-            .try_into()
-            .expect("backup header CRC"),
-    );
-    let mut header_copy = header.to_vec();
-    header_copy[BACKUP_V2_HEADER_BYTES - 4..].fill(0);
-    if crc32c(&header_copy) != expected_header {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backup header checksum",
-        ));
-    }
-    let footer = bytes.len() - BACKUP_V2_FOOTER_BYTES;
-    if &bytes[footer + 4..] != b"CBKE" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backup footer magic",
-        ));
-    }
-    let expected_bundle =
-        u32::from_le_bytes(bytes[footer..footer + 4].try_into().expect("bundle CRC"));
-    let mut bundle_copy = bytes.to_vec();
-    bundle_copy[footer..footer + 4].fill(0);
-    if crc32c(&bundle_copy) != expected_bundle {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backup bundle checksum",
-        ));
-    }
-    let mut cluster = [0_u8; 16];
-    cluster.copy_from_slice(&header[6..22]);
-    let source_cluster_id = ClusterId::new(cluster);
-    let source_index = LogIndex::new(u64::from_le_bytes(
-        header[22..30].try_into().expect("index"),
-    ));
-    let source_term = Term::new(u64::from_le_bytes(header[30..38].try_into().expect("term")));
-    let source_last_leader_time =
-        Time::from_nanos(u64::from_le_bytes(header[38..46].try_into().expect("time")));
-    let source_policy_hash = u64::from_le_bytes(header[46..54].try_into().expect("policy"));
-    let source_min_semantic = u16::from_le_bytes(header[54..56].try_into().expect("semantic"));
-    let source_active_features = u64::from_le_bytes(header[56..64].try_into().expect("features"));
-    let checkpoint_len = usize::try_from(u64::from_le_bytes(
-        header[64..72].try_into().expect("checkpoint length"),
-    ))
-    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "backup checkpoint length"))?;
-    if checkpoint_len == 0 || checkpoint_len > BACKUP_MAX_FILE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backup checkpoint limit",
-        ));
-    }
-    let end = BACKUP_V2_HEADER_BYTES
-        .checked_add(checkpoint_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "backup checkpoint length"))?;
-    if end != footer {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backup trailing bytes",
-        ));
-    }
-    let checkpoint = bytes[BACKUP_V2_HEADER_BYTES..end].to_vec();
-    let expected_checkpoint =
-        u32::from_le_bytes(header[72..76].try_into().expect("checkpoint CRC"));
-    if crc32c(&checkpoint) != expected_checkpoint
-        || source_cluster_id.is_zero()
-        || source_index.get() == 0
-        || source_term.get() == 0
-        || source_min_semantic == 0
-        || source_min_semantic > MIN_SEMANTIC_READER
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid backup checkpoint",
-        ));
-    }
-    let snapshot = decode_ccsn(
-        &checkpoint,
-        source_cluster_id.bytes(),
-        BACKUP_MAX_FILE as u64,
-    )
-    .map_err(io::Error::other)?;
-    if snapshot.kv.applied_index != source_index
-        || snapshot.kv.applied_term != source_term
-        || snapshot.kv.last_leader_time != source_last_leader_time
-        || snapshot.cluster_policy.hash() != source_policy_hash
-        || snapshot.membership.active_features != source_active_features
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backup checkpoint metadata",
-        ));
-    }
-    Ok(BackupV2 {
-        source_cluster_id,
-        source_index,
-        source_term,
-        source_last_leader_time,
-        source_policy_hash,
-        source_min_semantic,
-        source_active_features,
-        checkpoint,
-        provenance: BackupProvenance::LogicalCluster,
-    })
 }
 
 fn write_new_backup(output: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -2321,7 +2062,6 @@ pub(crate) fn metrics_dashboard() -> String {
     )
 }
 
-#[allow(dead_code)]
 fn take_bytes<'a>(input: &'a [u8], cursor: &mut usize, length: usize) -> io::Result<&'a [u8]> {
     let end = cursor
         .checked_add(length)
@@ -2333,13 +2073,12 @@ fn take_bytes<'a>(input: &'a [u8], cursor: &mut usize, length: usize) -> io::Res
     Ok(bytes)
 }
 
-#[allow(dead_code)]
 fn take_u16(input: &[u8], cursor: &mut usize) -> io::Result<u16> {
     Ok(u16::from_le_bytes(
         take_bytes(input, cursor, 2)?.try_into().expect("two bytes"),
     ))
 }
-#[allow(dead_code)]
+
 fn take_u32(input: &[u8], cursor: &mut usize) -> io::Result<u32> {
     Ok(u32::from_le_bytes(
         take_bytes(input, cursor, 4)?
@@ -2347,7 +2086,7 @@ fn take_u32(input: &[u8], cursor: &mut usize) -> io::Result<u32> {
             .expect("four bytes"),
     ))
 }
-#[allow(dead_code)]
+
 fn take_u64(input: &[u8], cursor: &mut usize) -> io::Result<u64> {
     Ok(u64::from_le_bytes(
         take_bytes(input, cursor, 8)?

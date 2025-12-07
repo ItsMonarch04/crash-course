@@ -15,7 +15,6 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
-          toolchain: stable
           components: rustfmt, clippy
       - run: node scripts/check-version-coherence.mjs
       - run: cargo fmt --all -- --check
@@ -26,4 +25,23 @@ jobs:
       # envelope closes without hitting the state cap. It fails loudly if a
       # change to `cc-raft` makes the reachable state space grow.
       - run: cargo run --locked --release -p cc-swarm -- model-check
-      - run: cargo doc --workspace --no-deps
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - run: node scripts/check-version-coherence.mjs
+      - run: node scripts/ci/doc-coherence.mjs
+      - run: bash scripts/ci/golden-manifest.sh --check
+      - run: bash scripts/ci/fuzz-inventory.sh --check
+      - run: bash scripts/ci/test-register.sh
+
+  kata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+      - run: bash scripts/ci/kata-matrix.sh

@@ -1,6 +1,12 @@
 name: perf-smoke
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/cc-bench/**"
+      - "bench/**"
+      - "scripts/ci/perf-smoke.sh"
   pull_request:
     paths:
       - "crates/cc-bench/**"
@@ -19,7 +25,5 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - run: node scripts/check-version-coherence.mjs
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
-        with:
-          toolchain: stable
       - run: ./scripts/ci/perf-smoke.sh
       - run: test -s bench/results/perf-smoke.json
