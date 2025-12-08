@@ -35,6 +35,10 @@ jobs:
           cache-dependency-path: theater/package-lock.json
       - run: npm ci --no-audit --no-fund
         working-directory: theater
+      - run: npm run lint
+        working-directory: theater
+      - run: npm run format:check
+        working-directory: theater
       - run: cargo test --locked -p cc-wasm
       - run: rustup target add wasm32-unknown-unknown
       - run: CARGO_HTTP_MULTIPLEXING=false cargo install wasm-bindgen-cli --version 0.2.105 --locked
