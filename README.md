@@ -87,7 +87,7 @@ shows the machinery that catches it.
   [histories as proof](docs/writeups/05-linearizability.md),
   [membership as a two-quorum story](docs/writeups/06-membership.md),
   [benchmarking without theater](docs/writeups/07-benchmark-honesty.md),
-  [the flight recorder](docs/writeups/08-theater.md), and
+  [the flight recorder](docs/writeups/08-theater.md),
   [exporting the determinism perimeter](docs/writeups/09-determinism-lint.md),
   [the storage engine that finally wrote a byte](docs/writeups/10-storage-byte.md),
   [record in production, replay in the simulator](docs/writeups/11-record-replay.md), and
@@ -138,4 +138,4 @@ publishes an altered simulator as a website cannot keep those changes closed.
 
 ---
 
-**Version:** v0.15.17
+**Version:** v0.16.0

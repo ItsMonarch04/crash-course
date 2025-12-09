@@ -3,4 +3,14 @@ target
 artifacts
 theater/node_modules
 theater/dist
+theater/test-results
 test-results
+# Local run state. `scripts/demo.sh`, the campaign runner, and the fuzzer all
+# write here, so without these a build after a demo ships the whole data
+# directory into the build context.
+ccdb-data
+campaigns/receipts
+campaigns/ledger.tsv
+campaigns/kata-ledger.tsv
+fuzz-artifacts
+bench/results

@@ -67,7 +67,7 @@ fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--determinism") => emit_determinism_trace(),
-        Some("--determinism-seeds") => run_determinism_seeds(parse_u64(&args, 1, 1_000)),
+        Some("--determinism-seeds") => run_determinism_seeds(parse_u64(&args, 1, 1_000)?),
         Some("--selfcheck") => {
             selfcheck_cluster(Seed::new(0xcc)).map_err(io::Error::other)?;
             println!("selfcheck: PASS");
@@ -99,7 +99,7 @@ fn main() -> io::Result<()> {
 }
 
 fn run_capability_campaign(args: &[String]) -> io::Result<()> {
-    let seeds = parse_u64_flag(args, "--seeds").unwrap_or(100_000);
+    let seeds = parse_u64_flag(args, "--seeds")?.unwrap_or(100_000);
     if seeds == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -331,7 +331,7 @@ fn run_ledger(args: &[String]) -> io::Result<()> {
             }
             let expected = (
                 parse_string_flag(args, "--expect-range"),
-                parse_u64_flag(args, "--expect-shards"),
+                parse_u64_flag(args, "--expect-shards")?,
                 parse_string_flag(args, "--expect-build"),
                 parse_string_flag(args, "--expect-config"),
             );
@@ -694,15 +694,11 @@ fn campaign_config_hash(profile: FaultProfile, disk_profile: Option<&(String, Di
 
 fn run_model_check(args: &[String]) -> io::Result<()> {
     let config = cc_raft::model::ModelConfig {
-        max_log: usize::try_from(parse_u64_flag(args, "--max-log").unwrap_or(4))
-            .unwrap_or(usize::MAX),
-        max_term: parse_u64_flag(args, "--max-term").unwrap_or(3),
-        max_messages: usize::try_from(parse_u64_flag(args, "--max-messages").unwrap_or(8))
-            .unwrap_or(usize::MAX),
-        max_depth: usize::try_from(parse_u64_flag(args, "--max-depth").unwrap_or(8))
-            .unwrap_or(usize::MAX),
-        max_states: usize::try_from(parse_u64_flag(args, "--max-states").unwrap_or(2_000_000))
-            .unwrap_or(usize::MAX),
+        max_log: parse_usize_flag(args, "--max-log", 4)?,
+        max_term: parse_u64_flag(args, "--max-term")?.unwrap_or(3),
+        max_messages: parse_usize_flag(args, "--max-messages", 8)?,
+        max_depth: parse_usize_flag(args, "--max-depth", 8)?,
+        max_states: parse_usize_flag(args, "--max-states", 2_000_000)?,
     };
     let report = cc_raft::model::check(config).map_err(io::Error::other)?;
     println!(
@@ -724,7 +720,7 @@ fn run_fuzz(args: &[String]) -> io::Result<()> {
             "fuzz requires --format <inventory-name>",
         )
     })?;
-    let iterations = parse_u64_flag(args, "--iterations").unwrap_or(1_000);
+    let iterations = parse_u64_flag(args, "--iterations")?.unwrap_or(1_000);
     let (max_input, allocation_budget, work_budget) = fuzz_inventory_budget(&format)?;
     if iterations > work_budget {
         return Err(io::Error::new(
@@ -765,7 +761,7 @@ fn run_fuzz(args: &[String]) -> io::Result<()> {
         }
         cases.push(bytes);
     }
-    let seed = parse_seed(args, 0);
+    let seed = parse_seed(args, 0)?;
     let mut rng = cc_core::Xoshiro256pp::stream(seed, "codec-fuzz", fnv1a(format.as_bytes()));
     let mut ok = 0_u64;
     let mut typed_errors = 0_u64;
@@ -895,8 +891,8 @@ fn regenerate_fuzz_manifest(path: &Path) -> io::Result<()> {
 }
 
 fn run_coverage_search(args: &[String]) -> io::Result<()> {
-    let iterations = parse_u64_flag(args, "--iterations").unwrap_or(100);
-    let profile = parse_profile(args, FaultProfile::Rough);
+    let iterations = parse_u64_flag(args, "--iterations")?.unwrap_or(100);
+    let profile = parse_profile(args, FaultProfile::Rough)?;
     let mut corpus = Vec::<RunSpec>::new();
     let mut guided_coverage = BTreeSet::new();
     let mut uniform_coverage = BTreeSet::new();
@@ -1133,7 +1129,7 @@ fn run_trace(args: &[String]) -> io::Result<()> {
             })
             .collect()
     };
-    let node = parse_u64_flag(args, "--node").map(NodeId::new);
+    let node = parse_u64_flag(args, "--node")?.map(NodeId::new);
     let kinds = parse_string_flag(args, "--kind")
         .map(|value| value.split(',').map(str::to_owned).collect::<BTreeSet<_>>())
         .unwrap_or_default();
@@ -1149,7 +1145,7 @@ fn run_trace(args: &[String]) -> io::Result<()> {
         .map(|value| parse_trace_needle(&value))
         .transpose()?;
     let tail =
-        parse_u64_flag(args, "--tail").map(|value| usize::try_from(value).unwrap_or(usize::MAX));
+        parse_u64_flag(args, "--tail")?.map(|value| usize::try_from(value).unwrap_or(usize::MAX));
     let mut rows = VecDeque::new();
     let mut row_bytes = 0_usize;
     const MAX_TAIL_BYTES: usize = 8 * 1024 * 1024;
@@ -1592,8 +1588,8 @@ fn run_proxy(args: &[String]) -> io::Result<()> {
         parse_string_flag(args, "--listen").unwrap_or_else(|| String::from("127.0.0.1:7379"));
     let upstream =
         parse_string_flag(args, "--upstream").unwrap_or_else(|| String::from("127.0.0.1:7101"));
-    let drop_every = parse_u64_flag(args, "--drop-every").unwrap_or(0);
-    let delay_ms = parse_u64_flag(args, "--delay-ms").unwrap_or(0);
+    let drop_every = parse_u64_flag(args, "--drop-every")?.unwrap_or(0);
+    let delay_ms = parse_u64_flag(args, "--delay-ms")?.unwrap_or(0);
     let listener = TcpListener::bind(&listen)?;
     println!(
         "cc-swarm proxy listening={listen} upstream={upstream} drop_every={drop_every} delay_ms={delay_ms}"
@@ -1685,8 +1681,8 @@ fn selfcheck_cluster(seed: Seed) -> Result<(), &'static str> {
 }
 
 fn run_one(args: &[String]) -> io::Result<()> {
-    let seed = parse_seed(args, 0);
-    let profile = parse_profile(args, FaultProfile::Calm);
+    let seed = parse_seed(args, 0)?;
+    let profile = parse_profile(args, FaultProfile::Calm)?;
     let disk_profile = load_disk_profile(args)?;
     let mut spec = fixture_spec(seed, profile, false);
     apply_loaded_disk_profile(&mut spec, disk_profile.as_ref());
@@ -1709,10 +1705,10 @@ fn run_one(args: &[String]) -> io::Result<()> {
 
 fn run_campaign(args: &[String]) -> io::Result<()> {
     let started_unix_ms = unix_time_ms()?;
-    let seeds = parse_u64_flag(args, "--seeds").unwrap_or(1);
-    let profile = parse_profile(args, FaultProfile::Rough);
+    let seeds = parse_u64_flag(args, "--seeds")?.unwrap_or(1);
+    let profile = parse_profile(args, FaultProfile::Rough)?;
     let shard = parse_shard(args)?;
-    let jobs = parse_u64_flag(args, "--jobs").unwrap_or(1).max(1);
+    let jobs = parse_u64_flag(args, "--jobs")?.unwrap_or(1).max(1);
     let ledger_path = parse_string_flag(args, "--ledger");
     let build_label = parse_string_flag(args, "--build").unwrap_or_else(|| String::from("dev"));
     let disk_profile = load_disk_profile(args)?;
@@ -2508,27 +2504,75 @@ fn verdict_name(verdict: &Verdict) -> &'static str {
     }
 }
 
-fn parse_profile(args: &[String], default: FaultProfile) -> FaultProfile {
-    parse_string_flag(args, "--profile")
-        .as_deref()
-        .and_then(FaultProfile::parse)
-        .unwrap_or(default)
+// A malformed value is an error, never a silent fall back to the default. The
+// whole harness sells reproducibility: `--seed 0xdeadbeef` typed as `--seed
+// 0xdeadbeff` must not quietly run seed 0 and report a green verdict, and
+// `--profile brutal` typed as `--profile brutl` must not quietly run `calm`.
+// A flag that is absent still takes its default; only a flag that is present
+// and unreadable stops the run.
+
+fn parse_profile(args: &[String], default: FaultProfile) -> io::Result<FaultProfile> {
+    let Some(value) = parse_string_flag(args, "--profile") else {
+        return Ok(default);
+    };
+    FaultProfile::parse(&value).ok_or_else(|| {
+        let names: Vec<&str> = FaultProfile::ALL.iter().map(|p| p.as_str()).collect();
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unknown --profile {value}; expected one of {}",
+                names.join(", ")
+            ),
+        )
+    })
 }
 
-fn parse_seed(args: &[String], default: u64) -> Seed {
-    parse_string_flag(args, "--seed")
-        .and_then(|value| parse_seed_text(&value))
-        .unwrap_or_else(|| Seed::new(default))
+fn parse_seed(args: &[String], default: u64) -> io::Result<Seed> {
+    let Some(value) = parse_string_flag(args, "--seed") else {
+        return Ok(Seed::new(default));
+    };
+    parse_seed_text(&value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--seed {value} is not a hexadecimal u64"),
+        )
+    })
 }
 
-fn parse_u64(args: &[String], position: usize, default: u64) -> u64 {
-    args.get(position)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+fn parse_u64(args: &[String], position: usize, default: u64) -> io::Result<u64> {
+    let Some(value) = args.get(position) else {
+        return Ok(default);
+    };
+    value.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("expected an unsigned integer, got {value}"),
+        )
+    })
 }
 
-fn parse_u64_flag(args: &[String], flag: &str) -> Option<u64> {
-    parse_string_flag(args, flag).and_then(|value| value.parse().ok())
+fn parse_u64_flag(args: &[String], flag: &str) -> io::Result<Option<u64>> {
+    let Some(value) = parse_string_flag(args, flag) else {
+        return Ok(None);
+    };
+    value.parse().map(Some).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{flag} requires an unsigned integer, got {value}"),
+        )
+    })
+}
+
+fn parse_usize_flag(args: &[String], flag: &str, default: usize) -> io::Result<usize> {
+    let Some(value) = parse_u64_flag(args, flag)? else {
+        return Ok(default);
+    };
+    usize::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{flag} value {value} does not fit this platform's usize"),
+        )
+    })
 }
 
 fn load_disk_profile(args: &[String]) -> io::Result<Option<(String, DiskModel)>> {
@@ -2631,18 +2675,26 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|value| value == flag)
 }
 
+/// Escape one JSON string body. Receipts carry operator-supplied build labels
+/// and paths and formatted error text, so every control character has to be
+/// escaped, not just the three with short forms — one stray control byte in an
+/// error message would otherwise make a receipt unparseable.
 fn json_escape(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|character| match character {
-            '"' => ['\\', '"'].into_iter().collect::<Vec<_>>(),
-            '\\' => ['\\', '\\'].into_iter().collect::<Vec<_>>(),
-            '\n' => ['\\', 'n'].into_iter().collect::<Vec<_>>(),
-            '\r' => ['\\', 'r'].into_iter().collect::<Vec<_>>(),
-            '\t' => ['\\', 't'].into_iter().collect::<Vec<_>>(),
-            other => [other].into_iter().collect::<Vec<_>>(),
-        })
-        .collect()
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            control if control.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 fn print_help() {
@@ -2925,5 +2977,57 @@ mod trace_tests {
         .expect_err("metadata mismatch must fail before driver boot");
         assert!(error.to_string().contains("metadata disagrees"));
         fs::remove_file(path).expect("remove journal");
+    }
+
+    #[test]
+    fn trap_unreadable_flag_values_stop_the_run_instead_of_defaulting() {
+        let arg = |value: &str| String::from(value);
+
+        // A misspelt profile must not silently select the default. Reporting
+        // `profile=calm verdict=ok` for a run the operator asked to be
+        // `brutal` would turn a typo into a false claim.
+        let args = [arg("--profile"), arg("brutl")];
+        let error = parse_profile(&args, FaultProfile::Calm).expect_err("typo must not default");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("brutl"));
+        assert!(
+            error.to_string().contains("brutal"),
+            "names the alternatives"
+        );
+
+        // A seed is the whole reproduction handle; a value that does not parse
+        // must never become seed 0.
+        let args = [arg("--seed"), arg("nothex")];
+        let error = parse_seed(&args, 0).expect_err("typo must not default");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        // A model-check bound that fails to parse would silently shrink the
+        // explored state space and still print PASS.
+        let args = [arg("--max-log"), arg("abc")];
+        let error = parse_u64_flag(&args, "--max-log").expect_err("typo must not default");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let error = parse_usize_flag(&args, "--max-log", 4).expect_err("typo must not default");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let args = [arg("run"), arg("nine")];
+        let error = parse_u64(&args, 1, 1_000).expect_err("typo must not default");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        // An absent flag still takes its default.
+        let empty: [String; 0] = [];
+        assert_eq!(
+            parse_profile(&empty, FaultProfile::Rough).expect("absent flag"),
+            FaultProfile::Rough
+        );
+        assert_eq!(parse_seed(&empty, 7).expect("absent flag"), Seed::new(7));
+        assert_eq!(
+            parse_u64_flag(&empty, "--max-log").expect("absent flag"),
+            None
+        );
+        assert_eq!(
+            parse_usize_flag(&empty, "--max-log", 4).expect("absent flag"),
+            4
+        );
+        assert_eq!(parse_u64(&empty, 1, 1_000).expect("absent flag"), 1_000);
     }
 }

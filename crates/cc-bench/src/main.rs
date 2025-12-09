@@ -125,10 +125,19 @@ fn main() -> io::Result<()> {
 }
 
 fn parse_options(args: &[String]) -> io::Result<Options> {
-    let workload = flag(args, "--workload")
-        .as_deref()
-        .and_then(Workload::parse)
-        .unwrap_or(Workload::A);
+    // A misspelt workload is an error, not workload A. The config hash that
+    // labels every published number is derived from this value, so silently
+    // substituting the default would attribute one workload's numbers to
+    // another.
+    let workload = match flag(args, "--workload") {
+        Some(value) => Workload::parse(&value).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown --workload {value}; expected one of A, B, C, W, CAS, SCAN"),
+            )
+        })?,
+        None => Workload::A,
+    };
     let clients = number_flag(args, "--clients", 1)?;
     let ops = number_flag(args, "--ops", 10_000)?;
     let seed = number_flag(args, "--seed", 0x00cc_b001)?;

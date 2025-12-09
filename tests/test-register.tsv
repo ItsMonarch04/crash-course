@@ -422,6 +422,7 @@ N4	NG4	cargo-lib	cc-sim	trap_data_directory_quota_counts_live_temp_and_staging_b
 N4	NG4	cargo-lib	cc-sim	trap_disk_quota_counts_snapshot_staging	Disk quota counts snapshot staging	green
 N10	NG10	cargo-lib	cc-sim	trap_follower_and_stale_workloads_route_reads_explicitly	Follower and stale workloads emit explicit non-leader reads	green
 N10	NG10	cargo-lib	cc-sim	trap_new_profiles_parse_and_select_workload_kind	Batch, follower-read, and stale-read profiles parse and select workload kind	green
+-	-	cargo-lib	cc-sim	trap_profile_all_round_trips_every_variant	Every fault profile appears in ALL and round-trips through parse/as_str	green
 -	-	cargo-lib	cc-sim	trap_rename_is_not_durable_until_the_directory_is_synced	Rename is not durable until the directory is synced	green
 N4	NG4	cargo-lib	cc-sim	trap_snapshot_install_is_atomic_across_crash	Snapshot install is atomic across crash	green
 -	-	cargo-lib	cc-sim	wipe_profile_plans_are_survivable_500k	Wipe profile plans are survivable 500k	green
@@ -557,6 +558,7 @@ C0	C0	cargo-bin	cc-swarm	trap_trace_reads_legacy_cctr_fixture	A 2c733f3 CCTR tra
 N5	NG5	cargo-bin	cc-swarm	trap_trace_rejects_malformed_length_at_offset	Trace rejects malformed length at offset	green
 N5	NG5	cargo-bin	cc-swarm	trap_trace_unknown_event_is_skippable	Trace unknown event is skippable	green
 N2	NG2	cargo-lib	cc-swarm	trap_truncated_frame_is_rejected_before_allocation	Truncated CCPF frames never reach the Raft decoder	green
+-	-	cargo-bin	cc-swarm	trap_unreadable_flag_values_stop_the_run_instead_of_defaulting	A misspelt --profile, --seed, or numeric bound fails instead of silently taking the default	green
 N2	NG2	cargo-lib	cc-swarm	trap_valid_frame_decode_failure_is_an_invariant	Unexpected valid-outer CCRP decode failures stop the simulator	green
 N6	NG6	cargo-lib	cc-swarm	trap_wall_time_difference_cannot_create_seed_conflict	Wall time difference cannot create seed conflict	green
 N1	NG1	cargo-lib	cc-swarm	trap_wipe_has_no_out_of_band_state_copy	Wiped simulator node catches up without an out-of-band state copy	green

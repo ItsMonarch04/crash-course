@@ -116,9 +116,15 @@ fn init_cluster(args: &[String]) -> io::Result<()> {
         );
         return Ok(());
     }
-    let nodes = flag(args, "--nodes")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(3);
+    let nodes = match flag(args, "--nodes") {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "init --nodes must be an unsigned integer",
+            )
+        })?,
+        None => 3,
+    };
     if nodes == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1469,7 +1475,19 @@ fn marked_checkpoint(
     validate_identity(&config)?;
     let identity = DiskIdentity::decode(&fs::read(identity_path(data_dir))?)?;
     let wal_path = data_dir.join("raft/wal.0");
-    let wal = fs::read(&wal_path)?;
+    // A bare `?` here reported `No such file or directory` with no path and no
+    // reason, which is what an operator following the runbook sees first: a
+    // freshly initialised directory has no WAL yet, and therefore no durable
+    // checkpoint to export.
+    let wal = fs::read(&wal_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot read the Raft WAL at {}: {error}; a data directory that has not run yet has no durable checkpoint to back up",
+                wal_path.display()
+            ),
+        )
+    })?;
     let recovered = cc_log::recover_framed_record_stream(&wal).map_err(io::Error::other)?;
     if recovered.torn_tail_truncated || recovered.bytes_consumed != wal.len() as u64 {
         return Err(io::Error::new(
@@ -1591,7 +1609,15 @@ fn restore_backup(
             "restore target must not exist",
         ));
     }
-    let input_metadata = fs::symlink_metadata(input)?;
+    let input_metadata = fs::symlink_metadata(input).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot read the backup archive at {}: {error}",
+                input.display()
+            ),
+        )
+    })?;
     if !input_metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

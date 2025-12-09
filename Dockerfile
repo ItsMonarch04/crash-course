@@ -1,6 +1,7 @@
-# `rust-toolchain.toml` pins the channel to stable, so rustup governs which
-# compiler actually runs. A specific version in this tag would be decoration:
-# it would be overridden on the first cargo invocation.
+# `rust-toolchain.toml` pins an exact compiler version, and rustup honours it
+# on the first cargo invocation — downloading that toolchain if the base image
+# ships a different one. Pinning a version in this tag too would be decoration:
+# it would be overridden anyway, and could drift from the real pin.
 FROM rust:bookworm AS build
 WORKDIR /src
 COPY . .

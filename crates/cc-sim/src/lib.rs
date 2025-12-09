@@ -1030,6 +1030,25 @@ pub enum FaultProfile {
 }
 
 impl FaultProfile {
+    /// Every profile, in declaration order. Callers use this to print the
+    /// accepted set when a name fails to parse, so a typo names its
+    /// alternatives instead of silently selecting a default profile.
+    pub const ALL: [Self; 13] = [
+        Self::Calm,
+        Self::Gentle,
+        Self::Rough,
+        Self::Brutal,
+        Self::Membership,
+        Self::Corruption,
+        Self::Wipe,
+        Self::Starve,
+        Self::Ttl,
+        Self::Batch,
+        Self::FollowerRead,
+        Self::FollowerReadV2,
+        Self::StaleRead,
+    ];
+
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
@@ -1727,6 +1746,28 @@ mod workload_tests {
             FaultProfile::StaleRead.workload_kind(),
             WorkloadKind::StaleRead
         );
+    }
+
+    #[test]
+    fn trap_profile_all_round_trips_every_variant() {
+        // `ALL` is what the CLI prints when a profile name fails to parse. A
+        // profile missing from it would be undiscoverable from the error
+        // message, and a name that does not round-trip would be unusable.
+        for profile in FaultProfile::ALL {
+            assert_eq!(
+                FaultProfile::parse(profile.as_str()),
+                Some(profile),
+                "{} does not round-trip through parse/as_str",
+                profile.as_str()
+            );
+        }
+        let names: BTreeSet<&str> = FaultProfile::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            FaultProfile::ALL.len(),
+            "two profiles share a name"
+        );
+        assert_eq!(FaultProfile::parse("no-such-profile"), None);
     }
 }
 

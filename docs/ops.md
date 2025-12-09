@@ -53,8 +53,14 @@ cargo run -p cc-node --bin ccdb -- selfcheck --data-dir /tmp/ccdb-demo/n1
 cargo run -p cc-node --bin ccdb -- selfcheck --deep --data-dir /tmp/ccdb-demo/n1
 cargo run -p cc-node --bin ccdb -- doctor --data-dir /tmp/ccdb-demo/n1
 cargo run -p cc-node --bin ccdb -- admin backup --data-dir /tmp/ccdb-demo/n1 --output /tmp/n1.ccbk
-cargo run -p cc-node --bin ccdb -- admin restore --input /tmp/n1.ccbk --data-dir /tmp/ccdb-restored/n1
+cargo run -p cc-node --bin ccdb -- admin restore --input /tmp/n1.ccbk --data-dir /tmp/ccdb-restored/n1 --new-cluster-id 11112233445566778899aabbccddeeff --new-node-id 1
 ```
+
+`backup` exports the one CCSN file named by a durable snapshot mark, so a data
+directory that has never run has nothing to export. `restore` always writes a
+fresh identity — the new cluster id and node id are required, never inherited
+from the archive — because this is fresh-cluster recovery, not an in-place
+restore of the source cluster.
 
 For a compact deterministic receipt from one real-host run, provide a new
 record path and replay it through the same shared Driver:

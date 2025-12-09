@@ -353,10 +353,16 @@ pub(crate) fn peer_probe(args: &[String]) -> io::Result<()> {
         )
     })?;
     let config = read_config(Path::new(&config_path))?;
-    let retries = super::flag(args, "--retries")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(5)
-        .max(1);
+    let retries = match super::flag(args, "--retries") {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--retries must be an unsigned integer",
+            )
+        })?,
+        None => 5,
+    }
+    .max(1);
     let mut delay = StdDuration::from_millis(20);
     for attempt in 1..=retries {
         match TcpStream::connect(&address) {
