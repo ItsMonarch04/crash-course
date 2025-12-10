@@ -22,6 +22,13 @@ if ! rg -qF "kata features are mutually exclusive" "$pair_log"; then
   exit 1
 fi
 
+# Each kata build is linted too. A kata arm that only compiles under `cargo
+# test` can rot unnoticed: the default build never sees it, so nothing else in
+# CI would catch a warning or a type error introduced by a refactor.
+for pair in cc-raft:kata01 cc-raft:kata02 cc-host:kata03 cc-store:kata04 cc-cluster:kata05; do
+  cargo clippy -p "${pair%%:*}" --all-targets --features "${pair##*:}" -- -D warnings
+done
+
 cargo test -p cc-raft --features kata01 trap_kata_01_commit_quorum_is_found_within_budget
 cargo test -p cc-raft --features kata02 trap_kata_02_wrong_timer_reset_is_found_within_budget
 cargo test -p cc-host --features kata03 trap_kata_03_ack_before_fsync_is_found_within_budget

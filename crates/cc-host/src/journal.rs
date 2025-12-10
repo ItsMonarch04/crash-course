@@ -744,8 +744,13 @@ pub fn replay_journal(journal: &InputJournal) -> Result<JournalReplay, JournalRe
 
     for record in &journal.records {
         let mut blocks = ReplayBlockSource::new(record.block_observations.clone());
+        // Every journalled transition was one the host had already admitted,
+        // including the ones it took off its own queue after a durability
+        // barrier. Replaying through the plain `deliver` door refused those,
+        // so an ordinary queued client request that found the node no longer
+        // leader made the whole journal unreplayable.
         let (_poll, actual) = driver
-            .deliver(record.now, record.input.clone(), &mut blocks)
+            .deliver_admitted(record.now, record.input.clone(), &mut blocks)
             .map_err(|error| JournalReplayError::Driver {
                 ordinal: record.ordinal,
                 error,

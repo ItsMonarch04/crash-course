@@ -1315,31 +1315,54 @@ impl Driver {
             .or_else(|| self.pending_client_inputs.pop_front())
             .map(|pending| pending.input);
         match input {
-            Some(input) => match self.deliver(now, input.clone(), blocks) {
-                Ok((poll, effects)) => Ok((Some(input), poll, effects)),
-                Err(
-                    HostError::Node(NodeError::NotLeader | NodeError::FeatureDisabled)
-                    | HostError::Node(NodeError::Kv(cc_kv::KvError::Busy)),
-                ) if matches!(&input, Input::ClientRequest { .. }) => {
-                    let (client, req) = match &input {
-                        Input::ClientRequest { client, req, .. } => (*client, *req),
-                        _ => unreachable!("guarded client request"),
-                    };
-                    Ok((
-                        Some(input),
-                        DriverPoll::Ready,
-                        vec![Effect::ClientReply {
-                            client,
-                            req,
-                            reply: encode_client_reply(&cc_kv::KvReply::Error(
-                                cc_kv::KvError::Busy,
-                            )),
-                        }],
-                    ))
-                }
-                Err(error) => Err(error),
-            },
+            Some(input) => {
+                let (poll, effects) = self.deliver_admitted(now, input.clone(), blocks)?;
+                Ok((Some(input), poll, effects))
+            }
             None => Ok((None, DriverPoll::Ready, Vec::new())),
+        }
+    }
+
+    /// Deliver one input that the host already admitted, rather than one it is
+    /// deciding whether to accept.
+    ///
+    /// The difference is the client contract. A request the host is still
+    /// deciding on can be refused, and the adapter turns `NotLeader` into a
+    /// redirect. A request that was queued behind a durability barrier has
+    /// already been accepted, so the same condition has to become a `Busy`
+    /// reply the client can retry.
+    ///
+    /// Recorders journal the queued transition, so the replayer has to admit
+    /// inputs through this same door. It did not, and the consequence was not
+    /// theoretical: any run where a client request waited behind an fsync and
+    /// then found the node was no longer leader produced a journal whose
+    /// replay stopped with `Node(NotLeader)` on a record that had been
+    /// recorded as a perfectly ordinary reply.
+    pub fn deliver_admitted(
+        &mut self,
+        now: Time,
+        input: Input,
+        blocks: &mut dyn BlockSource,
+    ) -> Result<(DriverPoll, Vec<Effect>), HostError> {
+        match self.deliver(now, input.clone(), blocks) {
+            Ok(result) => Ok(result),
+            Err(
+                HostError::Node(NodeError::NotLeader | NodeError::FeatureDisabled)
+                | HostError::Node(NodeError::Kv(cc_kv::KvError::Busy)),
+            ) if matches!(&input, Input::ClientRequest { .. }) => {
+                let Input::ClientRequest { client, req, .. } = input else {
+                    unreachable!("guarded client request")
+                };
+                Ok((
+                    DriverPoll::Ready,
+                    vec![Effect::ClientReply {
+                        client,
+                        req,
+                        reply: encode_client_reply(&cc_kv::KvReply::Error(cc_kv::KvError::Busy)),
+                    }],
+                ))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1513,18 +1536,18 @@ impl Driver {
         };
         match (stage, result) {
             (IoStage::Write { file, len }, IoResult::Written { len: actual }) if len == actual => {
-                #[cfg(feature = "kata03")]
-                {
-                    let _ = file;
+                // Written as a `cfg!` condition rather than two `#[cfg]`
+                // blocks so both arms type-check and lint under either
+                // feature selection; the condition still folds at compile
+                // time, so the default build has no fsync-skipping path.
+                if cfg!(feature = "kata03") {
                     // Synthetic teaching defect: publish the continuation
                     // after write completion without an fsync acknowledgement.
                     let effects = self
                         .node
                         .on_input(cc_cluster::NodeInput::Persisted { success: true })?;
-                    return Ok((DriverPoll::Ready, self.translate(effects)?));
-                }
-                #[cfg(not(feature = "kata03"))]
-                {
+                    Ok((DriverPoll::Ready, self.translate(effects)?))
+                } else {
                     let fsync_id = self.allocate_io()?;
                     self.pending_io.insert(fsync_id, IoStage::Fsync { file });
                     Ok((
@@ -4480,6 +4503,51 @@ mod tests {
             "the 32-byte route envelope plus command must be reserved first"
         );
         assert_eq!(driver.footprint().pending_input_bytes, 0);
+    }
+
+    #[test]
+    fn trap_admitted_and_replayed_client_requests_take_the_same_door() {
+        // A queued client request that finds the node is not the leader is
+        // answered `Busy`, and the recorder journals that transition. Replay
+        // has to admit it the same way; when it used the plain `deliver` door
+        // instead, an ordinary run — a request waiting behind an fsync while
+        // leadership sat elsewhere — produced a journal that stopped replaying
+        // partway through with `Node(NotLeader)`.
+        let mut driver = driver();
+        let mut blocks = MemoryBlockSource::default();
+        let request = Input::ClientRequest {
+            client: ClientId::new(1),
+            req: RequestSeq::new(1),
+            session: None,
+            command: vec![7; 4],
+        };
+        assert_eq!(
+            driver
+                .deliver(Time::from_nanos(1), request.clone(), &mut blocks)
+                .expect_err("an unaccepted request is refused so the adapter can redirect"),
+            HostError::Node(NodeError::NotLeader)
+        );
+        let (_, admitted) = driver
+            .deliver_admitted(Time::from_nanos(2), request.clone(), &mut blocks)
+            .expect("an already-accepted request is answered, not refused");
+        assert!(
+            matches!(
+                admitted.as_slice(),
+                [Effect::ClientReply { client, req, .. }]
+                    if *client == ClientId::new(1) && *req == RequestSeq::new(1)
+            ),
+            "the accepted request gets a retryable reply: {admitted:?}"
+        );
+
+        driver.enqueue(request).expect("admission");
+        let (queued, _, drained) = driver
+            .deliver_next_with_input(Time::from_nanos(3), &mut blocks)
+            .expect("draining an admitted request is not a host error");
+        assert!(queued.is_some());
+        assert_eq!(
+            drained, admitted,
+            "the drain path and the replay path must agree byte for byte"
+        );
     }
 
     #[test]

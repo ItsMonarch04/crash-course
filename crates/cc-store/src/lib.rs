@@ -464,20 +464,14 @@ pub fn may_drop_tombstone(
     reaches_bottom_for_key: bool,
     unselected_lower_range_may_contain_key: bool,
 ) -> bool {
-    #[cfg(feature = "kata04")]
-    {
-        let _ = reaches_bottom_for_key;
-        // Synthetic teaching defect: ignore whether the compaction reaches
-        // the bottom of the key's overlap closure.
-        return oldest_snapshot.is_none_or(|snapshot| tombstone_sequence < snapshot)
-            && !unselected_lower_range_may_contain_key;
-    }
-    #[cfg(not(feature = "kata04"))]
-    {
-        oldest_snapshot.is_none_or(|snapshot| tombstone_sequence < snapshot)
-            && reaches_bottom_for_key
-            && !unselected_lower_range_may_contain_key
-    }
+    // Synthetic teaching defect under `kata04`: ignore whether the compaction
+    // reaches the bottom of the key's overlap closure. Written as a `cfg!`
+    // condition rather than two `#[cfg]` blocks so both arms type-check and
+    // lint under either feature selection.
+    let reaches_bottom_for_key = cfg!(feature = "kata04") || reaches_bottom_for_key;
+    oldest_snapshot.is_none_or(|snapshot| tombstone_sequence < snapshot)
+        && reaches_bottom_for_key
+        && !unselected_lower_range_may_contain_key
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

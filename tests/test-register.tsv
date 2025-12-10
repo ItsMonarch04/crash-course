@@ -154,6 +154,7 @@ N2	NG2	cargo-lib	cc-env	trap_peer_hello_rejects_missing_required_feature	Peer he
 N2	NG2	cargo-lib	cc-env	trap_peer_hello_requires_version_overlap	Peer hello requires a version overlap	green
 N7	NG7	cargo-lib	cc-env	trap_rolling_upgrade_rejects_cluster_policy_drift	Rolling upgrade rejects cluster policy drift	green
 N7	NG7	cargo-lib	cc-env	trap_unsupported_feature_is_never_silently_downgraded	Unsupported feature is never silently downgraded	green
+-	-	cargo-lib	cc-host	trap_admitted_and_replayed_client_requests_take_the_same_door	A queued client request is answered the same way whether the host drains it or the replayer admits it	green
 N1	NG1	cargo-lib	cc-host	trap_bounded_peer_queue_drops_instead_of_blocking_consensus	Bounded peer queue drops instead of blocking consensus	green
 N1	NG1	cargo-lib	cc-host	trap_capped_journal_never_claims_complete	A capped journal is marked as a replayable prefix	green
 -	-	cargo-lib	cc-host	trap_competing_snapshot_rejection_is_canonical_after_progress	Competing snapshot rejection is canonical after progress	green
