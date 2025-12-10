@@ -1823,22 +1823,82 @@ fn has_intervening_mutation(
 ) -> bool {
     history.operations.iter().any(|operation| {
         operation.id != excluded_id
-            && operation.kind.key() == key
-            && is_successful_mutation(operation)
+            && may_have_mutated_key(operation, key)
             // Equal endpoints are concurrent under this history's strict
             // happens-before relation and can therefore linearize between the
             // two observations.  Exclude a mutation only when real time forces
             // it wholly before the left operation or wholly after the right.
             && operation.invoke <= right_complete
+            // An operation that never completed is still in flight at every
+            // later instant, so it is concurrent with anything from its
+            // invocation onwards.
             && operation
                 .complete
-                .is_some_and(|complete| complete >= left_invoke)
+                .is_none_or(|complete| complete >= left_invoke)
     })
 }
 
+/// Whether this operation *could* have mutated `key`, as far as the history
+/// says.
+///
+/// An unanswered request may still have been applied — that is what a client
+/// timeout means — so a linearization is free to place it anywhere at or after
+/// its invocation. Treating it as a no-op lets the session checker claim a
+/// read-your-writes violation on a history the linearizability checker just
+/// accepted, which is a contradiction between two checkers rather than a
+/// finding about the database.
+fn may_have_mutated_key(operation: &Operation, key: &[u8]) -> bool {
+    if matches!(operation.outcome, Outcome::Timeout) {
+        return mutating_kind_touches_key(&operation.kind, key);
+    }
+    mutates_key(operation, key)
+}
+
+fn mutating_kind_touches_key(kind: &OperationKind, key: &[u8]) -> bool {
+    match kind {
+        OperationKind::Batch { commands } => commands
+            .iter()
+            .any(|command| mutating_kind_touches_key(command, key)),
+        OperationKind::Set { .. }
+        | OperationKind::Del { .. }
+        | OperationKind::Incr { .. }
+        | OperationKind::Cas { .. } => kind.key() == key,
+        OperationKind::Get { .. } | OperationKind::Scan { .. } => false,
+    }
+}
+
+/// Whether this operation published a mutation of `key`.
+///
+/// A batch carries no key of its own, so a plain `kind.key() == key` test makes
+/// a committed `MULTI`/`EXEC` invisible to the per-key session relation. The
+/// session checker then sees a client's own write, then that client's later
+/// read of a value the batch wrote, concludes nothing intervened, and reports a
+/// read-your-writes violation against a history the linearizability checker
+/// accepted — a contradiction between two checkers where the history was fine.
+fn mutates_key(operation: &Operation, key: &[u8]) -> bool {
+    if let (OperationKind::Batch { commands }, Outcome::Batch { replies }) =
+        (&operation.kind, &operation.outcome)
+    {
+        // A batch is all-or-nothing, so reaching `Outcome::Batch` means every
+        // child landed; each child's own reply still decides whether it was a
+        // mutation, since a batch may contain reads or a failed compare.
+        return commands.iter().enumerate().any(|(index, command)| {
+            command.key() == key
+                && replies
+                    .get(index)
+                    .is_some_and(|reply| kind_outcome_is_mutation(command, reply))
+        });
+    }
+    operation.kind.key() == key && is_successful_mutation(operation)
+}
+
 fn is_successful_mutation(operation: &Operation) -> bool {
+    kind_outcome_is_mutation(&operation.kind, &operation.outcome)
+}
+
+fn kind_outcome_is_mutation(kind: &OperationKind, outcome: &Outcome) -> bool {
     matches!(
-        (&operation.kind, &operation.outcome),
+        (kind, outcome),
         (
             OperationKind::Set { .. } | OperationKind::Del { .. },
             Outcome::Ok
@@ -2166,15 +2226,36 @@ pub fn check_liveness(report: LivenessReport) -> InvariantReport {
 
 #[must_use]
 pub fn export_porcupine_json(history: &History) -> String {
+    // An operation whose reply never arrived may still have taken effect, so
+    // its invocation is exported with no completion — turning it into a `fail`
+    // would assert it did not happen and could make an illegal history look
+    // legal to the external checker.
+    //
+    // In this event encoding an invocation is paired with the next completion
+    // on the same process, so a client that keeps working after an
+    // indeterminate operation has to continue under a fresh process id.
+    // Otherwise its next reply would re-pair with the dangling call and the
+    // export would describe a history that never happened. This is the same
+    // reason Jepsen retires a process after an `:info` result.
+    let mut next_process = history
+        .operations
+        .iter()
+        .map(|operation| operation.client)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut process_of = BTreeMap::<u64, u64>::new();
     let mut output = String::from("[");
     let mut event_index = 0_usize;
     for operation in &history.operations {
+        let process = *process_of
+            .entry(operation.client)
+            .or_insert(operation.client);
         if event_index != 0 {
             output.push(',');
         }
         output.push_str(&format!(
-            "{{\"process\":{},\"type\":\"invoke\",\"value\":{},\"time\":{}}}",
-            operation.client,
+            "{{\"process\":{process},\"type\":\"invoke\",\"value\":{},\"time\":{}}}",
             operation_value(&operation.kind),
             operation.invoke.as_nanos()
         ));
@@ -2182,8 +2263,7 @@ pub fn export_porcupine_json(history: &History) -> String {
         if let Some(complete) = operation.complete {
             output.push(',');
             output.push_str(&format!(
-                "{{\"process\":{},\"type\":\"{}\",\"value\":{},\"time\":{}}}",
-                operation.client,
+                "{{\"process\":{process},\"type\":\"{}\",\"value\":{},\"time\":{}}}",
                 if operation.outcome == Outcome::Timeout {
                     "fail"
                 } else {
@@ -2193,6 +2273,9 @@ pub fn export_porcupine_json(history: &History) -> String {
                 complete.as_nanos()
             ));
             event_index += 1;
+        } else {
+            process_of.insert(operation.client, next_process);
+            next_process = next_process.saturating_add(1);
         }
     }
     output.push(']');
@@ -2266,23 +2349,31 @@ fn outcome_value(outcome: &Outcome) -> String {
     }
 }
 
+/// Encode arbitrary bytes as a JSON string, one escape per non-printable byte.
+///
+/// Keys and values are bytes, not text. The previous version ran them through
+/// `String::from_utf8_lossy` and emitted whatever came out — which meant two
+/// defects at once. Any byte below 0x20 other than tab/newline/return was
+/// written raw, and JSON forbids raw control characters in strings, so a
+/// random eight-byte value was usually enough to make the whole export
+/// unparseable: the Porcupine cross-check could never read a document at all.
+/// The lossy conversion also collapsed distinct non-UTF-8 values onto the same
+/// replacement character, so even a parseable export could have misrepresented
+/// the history. `\u00XX` escapes are valid JSON, lossless, and read back as one
+/// code point per byte.
 fn json_bytes(value: &[u8]) -> String {
-    let text = String::from_utf8_lossy(value);
-    format!("\"{}\"", json_escape(&text))
-}
-
-fn json_escape(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|character| match character {
-            '"' => ['\\', '"'].into_iter().collect::<Vec<_>>(),
-            '\\' => ['\\', '\\'].into_iter().collect::<Vec<_>>(),
-            '\n' => ['\\', 'n'].into_iter().collect::<Vec<_>>(),
-            '\r' => ['\\', 'r'].into_iter().collect::<Vec<_>>(),
-            '\t' => ['\\', 't'].into_iter().collect::<Vec<_>>(),
-            other => [other].into_iter().collect::<Vec<_>>(),
-        })
-        .collect()
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for &byte in value {
+        match byte {
+            b'"' => escaped.push_str("\\\""),
+            b'\\' => escaped.push_str("\\\\"),
+            0x20..=0x7e => escaped.push(char::from(byte)),
+            _ => escaped.push_str(&format!("\\u{byte:04x}")),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 impl fmt::Display for Verdict {
@@ -3347,6 +3438,153 @@ mod tests {
     }
 
     #[test]
+    fn trap_read_your_writes_violation_is_still_reported() {
+        // The counterweight to the two exemptions below. Nothing else in the
+        // history can explain the missing value, so the session checker must
+        // still name it; an exemption that swallowed this case would make the
+        // guarantee unfalsifiable.
+        let mut write = Operation::completed(
+            1,
+            OperationKind::Set {
+                key: b"k".to_vec(),
+                value: b"mine".to_vec(),
+            },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Ok,
+        );
+        write.client = 1;
+        write.sequence = 1;
+        let mut read = Operation::completed(
+            2,
+            OperationKind::Get { key: b"k".to_vec() },
+            Time::from_nanos(3),
+            Time::from_nanos(4),
+            Outcome::Value(None),
+        );
+        read.client = 1;
+        read.sequence = 2;
+        let history = History {
+            operations: vec![write, read],
+        };
+        let report = check_session_guarantees(&history);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.guarantee == SessionGuarantee::ReadYourWrites),
+            "an unexplained lost write is a read-your-writes violation"
+        );
+        assert!(
+            !cross_check_linearizable_sessions(&history, &Verdict::Linearizable { visited: 1 })
+                .is_ok(),
+            "and it contradicts a linearizable verdict"
+        );
+    }
+
+    #[test]
+    fn trap_another_clients_unanswered_write_is_not_assumed_absent() {
+        // Client 2's write never got a reply, so it may or may not have been
+        // applied; a linearization is free to place it between client 1's write
+        // and client 1's later read. Treating an unanswered write as a no-op
+        // makes the session checker contradict a linearizable verdict.
+        let mut write = Operation::completed(
+            1,
+            OperationKind::Set {
+                key: b"k".to_vec(),
+                value: b"mine".to_vec(),
+            },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Ok,
+        );
+        write.client = 1;
+        write.sequence = 1;
+        let mut unanswered = Operation::open(
+            2,
+            OperationKind::Set {
+                key: b"k".to_vec(),
+                value: b"theirs".to_vec(),
+            },
+            Time::from_nanos(3),
+        );
+        unanswered.client = 2;
+        unanswered.sequence = 1;
+        let mut read = Operation::completed(
+            3,
+            OperationKind::Get { key: b"k".to_vec() },
+            Time::from_nanos(5),
+            Time::from_nanos(6),
+            Outcome::Value(Some(b"theirs".to_vec())),
+        );
+        read.client = 1;
+        read.sequence = 2;
+        let history = History {
+            operations: vec![write, unanswered, read],
+        };
+        let verdict = check(&history, CheckerConfig::default());
+        assert!(
+            matches!(verdict, Verdict::Linearizable { .. }),
+            "the concurrent unanswered write makes this history linearizable: {verdict:?}"
+        );
+        assert!(
+            cross_check_linearizable_sessions(&history, &verdict).is_ok(),
+            "session cross-check must not contradict a linearizable verdict"
+        );
+    }
+
+    #[test]
+    fn trap_batch_mutation_is_visible_to_the_session_relation() {
+        // A batch carries no key of its own. If it is invisible to the per-key
+        // mutation relation, the client's own earlier write looks unobserved.
+        let mut write = Operation::completed(
+            1,
+            OperationKind::Set {
+                key: b"k".to_vec(),
+                value: b"first".to_vec(),
+            },
+            Time::from_nanos(1),
+            Time::from_nanos(2),
+            Outcome::Ok,
+        );
+        write.client = 1;
+        write.sequence = 1;
+        let mut batch = Operation::completed(
+            2,
+            OperationKind::Batch {
+                commands: vec![OperationKind::Set {
+                    key: b"k".to_vec(),
+                    value: b"second".to_vec(),
+                }],
+            },
+            Time::from_nanos(3),
+            Time::from_nanos(4),
+            Outcome::Batch {
+                replies: vec![Outcome::Ok],
+            },
+        );
+        batch.client = 2;
+        batch.sequence = 1;
+        let mut read = Operation::completed(
+            3,
+            OperationKind::Get { key: b"k".to_vec() },
+            Time::from_nanos(5),
+            Time::from_nanos(6),
+            Outcome::Value(Some(b"second".to_vec())),
+        );
+        read.client = 1;
+        read.sequence = 2;
+        let history = History {
+            operations: vec![write, batch, read],
+        };
+        assert!(
+            cross_check_linearizable_sessions(&history, &Verdict::Linearizable { visited: 1 })
+                .is_ok(),
+            "a committed batch write is an intervening mutation of its child key"
+        );
+    }
+
+    #[test]
     fn trap_session_crosscheck_excludes_stale_reads() {
         let mut write = Operation::completed(
             1,
@@ -3634,6 +3872,65 @@ mod tests {
         assert!(exported.contains("\"type\":\"invoke\""));
         assert!(exported.contains("\"type\":\"ok\""));
         assert!(exported.contains("[\"set\",\"a\",\"one\"]"));
+    }
+
+    #[test]
+    fn trap_porcupine_export_is_parseable_and_sequential_per_process() {
+        // Two defects lived here at once: arbitrary value bytes were written
+        // raw, so a control character made the whole document unparseable,
+        // and a client that continued after an indeterminate operation kept
+        // its process id, so its next reply would have re-paired with the
+        // dangling invocation.
+        let mut history = History::default();
+        let mut lost = Operation::open(
+            1,
+            OperationKind::Set {
+                key: b"k".to_vec(),
+                value: vec![0x00, 0x01, 0x1f, 0x22, 0x5c, 0xff],
+            },
+            Time::from_nanos(1),
+        );
+        lost.client = 3;
+        history.push(lost);
+        let mut later = Operation::completed(
+            2,
+            OperationKind::Get { key: b"k".to_vec() },
+            Time::from_nanos(3),
+            Time::from_nanos(4),
+            Outcome::Value(None),
+        );
+        later.client = 3;
+        history.push(later);
+        let exported = export_porcupine_json(&history);
+
+        assert!(
+            !exported.chars().any(char::is_control),
+            "a JSON string may not carry a raw control character: {exported}"
+        );
+        assert!(
+            exported.contains("\\u0000") && exported.contains("\\u00ff"),
+            "every byte is escaped losslessly: {exported}"
+        );
+
+        // The indeterminate operation keeps process 3; the client's next
+        // operation must not.
+        let invokes: Vec<&str> = exported.match_indices("\"type\":\"invoke\"").fold(
+            Vec::new(),
+            |mut found, (index, _)| {
+                found.push(&exported[..index]);
+                found
+            },
+        );
+        assert_eq!(invokes.len(), 2, "one invocation per operation");
+        assert_eq!(
+            exported.matches("\"process\":3").count(),
+            1,
+            "the retired process id is used exactly once: {exported}"
+        );
+        assert!(
+            exported.contains("\"process\":4"),
+            "the client continues under a fresh process id: {exported}"
+        );
     }
 
     #[test]

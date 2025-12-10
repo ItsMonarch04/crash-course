@@ -30,8 +30,8 @@ for spec in "0x0000000000000005:calm" "0x0000000000000071:membership" "0x0000000
 const fs = require("node:fs");
 const events = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 if (!Array.isArray(events) || events.length === 0) throw new Error("empty Porcupine export");
-if (events.length % 2 !== 0) throw new Error("every operation needs an invoke and a completion");
 const open = new Map();
+let invokes = 0;
 for (const event of events) {
   if (!Number.isInteger(event.process) || !["invoke", "ok", "fail"].includes(event.type)) {
     throw new Error(`invalid Porcupine event: ${JSON.stringify(event)}`);
@@ -39,8 +39,10 @@ for (const event of events) {
   if (!Number.isInteger(event.time) || !Object.hasOwn(event, "value")) {
     throw new Error(`incomplete Porcupine event: ${JSON.stringify(event)}`);
   }
-  // Porcupine pairs each invoke with the next completion on the same process.
+  // Porcupine pairs each invoke with the next completion on the same process,
+  // so a process may have at most one call outstanding.
   if (event.type === "invoke") {
+    invokes += 1;
     if (open.get(event.process)) throw new Error(`process ${event.process} invoked twice`);
     open.set(event.process, true);
   } else {
@@ -48,10 +50,15 @@ for (const event of events) {
     open.set(event.process, false);
   }
 }
-for (const [process, pending] of open) {
-  if (pending) throw new Error(`process ${process} never completed`);
+// A dangling invocation is the correct encoding for an operation whose reply
+// never arrived: it may still have taken effect, and Porcupine is expected to
+// consider both. What is not allowed is reusing that process id, which the
+// invoked-twice check above already rejects.
+const dangling = [...open.values()].filter(Boolean).length;
+if (invokes !== (events.length + dangling) / 2) {
+  throw new Error("event counts do not reconcile with the invocations");
 }
-console.log(events.length / 2);
+console.log(invokes);
 NODE
 )"
   total_operations=$((total_operations + operations))

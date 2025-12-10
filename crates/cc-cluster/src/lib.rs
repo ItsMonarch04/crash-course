@@ -3106,6 +3106,17 @@ impl Node {
             self.client_routes.clear();
             self.session_reservations.clear();
             self.logical_reservations.clear();
+            // A follower-read ReadIndex round belongs to the term that opened
+            // it, and only `ReadBarrierReady` closes it. A leader that steps
+            // down mid-round never sees that effect, so without this the
+            // round stays open forever: every later grant request is accepted
+            // into `pending_follower_grants` and silently queued behind a
+            // barrier that will never be answered, and follower reads stop
+            // completing for the rest of this node's life — including after it
+            // is elected again. Dropping the round makes the followers' reads
+            // fail closed, which is what they already retry on.
+            self.pending_follower_grants.clear();
+            self.follower_read_round_active = false;
         }
         Ok(output)
     }
@@ -4743,6 +4754,66 @@ mod tests {
             ),
             Err(NodeError::Environment("follower read capability unknown"))
         );
+    }
+
+    #[test]
+    fn trap_stepping_down_closes_an_open_follower_read_round() {
+        // Only `ReadBarrierReady` closes a follower-read ReadIndex round, and a
+        // leader that steps down never sees it. Leaving the round open wedges
+        // this node forever: `accept_follower_read_request` takes every later
+        // request into `pending_follower_grants` and returns without starting a
+        // barrier, so no follower read ever completes again — not even after
+        // this node is elected once more.
+        let voters: BTreeSet<NodeId> = [NodeId::new(1), NodeId::new(2)].into_iter().collect();
+        let mut leader = Node::new(config(1), voters).expect("leader");
+        leader.raft.hard_state.term = Term::new(1);
+        leader.raft.log.push(Entry {
+            term: Term::new(1),
+            index: LogIndex::new(1),
+            kind: cc_raft::EntryKind::Noop,
+            payload: Vec::new(),
+        });
+        leader.raft.commit_index = LogIndex::new(1);
+        leader.raft.applied_index = LogIndex::new(1);
+        leader.raft.role = Role::Leader;
+        leader.raft.leader_id = Some(NodeId::new(1));
+        leader
+            .observe_peer_capability(NodeId::new(2), SEMANTIC_VERSION_V3, FOLLOWER_READ_FEATURE)
+            .expect("capability");
+
+        leader
+            .accept_follower_read_request(NodeId::new(2), 9, 0x1234, Time::from_nanos(30))
+            .expect("grant request opens a round");
+        assert!(
+            leader.follower_read_round_active,
+            "a two-voter quorum cannot self-ack, so the round stays open"
+        );
+
+        // A higher term from the peer forces the step-down.
+        leader
+            .on_input(NodeInput::MessageAt {
+                now: Time::from_nanos(40),
+                message: Message {
+                    proto_version: cc_raft::PROTOCOL_VERSION,
+                    from: NodeId::new(2),
+                    to: NodeId::new(1),
+                    term: Term::new(2),
+                    kind: MessageKind::AppendReq(cc_raft::AppendRequest {
+                        prev_index: LogIndex::new(1),
+                        prev_term: Term::new(1),
+                        entries: Vec::new(),
+                        leader_commit: LogIndex::new(1),
+                        read_round: 0,
+                    }),
+                },
+            })
+            .expect("step down");
+        assert_ne!(leader.raft.role, Role::Leader, "the higher term wins");
+        assert!(
+            !leader.follower_read_round_active,
+            "the round belongs to the term that opened it"
+        );
+        assert!(leader.pending_follower_grants.is_empty());
     }
 
     #[test]

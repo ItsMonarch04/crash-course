@@ -11,7 +11,9 @@ phase	gate	harness	package	name	requirement	status
 -	-	cargo-lib	cc-checker	stale_read_is_rejected	Stale read is rejected	green
 -	-	cargo-lib	cc-checker	trace_and_liveness_reports_are_actionable	Trace and liveness reports are actionable	green
 -	-	cargo-lib	cc-checker	trap_anomaly_near_misses_remain_unclassified	Anomaly near misses remain unclassified	green
+-	-	cargo-lib	cc-checker	trap_another_clients_unanswered_write_is_not_assumed_absent	An unanswered write may still have landed, so it cannot make the session checker contradict a linearizable verdict	green
 -	-	cargo-lib	cc-checker	trap_batch_is_one_atomic_checker_transition	Batch is one atomic checker transition	green
+-	-	cargo-lib	cc-checker	trap_batch_mutation_is_visible_to_the_session_relation	A committed batch is an intervening mutation of every key its children wrote	green
 N0	NG0	cargo-lib	cc-checker	trap_chunk_cannot_claim_an_empty_initial_state	A chunk cannot claim an empty initial state	green
 N5	NG5	cargo-lib	cc-checker	trap_classifier_does_not_order_concurrent_operations	Anomaly classifier uses only certain real-time order	green
 N5	NG5	cargo-lib	cc-checker	trap_classifies_acked_write_lost	Classifies acked write lost	green
@@ -32,6 +34,8 @@ N5	NG5	cargo-lib	cc-checker	trap_linearizable_implies_session_guarantees	Lineari
 N5	NG5	cargo-lib	cc-checker	trap_minimal_witness_is_deterministic	Checker emits a deterministic minimal witness	green
 -	-	cargo-lib	cc-checker	trap_open_op_can_be_dropped_in_the_other_direction	Open op can be dropped in the other direction	green
 -	-	cargo-lib	cc-checker	trap_open_op_semantics_allows_timeout_to_take_effect	Open op semantics allows timeout to take effect	green
+-	-	cargo-lib	cc-checker	trap_porcupine_export_is_parseable_and_sequential_per_process	The Porcupine export is valid JSON for arbitrary value bytes and retires a process id after an indeterminate operation	green
+-	-	cargo-lib	cc-checker	trap_read_your_writes_violation_is_still_reported	A lost write with no possible intervening mutation is still named as a read-your-writes violation	green
 N0	NG0	cargo-lib	cc-checker	trap_real_history_detects_planted_lost_ack	Planted lost acknowledgements are rejected	green
 N0	NG0	cargo-lib	cc-checker	trap_resurrection_checker_flags_any_value_not_only_empty_bytes	Resurrection checker flags any value not only empty bytes	green
 N5	NG5	cargo-lib	cc-checker	trap_session_crosscheck_excludes_stale_reads	Session crosscheck excludes stale reads	green
@@ -107,6 +111,7 @@ N0	NG0	cargo-lib	cc-cluster	trap_same_sequence_different_command_never_mutates	S
 N4	NG4	cargo-lib	cc-cluster	trap_session_byte_limit_counts_request_and_reply	Session byte limit counts request and reply	green
 N4	NG4	cargo-lib	cc-cluster	trap_session_table_is_bounded	Session table is bounded	green
 -	-	cargo-lib	cc-cluster	trap_single_voter_election_still_waits_for_hard_state_fsync	Single voter election still waits for hard state fsync	green
+-	-	cargo-lib	cc-cluster	trap_stepping_down_closes_an_open_follower_read_round	A leader that steps down mid-ReadIndex closes the round instead of queueing follower reads forever	green
 N4	NG4	cargo-lib	cc-cluster	trap_uncommitted_log_is_bounded_under_partition	Uncommitted log is bounded under partition	green
 N1	NG1	cargo-lib	cc-cluster	trap_unknown_or_duplicate_io_completion_fails_closed	Unknown or duplicate persistence completions fail closed	green
 N0	NG0	cargo-lib	cc-cluster	trap_user_and_admin_entries_share_one_atomic_session_table	User and admin entries share one atomic session table	green
@@ -514,6 +519,7 @@ N4	NG4	cargo-lib	cc-swarm	trap_crash_discards_a_delayed_durability_continuation	
 N1	NG1	cargo-lib	cc-swarm	trap_crash_discards_volatile_state	Crash discards volatile simulator state	green
 N6	NG6	cargo-lib	cc-swarm	trap_declared_length_cannot_exceed_allocation_budget	Declared length cannot exceed allocation budget	green
 N11	NG11	cargo-lib	cc-swarm	trap_default_build_enables_no_kata	Default workspace builds enable no synthetic kata	green
+-	-	cargo-lib	cc-swarm	trap_deferred_input_retryable_error_is_not_a_run_failure	A retryable Raft condition reached on the deferred-input path is not a fatal run error	green
 N4	NG4	cargo-lib	cc-swarm	trap_enospc_fails_closed_before_a_vote_reply	ENOSPC suppresses a dependent vote reply and enters StorageFault	green
 N4	NG4	cargo-lib	cc-swarm	trap_enospc_never_loses_acked_writes	Enospc never loses acked writes	green
 N6	NG6	cargo-lib	cc-swarm	trap_every_decoder_is_in_the_fuzz_inventory	Every decoder is in the fuzz inventory	green
@@ -536,9 +542,11 @@ N6	NG6	cargo-lib	cc-swarm	trap_minimizer_reduces_a_planted_crash	Minimizer reduc
 N2	NG2	cargo-lib	cc-swarm	trap_network_byte_charge_releases_for_every_delivery_outcome	Network byte reservations release for delivery and horizon cancellation	green
 N6	NG6	cargo-lib	cc-swarm	trap_partial_final_line_is_discarded	Partial final line is discarded	green
 N2	NG2	cargo-lib	cc-swarm	trap_rechecksummed_malformed_ccrp_never_reaches_state_machine	Rechecksummed malformed CCRP never reaches the state machine	green
+-	-	cargo-lib	cc-swarm	trap_rejected_follower_read_does_not_consume_the_operation_budget	A withdrawn client attempt returns its slot in the run's bounded operation budget	green
 -	-	cargo-bin	cc-swarm	trap_replay_rejects_boot_metadata_mismatch	Replay rejects boot metadata mismatch	green
 N1	NG1	cargo-bin	cc-swarm	trap_replay_starts_from_captured_boot_image	Replay starts only from the captured boot image	green
 N2	NG2	cargo-lib	cc-swarm	trap_replayed_append_is_idempotent	Replayed Append frames are idempotent	green
+-	-	cargo-lib	cc-swarm	trap_replayed_corrupt_frame_is_a_drop_not_an_invariant	A replayed frame inherits the rejection its corruption fault made expected	green
 N1	NG1	cargo-lib	cc-swarm	trap_restart_recovers_hard_state_log_and_membership_from_disk	Restart recovers hard state, log, and membership from durable bytes	green
 N6	NG6	cargo-lib	cc-swarm	trap_resume_skips_only_prior_ok_by_default	Campaign resume skips only prior successful ledger rows	green
 N6	NG6	cargo-lib	cc-swarm	trap_shards_partition_seed_range_exactly	Shards partition seeds exactly once and validate bounds	green

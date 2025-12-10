@@ -1073,7 +1073,11 @@ pub struct SimCluster {
     frame_ordinals: BTreeMap<(NodeId, NodeId), u64>,
     frame_faults: BTreeMap<(NodeId, NodeId), Vec<FrameFault>>,
     replay_faults: BTreeMap<(NodeId, NodeId), Vec<ReplayFrameFault>>,
-    replay_frames: BTreeMap<(NodeId, NodeId), Vec<u8>>,
+    // The bytes last put on this link, and whether a fault made the receiver's
+    // rejection of them expected. A replay re-delivers exactly what was sent,
+    // so a duplicate of a corrupted frame must inherit that expectation
+    // instead of being read as a fresh, unexplained decode failure.
+    replay_frames: BTreeMap<(NodeId, NodeId), (Vec<u8>, bool)>,
     peak_replay_bytes: u64,
     nodes: BTreeMap<NodeId, NodeSlot>,
     pending: BTreeMap<u64, PendingOperation>,
@@ -1421,9 +1425,12 @@ impl SimCluster {
             .len(),
         )
         .unwrap_or(u64::MAX);
-        let replay_bytes = self.replay_frames.values().fold(0_u64, |total, frame| {
-            total.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX))
-        });
+        let replay_bytes = self
+            .replay_frames
+            .values()
+            .fold(0_u64, |total, (frame, _)| {
+                total.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX))
+            });
         let run_footprint = RunFootprint {
             network_inflight: Usage {
                 current: self.network.total_inflight_bytes(),
@@ -1640,10 +1647,23 @@ impl SimCluster {
                 self.handle_disk_sync_dir_complete(node, id)
             }
             ClusterEventKind::DeferredInput { node, input } => {
-                if self.is_up(node) {
-                    self.drive_node(node, input)
-                } else {
-                    Ok(())
+                if !self.is_up(node) {
+                    return Ok(());
+                }
+                match self.drive_node(node, input) {
+                    // `drive_node` defers an input when the node is mid
+                    // durability service, so this delivery happens later than
+                    // the caller that accepted it. By now a transient
+                    // condition can be true that was not: most often a fresh
+                    // leader whose current-term no-op is not yet committed, so
+                    // a read finds the barrier not ready. `issue_client`
+                    // already classifies those as retryable when it sees them
+                    // immediately; arriving on the deferred path must not turn
+                    // the same condition into a fatal run error. The request's
+                    // scheduled `ClientTimeout` records the unanswered attempt,
+                    // which is what a real client observes.
+                    Err(error) if is_retryable_client_error(&error) => Ok(()),
+                    other => other,
                 }
             }
             ClusterEventKind::DriverServiceComplete { node } => self.complete_driver_service(node),
@@ -1837,6 +1857,20 @@ impl SimCluster {
         );
     }
 
+    /// Give back the operation slot charged by `open_pending` for an attempt
+    /// that is being withdrawn and retried rather than answered.
+    ///
+    /// `MAX_OPERATIONS_PER_RUN` bounds the *history*, not the number of times a
+    /// client had to ask. A follower read fails closed whenever the leader is
+    /// unknown, incapable, or has changed term, and every one of those
+    /// rejections used to burn a slot: a partition during the follower-read
+    /// profile could exhaust all thirty-two slots without a single operation
+    /// reaching the history, and the bounded-liveness invariant then fired on a
+    /// run in which nothing had actually gone wrong.
+    fn refund_attempt(&mut self) {
+        self.total_issued = self.total_issued.saturating_sub(1);
+    }
+
     fn open_pending(
         &mut self,
         client: u64,
@@ -1902,6 +1936,7 @@ impl SimCluster {
             }
             Err(error) if is_retryable_client_error(&error) => {
                 self.pending.remove(&id);
+                self.refund_attempt();
                 self.retry_client(client, sequence, operation);
                 Ok(())
             }
@@ -1964,12 +1999,14 @@ impl SimCluster {
                     );
                     self.schedule_next(client);
                 } else {
+                    self.refund_attempt();
                     self.retry_client(client, sequence, operation);
                 }
                 Ok(())
             }
             Err(error) if is_retryable_host_error(&error) => {
                 self.pending.remove(&id);
+                self.refund_attempt();
                 self.retry_client(client, sequence, operation);
                 Ok(())
             }
@@ -2647,7 +2684,7 @@ impl SimCluster {
             .filter(|fault| fault.nth == ordinal)
             .map(|fault| fault.at)
             .collect();
-        if let Some(previous) = self.replay_frames.get(&(from, to)).cloned() {
+        if let Some((previous, previous_expected)) = self.replay_frames.get(&(from, to)).cloned() {
             for at in replay_at {
                 self.schedule(
                     at.max(self.now),
@@ -2656,15 +2693,19 @@ impl SimCluster {
                         to,
                         frame: previous.clone(),
                         charged: false,
-                        expected_rejection: false,
+                        expected_rejection: previous_expected,
                     },
                 );
             }
         }
-        self.replay_frames.insert((from, to), frame.clone());
-        let replay_bytes = self.replay_frames.values().fold(0_u64, |total, frame| {
-            total.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX))
-        });
+        self.replay_frames
+            .insert((from, to), (frame.clone(), expected_rejection));
+        let replay_bytes = self
+            .replay_frames
+            .values()
+            .fold(0_u64, |total, (frame, _)| {
+                total.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX))
+            });
         self.peak_replay_bytes = self.peak_replay_bytes.max(replay_bytes);
         if !self.is_up(from) || !self.is_up(to) {
             self.record(
@@ -4272,6 +4313,117 @@ mod tests {
     }
 
     #[test]
+    fn trap_replayed_corrupt_frame_is_a_drop_not_an_invariant() {
+        // A replay re-delivers whatever was last put on the link. When that
+        // frame was rechecksummed around a malformed CCRP body, its outer
+        // frame still decodes and the receiver still rejects the inner
+        // message — which is the expected outcome, not an unexplained decode
+        // failure. The corruption profile plans exactly this pair, and losing
+        // the expectation across the replay made every seed of that profile
+        // fail before a single event was recorded.
+        let spec = RunSpec::standard(Seed::new(0x7b), FaultProfile::Calm);
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        cluster
+            .handle_fault(FaultAction::MutateRaftAndRechecksum {
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                nth: 1,
+                mutation: CcrpMutation::MessageTag(99),
+            })
+            .expect("mutation fault");
+        cluster
+            .handle_fault(FaultAction::ReplayFrame {
+                from: NodeId::new(1),
+                to: NodeId::new(2),
+                nth: 2,
+                at: Time::from_nanos(3_000_000),
+            })
+            .expect("replay fault");
+        let vote = cc_raft::Message {
+            proto_version: cc_raft::PROTOCOL_VERSION,
+            from: NodeId::new(1),
+            to: NodeId::new(2),
+            term: cc_core::Term::new(1),
+            kind: cc_raft::MessageKind::VoteReq {
+                last_index: cc_core::LogIndex::new(0),
+                last_term: cc_core::Term::new(0),
+            },
+        };
+        cluster.send_message(vote.clone()).expect("mutated send");
+        cluster
+            .send_message(vote)
+            .expect("send that triggers the replay");
+        cluster
+            .process_until(Time::from_nanos(10_000_000))
+            .expect("a duplicate of a corrupted frame is dropped, not fatal");
+    }
+
+    #[test]
+    fn trap_deferred_input_retryable_error_is_not_a_run_failure() {
+        // `drive_node` postpones an input while the node is mid durability
+        // service, so the delivery happens after the caller that accepted it
+        // already returned. A transient Raft condition that `issue_client`
+        // classifies as retryable when it sees it immediately — no leader yet,
+        // or a fresh leader whose no-op is not committed — must not become a
+        // fatal run error just because it surfaced on the deferred path.
+        let spec = RunSpec::standard(Seed::new(0x5f), FaultProfile::Calm);
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        let node = NodeId::new(1);
+        let ready_at = cluster.now + Duration::from_millis(1);
+        cluster
+            .nodes
+            .get_mut(&node)
+            .expect("node slot")
+            .persistence_ready_at = Some(ready_at);
+        let read = Input::ClientRequest {
+            client: ClientId::new(1),
+            req: cc_core::RequestSeq::new(1),
+            session: None,
+            command: encode_command(&KvCommand::Get { key: b"k".to_vec() }),
+        };
+        cluster
+            .drive_node(node, read)
+            .expect("the input is postponed, not delivered");
+        cluster
+            .nodes
+            .get_mut(&node)
+            .expect("node slot")
+            .persistence_ready_at = None;
+        cluster
+            .process_until(ready_at + Duration::from_millis(1))
+            .expect("a retryable condition on the deferred path is not fatal");
+    }
+
+    #[test]
+    fn trap_rejected_follower_read_does_not_consume_the_operation_budget() {
+        // Nothing has been elected yet, so every follower read fails closed
+        // with an unknown leader and is withdrawn and retried. The run's
+        // bounded operation budget counts operations in the history, not
+        // attempts: charging withdrawn attempts let a partition exhaust all
+        // thirty-two slots without a single operation, and the bounded
+        // liveness invariant then fired on a healthy run.
+        let spec = RunSpec::standard(Seed::new(0x9d), FaultProfile::FollowerRead);
+        let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
+        for sequence in 1..=MAX_OPERATIONS_PER_RUN {
+            cluster
+                .handle_client_issue(
+                    1,
+                    sequence,
+                    WorkloadOperation::ReadFollower { key: b"k".to_vec() },
+                )
+                .expect("a fail-closed follower read is not a host error");
+        }
+        assert_eq!(
+            cluster.total_issued, 0,
+            "a withdrawn attempt must return its operation slot"
+        );
+        assert!(
+            cluster.history.operations.is_empty(),
+            "no attempt reached the history"
+        );
+    }
+
+    #[test]
     fn trap_replayed_append_is_idempotent() {
         let spec = RunSpec::standard(Seed::new(0x7c), FaultProfile::Calm);
         let mut cluster = SimCluster::new(spec, RecorderLevel::Gate).expect("cluster");
@@ -4380,10 +4532,14 @@ mod tests {
             },
         };
         cluster.send_message(message).expect("CCRP through CCPF");
-        let frame = cluster
+        let (frame, expected_rejection) = cluster
             .replay_frames
             .get(&(NodeId::new(1), NodeId::new(2)))
             .expect("the transport retains only frame bytes");
+        assert!(
+            !expected_rejection,
+            "an unfaulted frame is not expected to be rejected"
+        );
         let (outer, used) = decode_peer_frame(frame).expect("CCPF frame");
         assert_eq!(used, frame.len());
         assert!(cc_raft::codec::decode(&outer.payload).is_ok());
@@ -4430,7 +4586,7 @@ mod tests {
             .expect("delay fault");
         cluster
             .replay_frames
-            .insert((NodeId::new(1), NodeId::new(2)), vec![1, 2]);
+            .insert((NodeId::new(1), NodeId::new(2)), (vec![1, 2], false));
         cluster.handle_fault(FaultAction::Heal).expect("heal fault");
         assert!(cluster.frame_faults.is_empty());
         assert!(cluster.replay_faults.is_empty());

@@ -54,6 +54,13 @@ capability observations so a missing feature returns an error instead of a
 local linearizable read. `stale-read` records tagged local observations and
 checks them only against the reported applied watermark after TTL filtering.
 
+The `corruption` profile is the transport counterpart. It installs one corrupt
+frame, one truncated frame, one rechecksummed-but-malformed CCRP body, and one
+replay of a previously sent frame on the same directed link, so every decoder
+rejection path is reached in a single run. A replayed frame carries whatever
+bytes were last on the wire, so a duplicate of a corrupted frame is a modelled
+drop rather than a host invariant violation.
+
 Persistent storage faults are explicit scenario data as well: `EnospcFrom`
 rejects later space-growing writes, `DiskQuota` caps the simulated allocated
 bytes, and `BitRotAtRest` flips one byte immediately after its selected fsync.
