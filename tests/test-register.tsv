@@ -599,6 +599,7 @@ N9	NG9	cargo-lib	cc-wasm	trap_packet_loss_uses_the_effective_link_p16_value	Thea
 N9	NG9	cargo-lib	cc-wasm	trap_slow_disk_reports_the_effective_persistent_delay	Theater disk latency maps to effective persistent SlowDisk service time	green
 -	-	cargo-lib	cc-wasm	trap_wasm_state_and_trace_pages_obey_the_abi_byte_cap	Wasm state and trace pages obey the abi byte cap	green
 N1	NG1	cargo-lib	cc-wasm	trap_wasm_wraps_the_same_driver_backed_simcluster	Wasm theater wraps the same Driver-backed simulator	green
+-	-	playwright	theater	built site loads its engine when served from a deployment subpath	The built bundle resolves every runtime fetch under a GitHub Pages project subpath, not the origin root	green
 -	-	playwright	theater	cluster size, node selection, stepping, and fault readouts are live	Cluster size, node selection, stepping, and fault readouts are live	green
 -	-	playwright	theater	contrast gate	Contrast gate	green
 N9	NG9	playwright	theater	every control changes observable state	Every rendered theater control has a contract row and functional controls change observable state	green

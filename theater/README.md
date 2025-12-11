@@ -21,6 +21,13 @@ checked-in `src/wasm/cc_wasm.{js,d.ts}` pair. The wasm binary and `dist/` stay
 ignored; CI regenerates the bridge and treats a JS/type-definition diff as a
 failure. Generated bridge files are never hand-edited.
 
+The published site is a GitHub Pages project page under `/crash-course/`, so
+`base` is `./` and every runtime fetch resolves against the document rather
+than the origin. `npm run dev` serves from the origin root, where the two are
+indistinguishable, so `tests/subpath.spec.ts` builds the bundle and serves it
+under a subpath: a root-absolute URL leaves the deployed theater with no
+engine, and only that test sees it.
+
 Every visible interactive control has a row in
 `tests/control-contract.tsv`; `scripts/ci/control-contract.mjs` rejects either
 a rendered control without a contract row or a stale row. The disk-latency

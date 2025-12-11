@@ -5,7 +5,7 @@
 // never changed, so a returning visitor kept the old `index.html` forever and
 // with it the old hashed asset and wasm URLs. A deploy could not reach anyone
 // who had already loaded the theater once.
-const CACHE = "crash-course-theater-v0.16.2-abi2";
+const CACHE = "crash-course-theater-v0.16.3-abi2";
 
 self.addEventListener("install", (event) => {
 	event.waitUntil(caches.open(CACHE).then(() => self.skipWaiting()));
@@ -27,14 +27,26 @@ self.addEventListener("fetch", (event) => {
 	const { request } = event;
 	if (request.method !== "GET") return;
 
+	// Only a good, complete response is worth keeping. A 502 from a deploy in
+	// flight must not overwrite the last page that actually worked, and
+	// `Cache.put` rejects outright on a 206, so an unguarded put would raise an
+	// unhandled rejection instead of quietly declining.
+	const remember = (response) => {
+		if (response.status !== 200) return;
+		const copy = response.clone();
+		caches
+			.open(CACHE)
+			.then((cache) => cache.put(request, copy))
+			.catch(() => {});
+	};
+
 	// Navigations go to the network first so a new deploy is picked up on the
 	// next visit; the cache is the offline fallback, not the source of truth.
 	if (request.mode === "navigate") {
 		event.respondWith(
 			fetch(request)
 				.then((response) => {
-					const copy = response.clone();
-					caches.open(CACHE).then((cache) => cache.put(request, copy));
+					remember(response);
 					return response;
 				})
 				.catch(() =>
@@ -50,10 +62,7 @@ self.addEventListener("fetch", (event) => {
 			(cached) =>
 				cached ||
 				fetch(request).then((response) => {
-					if (response.ok) {
-						const copy = response.clone();
-						caches.open(CACHE).then((cache) => cache.put(request, copy));
-					}
+					remember(response);
 					return response;
 				}),
 		),

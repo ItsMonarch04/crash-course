@@ -496,7 +496,7 @@ export default function App() {
 					);
 				}
 			});
-		fetch(`/fixtures/seed-${seed.replace(/^0x/, "")}.json`)
+		fetch(`./fixtures/seed-${seed.replace(/^0x/, "")}.json`)
 			.then((response) =>
 				response.ok
 					? (response.json() as Promise<TraceFixture>)
@@ -520,7 +520,11 @@ export default function App() {
 					traceHash: wasmTraceHash,
 					tracePage: wasmTracePage,
 				};
-				await module.default("/wasm/cc_wasm_bg.wasm");
+				// Document-relative, like `./exhibits/manifest.json` and
+				// `./sw.js`. The site is served from a project subpath
+				// (`/crash-course/`), where a root-absolute URL resolves
+				// off the deployment and the engine never loads.
+				await module.default("./wasm/cc_wasm_bg.wasm");
 				const handle = module.init(JSON.stringify({ seed, profile, nodes: clusterSize }));
 				sharedFaults.forEach((action) => {
 					module.inject(handle, JSON.stringify(action));
