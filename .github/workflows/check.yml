@@ -37,6 +37,7 @@ jobs:
       - run: bash scripts/ci/golden-manifest.sh --check
       - run: bash scripts/ci/fuzz-inventory.sh --check
       - run: bash scripts/ci/test-register.sh
+      - run: node scripts/ci/campaign-coverage.mjs
 
   kata:
     runs-on: ubuntu-latest

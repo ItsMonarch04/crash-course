@@ -51,7 +51,30 @@ function localLinkTarget(raw) {
   return target.split(/[?#]/, 1)[0];
 }
 
-for (const file of [resolve(root, "README.md"), ...markdownFiles(resolve(root, "docs"))]) {
+// Every checked-in markdown file outside `docs/` that a reader can reach from
+// the front page. `theater/` and `fuzz/` are named individually because
+// recursing into them would walk `node_modules/` and the fuzz corpus.
+const outlyingDocs = [
+  ".github/PULL_REQUEST_TEMPLATE.md",
+  "SECURITY.md",
+  "bench/README.md",
+  "campaigns/README.md",
+  "deploy/README.md",
+  "exhibits/README.md",
+  "fuzz/README.md",
+  "theater/README.md",
+  "theater/public/fixtures/README.md",
+];
+for (const path of outlyingDocs) {
+  if (!existsSync(resolve(root, path))) errors.push(`missing linked documentation: ${path}`);
+}
+
+const linkedFiles = [
+  resolve(root, "README.md"),
+  ...markdownFiles(resolve(root, "docs")),
+  ...outlyingDocs.map((path) => resolve(root, path)).filter((path) => existsSync(path)),
+];
+for (const file of linkedFiles) {
   const source = readFileSync(file, "utf8");
   const links = source.matchAll(/\[[^\]]*\]\(([^)]+)\)/g);
   for (const match of links) {
@@ -95,6 +118,6 @@ if (errors.length > 0) {
   process.exitCode = 1;
 } else {
   console.log(
-    `doc coherence: PASS docs=${requiredDocs.length} markdown=${markdownFiles(resolve(root, "docs")).length + 1} adrs=${adrNumbers.length} register_rows=${rows.length}`,
+    `doc coherence: PASS docs=${requiredDocs.length} markdown=${linkedFiles.length} adrs=${adrNumbers.length} register_rows=${rows.length}`,
   );
 }

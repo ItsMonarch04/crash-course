@@ -35,6 +35,12 @@ jobs:
           cache-dependency-path: theater/package-lock.json
       - run: npm ci --no-audit --no-fund
         working-directory: theater
+      # `npm ci` is told not to audit so a transient registry hiccup cannot
+      # fail the install step. The audit is its own step instead: this is the
+      # only dependency tree that reaches a browser, and nothing else in CI
+      # would notice a high-severity advisory in it.
+      - run: npm audit --audit-level=high
+        working-directory: theater
       - run: npm run lint
         working-directory: theater
       - run: npm run format:check

@@ -26,7 +26,6 @@ jobs:
       - run: node scripts/check-version-coherence.mjs
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
-          toolchain: stable
           components: rustfmt, clippy
       - run: cargo test --locked --workspace --release
       - run: cargo run --locked -p cc-swarm -- --determinism-seeds 100
@@ -42,6 +41,16 @@ jobs:
       - run: cargo run --locked -p cc-swarm -- run --profile follower-read --seeds 10000 --jobs 4
       - run: cargo run --locked -p cc-swarm -- run --profile follower-read-v2 --seeds 2000 --jobs 4
       - run: cargo run --locked -p cc-swarm -- run --profile stale-read --seeds 2000 --jobs 4
+      # Every remaining profile gets a run too. A selectable profile with no
+      # gate rots silently: `corruption` reached the point where every seed
+      # failed before recording a single event, and nothing noticed, because
+      # it was the one transport profile no workflow executed.
+      # `scripts/ci/campaign-coverage.mjs` fails if a new profile is added
+      # without a line here.
+      - run: cargo run --locked -p cc-swarm -- run --profile gentle --seeds 2000 --jobs 4
+      - run: cargo run --locked -p cc-swarm -- run --profile corruption --seeds 2000 --jobs 4 --require-beacon network-drop
+      - run: cargo run --locked -p cc-swarm -- run --profile starve --seeds 2000 --jobs 4
+      - run: cargo run --locked -p cc-swarm -- run --profile ttl --seeds 2000 --jobs 4
       - run: cargo run --locked -p cc-swarm -- regress
       - run: ./scripts/ci/sim-throughput.sh
       - run: ./scripts/ci/porcupine-crosscheck.sh
@@ -52,6 +61,8 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
-        with:
-          toolchain: stable
+      # The README's first "try this" command, run enough times to catch a
+      # race. It reached the point where roughly one run in three failed its
+      # journal replay and nothing noticed, because no workflow ran it.
+      - run: bash scripts/ci/repeat-demo.sh --runs 8
       - run: CC_MEMBERSHIP_RUNS=20 bash scripts/demo-membership.sh

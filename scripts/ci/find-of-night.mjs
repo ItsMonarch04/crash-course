@@ -20,11 +20,19 @@ if (existsSync(artifacts)) {
   for (const name of names) {
     try {
       const artifact = JSON.parse(readFileSync(resolve(artifacts, name), "utf8"));
-      const failed = artifact.error
-        || artifact.trace_invariants_ok === false
-        || artifact.liveness_ok === false
-        || ["not-linearizable", "undecided"].includes(artifact.verdict);
-      if (!failed) continue;
+      // Name the reason, not just the fact. A trace-invariant or liveness
+      // failure can carry `verdict: "linearizable"`, and the summary used to
+      // print only the verdict — so the one finding of the night read as
+      // though nothing had gone wrong.
+      const reasons = [];
+      if (artifact.error) reasons.push(`runner error: ${artifact.error}`);
+      if (artifact.trace_invariants_ok === false) reasons.push("trace invariants violated");
+      if (artifact.liveness_ok === false) reasons.push("liveness not reached");
+      if (["not-linearizable", "undecided"].includes(artifact.verdict)) {
+        reasons.push(`verdict=${artifact.verdict}`);
+      }
+      if (reasons.length === 0) continue;
+      artifact.find_reasons = reasons;
       // A finding has to be reduced before it is worth anyone's attention. An
       // unshrunk trace is a thousand actions of noise around the one that
       // mattered, so it is counted but never promoted.
@@ -59,7 +67,7 @@ if (shrunk.length > 0) {
   const profile = artifact.profile ?? artifact.run_spec?.profile ?? "rough";
   const runSpec = encodeURIComponent(JSON.stringify(artifact.run_spec ?? { seed, profile, faults: [] }));
   const url = `${baseUrl}#seed=${encodeURIComponent(seed)}&profile=${encodeURIComponent(profile)}&run_spec=${runSpec}`;
-  markdown = `## Find of the night\n\n[Replay ${name} in the theater](${url}) — verdict=${artifact.verdict ?? "runner-error"}, events=${artifact.events ?? 0}, shrunk from ${receipt.canonical_actions} fault actions to ${receipt.shrunk_actions} and re-verified to still reproduce.\n`;
+  markdown = `## Find of the night\n\n[Replay ${name} in the theater](${url}) — ${artifact.find_reasons.join("; ")}, verdict=${artifact.verdict ?? "runner-error"}, events=${artifact.events ?? 0}, shrunk from ${receipt.canonical_actions} fault actions to ${receipt.shrunk_actions} and re-verified to still reproduce.\n`;
 }
 writeFileSync(output, markdown);
 process.stdout.write(markdown);
