@@ -15,8 +15,6 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - run: node scripts/check-version-coherence.mjs
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
-        with:
-          toolchain: stable
       - run: cargo run --locked -p cc-swarm -- --determinism > trace-a.cctrace
       - run: cargo run --locked -p cc-swarm -- --determinism > trace-b.cctrace
       - run: cmp trace-a.cctrace trace-b.cctrace
@@ -30,8 +28,6 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - run: node scripts/check-version-coherence.mjs
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
-        with:
-          toolchain: stable
       - run: cargo run --locked -p cc-swarm -- --determinism > trace-${{ matrix.os }}.cctrace
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -57,8 +53,6 @@ jobs:
         with:
           node-version-file: theater/.nvmrc
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
-        with:
-          toolchain: stable
       - run: rustup target add wasm32-unknown-unknown
       - run: CARGO_HTTP_MULTIPLEXING=false cargo install wasm-bindgen-cli --version 0.2.105 --locked
       - run: ./scripts/ci/wasm-equivalence.sh

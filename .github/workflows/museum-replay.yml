@@ -21,7 +21,5 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - run: node scripts/check-version-coherence.mjs
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
-        with:
-          toolchain: stable
       - run: ./scripts/ci/museum-replay.sh
       - run: cargo run --locked -p cc-swarm -- one --seed 0x2a --profile calm --export-json
