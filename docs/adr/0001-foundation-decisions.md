@@ -43,11 +43,9 @@ close the highest-risk architectural choices before implementation begins.
 29. **Tie-sequence event ordering** — equal-time events execute by insertion sequence, making heap implementation details irrelevant.
 30. **Trace binary plus JSON dual encoding** — compact bytes serve gates and files while JSON serves inspection without becoming a consensus format.
 31. **AGPL-3.0-only license** — the lab remains freely shareable and every crate carries the same explicit license metadata.
-32. **I cut every commit, tag, and release by hand** — repository state and public release timing are my decisions, never a pipeline's.
-33. **Every change records the gates it passed** — I can put the project down for a month and pick it back up without re-deriving what was already proven.
-34. **`preflight.sh` as the local CI mirror** — contributors can run the same essential checks without needing a remote commit or pull request.
-35. **Runaway guards in the simulator** — zero-delay self-scheduling must fail loudly instead of hanging a campaign.
-36. **Theater Playwright smoke with reduced motion** — browser behavior is checked at the interaction boundary while animation timing stays testable.
+32. **`preflight.sh` as the local CI mirror** — contributors can run the same essential checks without needing a remote commit or pull request.
+33. **Runaway guards in the simulator** — zero-delay self-scheduling must fail loudly instead of hanging a campaign.
+34. **Theater Playwright smoke with reduced motion** — browser behavior is checked at the interaction boundary while animation timing stays testable.
 
 ## Consequences
 
@@ -62,4 +60,3 @@ numbered ADR and a format or protocol version bump when bytes are affected.
 General-purpose serialization, ambient clocks, live random draws, unordered
 maps, async core state machines, and a production-oriented scope were rejected
 because each would hide a source of nondeterminism or broaden the proof surface.
-

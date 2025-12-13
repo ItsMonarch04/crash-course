@@ -1,6 +1,6 @@
 # ADR-0008: Permanent scope boundaries
 
-- Status: Accepted
+- Status: Accepted; the follower-read deferral is superseded by [ADR-0017](0017-complete-replay-and-implementation-status.md)
 - Date: 2025-11-15
 
 ## Context
@@ -9,7 +9,7 @@ Four capabilities were repeatedly proposed for this laboratory and are
 individually reasonable. Each was left open long enough to be re-proposed, and
 each carries a cost that is easy to under-count at proposal time and expensive
 to reverse once merged. Leaving them nominally "open" invites a future
-contributor — or a future me — to spend the project's credibility implementing
+contributor or maintainer to spend the project's credibility implementing
 one.
 
 This record closes them so the answer is written down once rather than
@@ -43,8 +43,9 @@ the store's depth work, and the real host does not use the LSM path at all. A
 read cache would add cache-coherence surface to a component nothing in
 production reads through.
 
-Follower and learner read endpoints remain deferred, unchanged, for the reason
-already recorded: followers redirect rather than serve.
+Follower and learner read endpoints were deferred when this decision was
+accepted. ADR-0017 supersedes that deferral with the negotiated follower-read
+protocol; stale reads remain explicitly non-linearizable.
 
 ## Consequences
 

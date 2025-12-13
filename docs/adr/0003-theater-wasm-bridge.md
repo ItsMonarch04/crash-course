@@ -15,16 +15,16 @@ crates.
 ## Decision
 
 Use `wasm-bindgen` for the `cc-wasm` boundary, as permitted by the dependency
-policy. The bridge will expose a small ABI-versioned surface owned by
-`cc-wasm`; the simulator, cluster, Raft, KV, and storage crates remain
+policy. The bridge exposes a small ABI-versioned surface owned by `cc-wasm`;
+the simulator, cluster, Raft, KV, and storage crates remain
 host-independent and dependency-light. The generated JavaScript glue is a
 theater build artifact, not a second execution model.
 
-The bridge will own persistent handles and JSON conversion only. A browser
+The bridge owns persistent handles and JSON conversion only. A browser
 `step` advances one simulator instance by a virtual-time budget, and `inject`
 adds fault-plan data to that same instance. Native and WebAssembly traces must
-remain byte-identical for the equivalence gate before the theater claims live
-cluster behavior.
+remain byte-identical in the equivalence gate that supports the theater's live
+cluster claim.
 
 ## Consequences
 
