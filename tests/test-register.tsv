@@ -103,6 +103,7 @@ N1	NG1	cargo-lib	cc-cluster	trap_peer_identity_must_match_inner_frame	Peer ident
 N4	NG4	cargo-lib	cc-cluster	trap_pending_admin_workflow_session_cannot_expire	Pending admin workflow session cannot expire	green
 N4	NG4	cargo-lib	cc-cluster	trap_pending_client_routes_are_bounded_and_dropped_on_stepdown	Pending client routes are bounded and dropped on stepdown	green
 N1	NG1	cargo-lib	cc-cluster	trap_plain_route_ids_never_enter_raft_payload	Volatile route ids never enter Raft payload	green
+-	-	cargo-lib	cc-cluster	trap_reads_wait_for_the_durable_kv_watermark	Reads wait for the durable kv watermark	green
 N1	NG1	cargo-lib	cc-cluster	trap_restore_refuses_unproven_applied_watermark	Recovery does not claim an unproven applied watermark	green
 N10	NG10	cargo-lib	cc-cluster	trap_restored_cluster_grows_without_identity_clone	Fresh restore discards source cluster and node identity before growth	green
 N10	NG10	cargo-lib	cc-cluster	trap_restored_cluster_matches_source_final_probes	Fresh restore preserves final value and TTL probes	green
@@ -157,6 +158,7 @@ N7	NG7	cargo-lib	cc-env	trap_unsupported_feature_is_never_silently_downgraded	Un
 -	-	cargo-lib	cc-host	trap_admitted_and_replayed_client_requests_take_the_same_door	A queued client request is answered the same way whether the host drains it or the replayer admits it	green
 N1	NG1	cargo-lib	cc-host	trap_bounded_peer_queue_drops_instead_of_blocking_consensus	Bounded peer queue drops instead of blocking consensus	green
 N1	NG1	cargo-lib	cc-host	trap_capped_journal_never_claims_complete	A capped journal is marked as a replayable prefix	green
+-	-	cargo-lib	cc-host	trap_checkpoint_cannot_race_a_raft_wal_append	Checkpoint cannot race a raft wal append	green
 -	-	cargo-lib	cc-host	trap_competing_snapshot_rejection_is_canonical_after_progress	Competing snapshot rejection is canonical after progress	green
 N4	NG4	cargo-lib	cc-host	trap_delayed_old_transfer_cannot_evict_new_staging	Delayed old transfer cannot evict new staging	green
 N1	NG1	cargo-lib	cc-host	trap_driver_correlates_write_and_fsync_before_continuation	Shared driver correlates write and fsync before continuation	green
@@ -176,6 +178,7 @@ N4	NG4	cargo-lib	cc-host	trap_follower_checkpoint_reclaims_its_own_log_prefix	Fo
 N4	NG4	cargo-lib	cc-host	trap_footprint_counts_encoded_queue_bytes	Driver footprint exposes deterministic current, peak, and limit queue-byte charges	green
 N1	NG1	cargo-lib	cc-host	trap_input_journal_is_prefix_durable	Input journal discards only a torn final record	green
 N1	NG1	cargo-lib	cc-host	trap_input_journal_rejects_complete_crc_corruption	Input journal rejects complete-record CRC corruption	green
+-	-	cargo-lib	cc-host	trap_installed_snapshot_is_idempotent_across_transfer_ids	Installed snapshot is idempotent across transfer ids	green
 N1	NG1	cargo-lib	cc-host	trap_journal_record_pairs_input_and_effects	Input journal pairs each input with its effect batch	green
 N11	NG11	cargo-lib	cc-host	trap_kata_03_ack_before_fsync_is_found_within_budget	Kata 03 exposes an acknowledgement released before fsync within its budget	green
 N4	NG4	cargo-lib	cc-host	trap_leader_sends_snapshot_when_log_prefix_is_gone	Leader sends snapshot when log prefix is gone	green
@@ -528,6 +531,7 @@ N6	NG6	cargo-lib	cc-swarm	trap_every_format_has_a_corpus	Every format has a corp
 N5	NG5	cargo-lib	cc-swarm	trap_explain_emits_parseable_svg	Explain emits parseable svg	green
 N5	NG5	cargo-lib	cc-swarm	trap_explain_obeys_output_cap	Explain obeys output cap	green
 N5	NG5	cargo-lib	cc-swarm	trap_explain_xml_escapes_labels	Explain xml escapes labels	green
+-	-	cargo-bin	cc-swarm	trap_follower_read_campaign_seed_225d_is_linearizable	Follower read campaign seed 225d is linearizable	green
 N10	NG10	cargo-lib	cc-swarm	trap_follower_read_profile_completes_a_non_leader_get	Follower-read profile completes a strong GET on a non-leader	green
 N10	NG10	cargo-lib	cc-swarm	trap_follower_read_v2_profile_never_serves_local_state_as_linearizable	Mixed-v2 follower-read profile never labels local state linearizable	green
 N4	NG4	cargo-lib	cc-swarm	trap_footprint_returns_to_baseline_after_heal	Footprint returns to baseline after heal	green
@@ -570,6 +574,7 @@ N2	NG2	cargo-lib	cc-swarm	trap_truncated_frame_is_rejected_before_allocation	Tru
 -	-	cargo-bin	cc-swarm	trap_unreadable_flag_values_stop_the_run_instead_of_defaulting	A misspelt --profile, --seed, or numeric bound fails instead of silently taking the default	green
 N2	NG2	cargo-lib	cc-swarm	trap_valid_frame_decode_failure_is_an_invariant	Unexpected valid-outer CCRP decode failures stop the simulator	green
 N6	NG6	cargo-lib	cc-swarm	trap_wall_time_difference_cannot_create_seed_conflict	Wall time difference cannot create seed conflict	green
+-	-	cargo-bin	cc-swarm	trap_wipe_campaign_reaches_snapshot_install	Wipe campaign reaches snapshot install	green
 N1	NG1	cargo-lib	cc-swarm	trap_wipe_has_no_out_of_band_state_copy	Wiped simulator node catches up without an out-of-band state copy	green
 N4	NG4	cargo-lib	cc-swarm	trap_wiped_node_rejoins_only_via_snapshot	Wiped node rejoins only via snapshot	green
 -	-	cargo-lib	cc-wal	append_flush_commit_and_recover	Append flush commit and recover	green

@@ -787,6 +787,16 @@ impl Driver {
         }) {
             return Ok(Vec::new());
         }
+        // Building a replacement WAL captures the current eager Raft log.
+        // Do not start that publication while an earlier Raft/store durability
+        // effect is still in flight: real hosts may complete the two effects
+        // on different workers, allowing the older checkpoint image to rename
+        // over a newly appended record. Snapshot sends can share an already
+        // published immutable file; checkpoint creation cannot share a
+        // durability window.
+        if !self.pending_io.is_empty() {
+            return Ok(Vec::new());
+        }
         self.begin_local_snapshot_publication()
     }
 
@@ -2480,6 +2490,22 @@ impl Driver {
         {
             return self.snapshot_ack(&message, *transfer_id, *total_len, true, None);
         }
+        // A new leader may resend a checkpoint the node has already published
+        // and installed under a different transfer id. Appending a second mark
+        // for the same base makes the framed WAL temporarily unrecoverable
+        // (`SnapshotMark` indexes are strictly increasing), and a crash before
+        // the following compaction then strands the node. The published file
+        // metadata is durable authority for an exact idempotent acknowledgement.
+        if self.published_snapshot.is_some_and(|published| {
+            published.index == *last_included_index
+                && published.snapshot_term == *last_included_term
+                && published.total_len == *total_len
+                && published.crc32c == *snapshot_crc32c
+                && self.node.kv.applied_index == *last_included_index
+                && self.node.kv.applied_term == *last_included_term
+        }) {
+            return self.snapshot_ack(&message, *transfer_id, *total_len, true, None);
+        }
         let reset = match self.incoming_snapshot.as_ref() {
             None => {
                 if *offset != 0 {
@@ -3382,6 +3408,38 @@ mod tests {
     }
 
     #[test]
+    fn trap_installed_snapshot_is_idempotent_across_transfer_ids() {
+        let mut driver = driver();
+        driver.node_mut().kv.mark_applied(
+            cc_core::LogIndex::new(4),
+            cc_core::Term::new(1),
+            Time::from_nanos(1),
+        );
+        driver.node_mut().raft.applied_index = cc_core::LogIndex::new(4);
+        driver
+            .node_mut()
+            .raft
+            .install_snapshot_state(cc_core::LogIndex::new(4), cc_core::Term::new(1));
+        driver
+            .register_published_snapshot(
+                FileId::Snapshot { generation: 4 },
+                cc_core::LogIndex::new(4),
+                cc_core::Term::new(1),
+                driver.node().kv.store.last_sequence(),
+                10,
+                9,
+            )
+            .expect("published snapshot");
+
+        let duplicate = driver
+            .stage_snapshot_chunk(test_snapshot_chunk(99, 0, b"duplicate", 10, 9, true))
+            .expect("idempotent acknowledgement");
+        assert_eq!(snapshot_ack_fields(&duplicate), (true, None, 10));
+        assert!(driver.incoming_snapshot.is_none());
+        assert!(driver.pending_io.is_empty());
+    }
+
+    #[test]
     fn trap_competing_snapshot_rejection_is_canonical_after_progress() {
         let mut driver = driver();
         let first = test_snapshot_chunk(7, 0, b"abc", 10, 9, false);
@@ -3804,6 +3862,36 @@ mod tests {
                 .expect("checkpoint probe")
                 .is_empty(),
             "local checkpoint must coalesce behind the same barrier"
+        );
+    }
+
+    #[test]
+    fn trap_checkpoint_cannot_race_a_raft_wal_append() {
+        let mut driver = driver();
+        driver.node_mut().raft.role = cc_cluster::Role::Leader;
+        driver.node_mut().raft.hard_state.term = cc_core::Term::new(1);
+        driver.node_mut().raft.leader_id = Some(NodeId::new(1));
+        driver.node_mut().kv.applied_index = cc_core::LogIndex::new(1);
+        driver.node_mut().kv.applied_term = cc_core::Term::new(1);
+        driver.node_mut().raft.applied_index = cc_core::LogIndex::new(1);
+        driver.limits.max_log_bytes_before_snapshot = 1;
+        driver.next_wal_offset = 1;
+        let append = driver
+            .issue_raw_wal_write(vec![7])
+            .expect("Raft WAL append");
+        assert!(matches!(append, Effect::DiskWrite { .. }));
+
+        let checkpoint = driver
+            .begin_snapshot_transfer(NodeId::new(2))
+            .expect("checkpoint request is retained");
+        assert!(
+            checkpoint.is_empty(),
+            "a replacement WAL must not be built beside the append it could overwrite"
+        );
+        assert_eq!(driver.pending_io.len(), 1, "only the Raft append is live");
+        assert!(
+            driver.pending_snapshot_peers.contains(&NodeId::new(2)),
+            "the snapshot transfer remains queued after the durability barrier"
         );
     }
 

@@ -2444,9 +2444,22 @@ impl SimCluster {
             let before = driver.role();
             let was_blocked = driver.footprint().blocked;
             let mut blocks = SimBlockSource { disk };
-            let (poll, effects) = driver
-                .deliver(now, input.clone(), &mut blocks)
-                .map_err(|error| cluster_host_error(id, error))?;
+            let (poll, effects) = match driver.deliver(now, input.clone(), &mut blocks) {
+                Ok(result) => result,
+                Err(HostError::Node(NodeError::PersistencePending)) => {
+                    // Snapshot publication and transfer use read/rename/dirsync
+                    // stages after their first write/fsync pair. Those stages
+                    // have no single persistence deadline, so the simulator
+                    // must use the Driver's bounded queues just like a real
+                    // host instead of treating a concurrent arrival as fatal.
+                    driver
+                        .enqueue(input)
+                        .map_err(|error| cluster_host_error(id, error))?;
+                    let _ = driver.footprint();
+                    return Ok(());
+                }
+                Err(error) => return Err(cluster_host_error(id, error)),
+            };
             let _ = driver.footprint();
             (before, was_blocked, poll, effects)
         };
@@ -2542,6 +2555,14 @@ impl SimCluster {
             self.consume_effects(node, effects)?;
             if let DriverPoll::BlockedUntil(until) = poll {
                 self.schedule(until, ClusterEventKind::DriverServiceComplete { node });
+                break;
+            }
+            let durability_pending = self
+                .nodes
+                .get(&node)
+                .and_then(|slot| slot.driver.as_ref())
+                .is_some_and(|driver| driver.footprint().pending_io > 0);
+            if durability_pending {
                 break;
             }
             if input.is_none() {
@@ -3060,7 +3081,19 @@ impl SimCluster {
                     self.record(self.now, Some(node), EventKind::IoDone, Vec::new());
                     self.record(self.now, Some(node), EventKind::Flush, Vec::new());
                 }
-                self.consume_effects(node, effects)
+                self.consume_effects(node, effects)?;
+                let durability_idle = self
+                    .nodes
+                    .get(&node)
+                    .and_then(|slot| slot.driver.as_ref())
+                    .is_some_and(|driver| {
+                        let footprint = driver.footprint();
+                        footprint.pending_io == 0 && !footprint.blocked
+                    });
+                if durability_idle {
+                    self.complete_driver_service(node)?;
+                }
+                Ok(())
             }
             Ok((DriverPoll::BlockedUntil(until), _)) => {
                 self.schedule(until, ClusterEventKind::DriverServiceComplete { node });
@@ -4794,9 +4827,8 @@ mod tests {
         assert_eq!(rejoined.2, rejoined.1);
     }
 
-    /// Reads run through the ReadIndex quorum round. Before this was wired the
-    /// `ReadReply` handler matched on sequence zero, which no operation ever
-    /// carries, so every read silently timed out.
+    /// Reads run through the ReadIndex quorum round and must complete with the
+    /// nonzero request sequence that the workload actor issued.
     #[test]
     fn reads_are_served_through_the_read_index_barrier() {
         let mut spec = RunSpec::standard(Seed::new(0x81), FaultProfile::Calm);
@@ -5005,8 +5037,8 @@ mod tests {
         ));
     }
 
-    /// The membership profile used to be byte-identical to `rough`. It must now
-    /// generate real reconfigure actions and land them as committed config.
+    /// The membership profile must generate real reconfigure actions and land
+    /// them as committed configuration.
     #[test]
     fn membership_profile_moves_the_voting_set() {
         let end_time = Time::from_nanos(6_000_000_000);

@@ -3901,7 +3901,11 @@ impl Node {
         let Some(ready) = self.read_barrier_ready else {
             return Vec::new();
         };
-        let applied = self.raft.applied_index;
+        // The Raft state machine advances its in-memory applied index when it
+        // emits an Apply effect. The KV watermark advances only after the
+        // matching store record is durable and published. Reads inspect KV,
+        // so only that durable watermark can make a barrier readable.
+        let applied = self.kv.applied_index;
         let pending = std::mem::take(&mut self.pending_reads);
         let mut output = Vec::new();
         for read in pending {
@@ -4065,7 +4069,7 @@ impl Node {
                     sequence,
                     reply: KvReply::Error(KvError::InvalidInput),
                 });
-            } else if self.raft.applied_index >= read_index {
+            } else if self.kv.applied_index >= read_index {
                 if self.kv.store.is_file_backed() {
                     self.completed_file_reads
                         .insert((client, sequence), (read.command.clone(), read_time));
@@ -4078,7 +4082,7 @@ impl Node {
                     (client, sequence),
                     FollowerReadMetadata {
                         read_index,
-                        applied_index: self.raft.applied_index,
+                        applied_index: self.kv.applied_index,
                         applied_term: self.kv.applied_term,
                         read_time,
                     },
@@ -4858,6 +4862,97 @@ mod tests {
     }
 
     #[test]
+    fn trap_reads_wait_for_the_durable_kv_watermark() {
+        let voters = [NodeId::new(1), NodeId::new(2)].into_iter().collect();
+        let mut follower = Node::new(config(2), voters).expect("follower");
+        follower.raft.role = Role::Follower;
+        follower.raft.hard_state.term = Term::new(2);
+        follower.raft.leader_id = Some(NodeId::new(1));
+        follower.raft.applied_index = LogIndex::new(5);
+        follower
+            .kv
+            .mark_applied(LogIndex::new(1), Term::new(1), Time::from_nanos(1));
+        follower
+            .observe_peer_capability(NodeId::new(1), SEMANTIC_VERSION_V3, FOLLOWER_READ_FEATURE)
+            .expect("capability");
+        follower
+            .request_follower_read(
+                ClientId::new(7),
+                9,
+                KvCommand::Get { key: b"k".to_vec() },
+                Time::from_nanos(1),
+            )
+            .expect("request");
+        let hash = follower
+            .pending_follower_reads
+            .get(&(ClientId::new(7), 9))
+            .expect("pending")
+            .command_hash;
+        follower.accept_follower_read_grant(
+            NodeId::new(1),
+            Term::new(2),
+            9,
+            hash,
+            LogIndex::new(5),
+            Time::from_nanos(5),
+        );
+
+        assert!(
+            follower.drain_pending_follower_reads().is_empty(),
+            "an in-memory Raft watermark cannot authorize a durable KV read"
+        );
+        assert!(
+            follower
+                .pending_follower_reads
+                .contains_key(&(ClientId::new(7), 9)),
+            "the read remains pending while durable apply catches up"
+        );
+
+        follower
+            .kv
+            .mark_applied(LogIndex::new(5), Term::new(2), Time::from_nanos(5));
+        assert!(matches!(
+            follower.drain_pending_follower_reads().as_slice(),
+            [NodeEffect::ReadReply {
+                reply: KvReply::Value(None),
+                ..
+            }]
+        ));
+
+        let mut leader = Node::new(
+            config(1),
+            [NodeId::new(1), NodeId::new(2)].into_iter().collect(),
+        )
+        .expect("leader");
+        leader.raft.applied_index = LogIndex::new(5);
+        leader
+            .kv
+            .mark_applied(LogIndex::new(1), Term::new(1), Time::from_nanos(1));
+        leader.read_barrier_ready = Some(LogIndex::new(5));
+        leader.pending_reads.push(PendingRead {
+            client: ClientId::new(8),
+            sequence: 10,
+            command: KvCommand::Get { key: b"k".to_vec() },
+            at: Time::from_nanos(5),
+            index: LogIndex::new(5),
+        });
+        assert!(
+            leader.drain_pending_reads().is_empty(),
+            "leader reads use the same durable watermark"
+        );
+        leader
+            .kv
+            .mark_applied(LogIndex::new(5), Term::new(2), Time::from_nanos(5));
+        assert!(matches!(
+            leader.drain_pending_reads().as_slice(),
+            [NodeEffect::ReadReply {
+                reply: KvReply::Value(None),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
     fn trap_follower_read_uses_leader_time_for_ttl() {
         let voters = [NodeId::new(1), NodeId::new(2)].into_iter().collect();
         let mut follower = Node::new(config(2), voters).expect("follower");
@@ -5480,6 +5575,8 @@ mod tests {
         });
         node.raft.commit_index = LogIndex::new(1);
         node.raft.applied_index = LogIndex::new(1);
+        node.kv
+            .mark_applied(LogIndex::new(1), Term::new(1), Time::from_nanos(1));
         let effects = node
             .on_input(NodeInput::Read {
                 sequence: 1,

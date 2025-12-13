@@ -2254,6 +2254,13 @@ fn fixture_spec(seed: Seed, profile: FaultProfile, campaign: bool) -> RunSpec {
         set_ttl: matches!(profile, FaultProfile::Ttl).then_some(Duration::from_millis(125)),
         kind: profile.workload_kind(),
     };
+    if matches!(profile, FaultProfile::Wipe) {
+        // The bounded fixture cannot reach the production 64 MiB checkpoint
+        // trigger in three or six seconds. Without a profile-specific trigger,
+        // the wiped node always catches up from the retained log and the wipe
+        // campaign never exercises snapshot transfer at all.
+        spec.host_limits.max_log_bytes_before_snapshot = 1024;
+    }
     spec
 }
 
@@ -2714,6 +2721,62 @@ fn print_help() {
 #[cfg(test)]
 mod trace_tests {
     use super::*;
+
+    #[test]
+    fn trap_follower_read_campaign_seed_225d_is_linearizable() {
+        let run = run_spec(
+            fixture_spec(Seed::new(0x225d), FaultProfile::FollowerRead, true),
+            RecorderLevel::Theater,
+        )
+        .expect("follower-read campaign fixture");
+        let mut per_key = BTreeMap::<Vec<u8>, History>::new();
+        for operation in &run.history.operations {
+            let key = match &operation.kind {
+                OperationKind::Set { key, .. }
+                | OperationKind::Get { key }
+                | OperationKind::Del { key }
+                | OperationKind::Incr { key }
+                | OperationKind::Cas { key, .. } => key,
+                OperationKind::Scan { prefix, .. } => prefix.as_deref().unwrap_or_default(),
+                OperationKind::Batch { .. } => continue,
+            };
+            per_key
+                .entry(key.to_vec())
+                .or_default()
+                .push(operation.clone());
+        }
+        let failing_keys = per_key
+            .into_iter()
+            .filter_map(|(key, history)| {
+                (!matches!(
+                    cc_checker::check(&history, CheckerConfig::default()),
+                    Verdict::Linearizable { .. }
+                ))
+                .then_some((key, history))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(run.verdict, Verdict::Linearizable { .. }),
+            "failing_keys={failing_keys:#?}"
+        );
+    }
+
+    #[test]
+    fn trap_wipe_campaign_reaches_snapshot_install() {
+        let run = run_spec(
+            fixture_spec(Seed::new(1), FaultProfile::Wipe, true),
+            RecorderLevel::Campaign,
+        )
+        .expect("wipe campaign fixture");
+        let snapshot_position = REACHABILITY_BEACONS
+            .iter()
+            .position(|name| *name == "snapshot-install")
+            .expect("snapshot beacon");
+        assert!(
+            reachability_beacons(&run.trace, run.had_leader)[snapshot_position] > 0,
+            "the wipe profile must exercise snapshot recovery"
+        );
+    }
 
     #[test]
     fn trap_kata_ledger_cannot_generate_production_summary() {
