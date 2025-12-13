@@ -32,11 +32,11 @@ toolchain required.
 ## Try the current workspace
 
 ```sh
-cargo run -p cc-swarm -- --selfcheck
-cargo run -p cc-node --bin ccdb -- --help
+cargo run --locked -p cc-swarm -- --selfcheck
+cargo run --locked -p cc-node --bin ccdb -- --help
 ./scripts/preflight.sh
 ./scripts/demo.sh
-cargo run --release -p cc-bench -- --workload A --clients 1 --ops 10000
+cargo run --locked --release -p cc-bench -- --workload A --clients 1 --ops 10000
 ```
 
 The repository currently contains:
@@ -107,8 +107,7 @@ shows the machinery that catches it.
 - [`docs/ops.md`](docs/ops.md) — running the real `ccdb` host: shared-driver
   WAL layout, peer handshake, and current recovery limits
 - [`docs/adr/`](docs/adr/) — numbered decisions, append-only
-- [`docs/talk-kit.md`](docs/talk-kit.md) — a fifteen-minute run of show, with
-  [slides](docs/crash-course-talk-kit.pptx)
+- [`docs/talk-kit.md`](docs/talk-kit.md) — a fifteen-minute run of show
 - [`theater/README.md`](theater/README.md) — the browser theater
 - [`bench/README.md`](bench/README.md) — the benchmark harness and what it
   refuses to claim
@@ -138,4 +137,4 @@ publishes an altered simulator as a website cannot keep those changes closed.
 
 ---
 
-**Version:** v0.16.10
+**Version:** v0.16.11

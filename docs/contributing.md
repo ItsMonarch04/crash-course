@@ -6,9 +6,9 @@ and readable enough for a student to follow.
 ## Before opening a change
 
 - Run `cargo fmt --all -- --check`.
-- Run `cargo clippy --workspace --all-targets -- -D warnings`.
+- Run `cargo clippy --locked --workspace --all-targets -- -D warnings`.
 - Run `./scripts/ci/forbidden-grep.sh`.
-- Run `cargo test --workspace --all-targets` and `./scripts/preflight.sh`.
+- Run `cargo test --locked --workspace --all-targets` and `./scripts/preflight.sh`.
 - Add a focused regression test for each known failure mode touched.
 - Update the public rustdoc.
 
@@ -22,4 +22,3 @@ changes bytes, or changes determinism, write a new ADR before implementation.
 
 Report suspected security vulnerabilities privately — see
 [`SECURITY.md`](../SECURITY.md), not a public issue.
-
