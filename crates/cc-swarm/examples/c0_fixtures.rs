@@ -256,6 +256,8 @@ fn fixtures() -> io::Result<Vec<Fixture<'static>>> {
             membership: membership.clone(),
         })))
         .map_err(io::Error::other)?,
+        store_wal: Vec::new(),
+        snapshot: None,
     }
     .encode()
     .map_err(io::Error::other)?;
@@ -510,9 +512,9 @@ fn fixtures() -> io::Result<Vec<Fixture<'static>>> {
         },
         Fixture {
             format: "CCBI",
-            name: "ccbi-v3",
+            name: "ccbi-v4",
             reader_test: "trap_replay_starts_from_captured_boot_image",
-            semantic: "one-node complete Driver boot image",
+            semantic: "one-node complete Driver boot image with store durability fields",
             bytes: boot_image,
         },
         Fixture {

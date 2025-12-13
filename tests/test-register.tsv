@@ -188,6 +188,7 @@ N4	NG4	cargo-lib	cc-host	trap_maintenance_reserve_serializes_space_amplifying_jo
 N4	NG4	cargo-lib	cc-host	trap_raft_and_store_wal_hard_caps_fail_closed	Raft and store wal hard caps fail closed	green
 -	-	cargo-lib	cc-host	trap_recorded_boot_image_is_bounded_and_canonical	Recorded boot image is bounded and canonical	green
 -	-	cargo-lib	cc-host	trap_recovered_driver_appends_after_verified_wal_prefix	Recovered driver appends after verified wal prefix	green
+-	-	cargo-lib	cc-host	trap_replay_boot_image_restores_its_marked_snapshot	Replay boot image restores its marked snapshot	green
 N1	NG1	cargo-lib	cc-host	trap_replay_consumes_recorded_block_reads_and_service_time	Replay consumes recorded block reads and their service time	green
 N1	NG1	cargo-lib	cc-host	trap_replay_rejects_block_read_request_order_divergence	Replay rejects a changed recorded block-read order	green
 N4	NG4	cargo-lib	cc-host	trap_snapshot_buffer_cannot_exceed_limit	Snapshot buffer cannot exceed limit	green

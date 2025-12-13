@@ -8,7 +8,9 @@ use std::fmt;
 
 use crate::{BootState, Driver, HostError};
 
-use cc_cluster::{NodeConfig, RaftConfig, RecoveredNode};
+use cc_cluster::{
+    NodeConfig, RaftConfig, RecoveredNode, ccsn_file_crc, decode_ccsn, node_snapshot_from_ccsn,
+};
 use cc_core::{
     ClusterPolicy, Dec, DecodeError, Duration, Enc, HostLimits, MembershipState, NodeId, Seed,
     Time, crc32c,
@@ -18,7 +20,9 @@ use cc_env::{
     encode_effect, encode_file_id, encode_input,
 };
 use cc_log::{LogError, recover_framed_record_stream};
-use cc_store::{BlockRead, BlockReadError, BlockSource, StoreConfig, StoreError};
+use cc_store::{
+    BlockRead, BlockReadError, BlockSource, StoreConfig, StoreError, recover_store_wal,
+};
 
 pub const INPUT_JOURNAL_MAGIC: u32 = u32::from_le_bytes(*b"CCIJ");
 pub const INPUT_JOURNAL_VERSION: u16 = 1;
@@ -28,16 +32,17 @@ pub const MAX_BLOCK_OBSERVATIONS_PER_RECORD: usize = 4_096;
 pub const MAX_BOOT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_BOOT_BUILD_LABEL_BYTES: usize = 256;
 pub const DRIVER_BOOT_MAGIC: u32 = u32::from_le_bytes(*b"CCBI");
-pub const DRIVER_BOOT_VERSION: u16 = 3;
+pub const DRIVER_BOOT_VERSION: u16 = 4;
 const FOOTER_FRAME_BIT: u32 = 1 << 31;
 const FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"CCIF");
 const FOOTER_VERSION: u16 = 1;
 const MAX_FOOTER_BYTES: usize = 64;
 
 /// The host-neutral image required to rebuild the current real Driver without
-/// consulting an ambient config file. The embedded WAL remains authoritative
-/// for durable Raft state; the copied identity/configuration/membership fields
-/// fence that recovery and retain its exact effective host inputs.
+/// consulting ambient configuration or storage. The embedded Raft WAL,
+/// store-WAL prefix, and optional marked checkpoint retain the complete
+/// durability authority; copied identity/configuration/membership fields fence
+/// that recovery and preserve the exact effective host inputs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedBootImage {
     pub config: NodeConfig,
@@ -46,12 +51,20 @@ pub struct RecordedBootImage {
     pub boot_epoch: Time,
     pub build_label: String,
     pub wal: Vec<u8>,
+    pub store_wal: Vec<u8>,
+    pub snapshot: Option<Vec<u8>>,
 }
 
 impl RecordedBootImage {
     pub fn encode(&self) -> Result<Vec<u8>, JournalError> {
-        if self.wal.len() > MAX_BOOT_IMAGE_BYTES {
-            return Err(JournalError::TooLarge("boot WAL"));
+        if self.wal.len() > MAX_BOOT_IMAGE_BYTES
+            || self.store_wal.len() > MAX_BOOT_IMAGE_BYTES
+            || self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.len() > MAX_BOOT_IMAGE_BYTES)
+        {
+            return Err(JournalError::TooLarge("boot durability image"));
         }
         if self.build_label.len() > MAX_BOOT_BUILD_LABEL_BYTES {
             return Err(JournalError::TooLarge("build label"));
@@ -79,7 +92,19 @@ impl RecordedBootImage {
         enc.u64(self.boot_epoch.as_nanos());
         enc.string(&self.build_label);
         enc.bytes(&self.wal);
-        Ok(enc.finish())
+        enc.bytes(&self.store_wal);
+        match &self.snapshot {
+            Some(snapshot) => {
+                enc.u8(1);
+                enc.bytes(snapshot);
+            }
+            None => enc.u8(0),
+        }
+        let bytes = enc.finish();
+        if bytes.len() > MAX_BOOT_IMAGE_BYTES {
+            return Err(JournalError::TooLarge("boot image"));
+        }
+        Ok(bytes)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, JournalError> {
@@ -92,7 +117,7 @@ impl RecordedBootImage {
                 actual: magic,
             }));
         }
-        if !matches!(boot_version, 2 | DRIVER_BOOT_VERSION) {
+        if !matches!(boot_version, 2 | 3 | DRIVER_BOOT_VERSION) {
             return Err(JournalError::Decode(DecodeError::InvalidVersion {
                 expected: DRIVER_BOOT_VERSION,
                 actual: boot_version,
@@ -114,6 +139,24 @@ impl RecordedBootImage {
         if wal.len() > MAX_BOOT_IMAGE_BYTES {
             return Err(JournalError::TooLarge("boot WAL"));
         }
+        let (store_wal, snapshot) = if boot_version >= 4 {
+            let store_wal = dec.bytes()?;
+            let snapshot = match dec.u8()? {
+                0 => None,
+                1 => Some(dec.bytes()?),
+                _ => return Err(JournalError::Invalid("boot snapshot flag")),
+            };
+            if store_wal.len() > MAX_BOOT_IMAGE_BYTES
+                || snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.len() > MAX_BOOT_IMAGE_BYTES)
+            {
+                return Err(JournalError::TooLarge("boot durability image"));
+            }
+            (store_wal, snapshot)
+        } else {
+            (Vec::new(), None)
+        };
         dec.finish()?;
         Ok(Self {
             config,
@@ -122,6 +165,8 @@ impl RecordedBootImage {
             boot_epoch,
             build_label,
             wal,
+            store_wal,
+            snapshot,
         })
     }
 }
@@ -658,7 +703,9 @@ pub struct JournalReplay {
 pub enum JournalReplayError {
     Journal(JournalError),
     Log(LogError),
+    Store(StoreError),
     IncompleteBootWal,
+    IncompleteBootStoreWal,
     BootMetadataMismatch,
     DriverBoot(HostError),
     BlockDivergence {
@@ -681,8 +728,12 @@ impl fmt::Display for JournalReplayError {
         match self {
             Self::Journal(error) => write!(f, "CCIJ: {error}"),
             Self::Log(error) => write!(f, "recorded boot WAL: {error}"),
+            Self::Store(error) => write!(f, "recorded boot store WAL: {error}"),
             Self::IncompleteBootWal => {
                 f.write_str("recorded boot WAL is not a complete durable prefix")
+            }
+            Self::IncompleteBootStoreWal => {
+                f.write_str("recorded boot store WAL is not a complete durable prefix")
             }
             Self::BootMetadataMismatch => {
                 f.write_str("recorded boot metadata disagrees with embedded WAL genesis")
@@ -709,8 +760,8 @@ impl fmt::Display for JournalReplayError {
 impl std::error::Error for JournalReplayError {}
 
 /// Replay a CCIJ receipt through the same `Driver` boundary as a real host.
-/// The embedded boot image is the sole source of config, identity, membership
-/// and durable log bytes: replay deliberately consults neither a local data
+/// The embedded boot image is the sole source of config, identity, membership,
+/// and durable state: replay deliberately consults neither a local data
 /// directory nor ambient configuration.
 pub fn replay_journal(journal: &InputJournal) -> Result<JournalReplay, JournalReplayError> {
     let boot =
@@ -719,6 +770,12 @@ pub fn replay_journal(journal: &InputJournal) -> Result<JournalReplay, JournalRe
     if recovered.torn_tail_truncated || recovered.bytes_consumed != boot.wal.len() as u64 {
         return Err(JournalReplayError::IncompleteBootWal);
     }
+    let recovered_store = recover_store_wal(&boot.store_wal).map_err(JournalReplayError::Store)?;
+    if recovered_store.torn_tail_truncated
+        || recovered_store.bytes_consumed != boot.store_wal.len() as u64
+    {
+        return Err(JournalReplayError::IncompleteBootStoreWal);
+    }
     let state = recovered.state;
     if state.genesis.cluster_id != boot.cluster_id
         || state.genesis.policy != boot.config.policy
@@ -726,21 +783,71 @@ pub fn replay_journal(journal: &InputJournal) -> Result<JournalReplay, JournalRe
     {
         return Err(JournalReplayError::BootMetadataMismatch);
     }
+    let recovered_snapshot = match (state.snapshot, boot.snapshot.as_deref()) {
+        (Some(mark), Some(bytes)) => {
+            let decoded = decode_ccsn(
+                bytes,
+                boot.cluster_id,
+                boot.config.host_limits.max_snapshot_bytes,
+            )
+            .map_err(|_| JournalReplayError::BootMetadataMismatch)?;
+            let crc32c =
+                ccsn_file_crc(bytes).map_err(|_| JournalReplayError::BootMetadataMismatch)?;
+            if decoded.kv.applied_index != mark.index
+                || decoded.kv.applied_term != mark.term
+                || decoded.cluster_policy.encode() != boot.config.policy.encode()
+                || crc32c != mark.crc32c
+            {
+                return Err(JournalReplayError::BootMetadataMismatch);
+            }
+            let snapshot = node_snapshot_from_ccsn(decoded, boot.config.store)
+                .map_err(|error| JournalReplayError::DriverBoot(HostError::Node(error)))?;
+            Some((snapshot, mark, bytes.len() as u64))
+        }
+        (None, None) => None,
+        _ => return Err(JournalReplayError::BootMetadataMismatch),
+    };
+    let recovered_membership = recovered_snapshot.as_ref().map_or_else(
+        || state.genesis.membership.clone(),
+        |(snapshot, _, _)| snapshot.membership.clone(),
+    );
     let node = RecoveredNode {
         hard_state: state.hard_state,
         log_base: (state.base_index, state.base_term),
         entries: state.entries,
-        membership: boot.membership.clone(),
+        membership: recovered_membership,
         cluster_policy: boot.config.policy,
-        snapshot: None,
+        snapshot: recovered_snapshot
+            .as_ref()
+            .map(|(snapshot, _, _)| snapshot.clone()),
         durable_applied: (state.base_index, state.base_term),
     };
-    let mut driver = Driver::boot_with_wal_offset(
+    let mut driver = Driver::boot_with_offsets_and_genesis(
         boot.config,
         BootState::Recovered(Box::new(node)),
         recovered.bytes_consumed,
+        recovered_store.bytes_consumed,
+        state.genesis,
     )
     .map_err(JournalReplayError::DriverBoot)?;
+    driver
+        .node_mut()
+        .recover_durable_applies(&recovered_store)
+        .map_err(|error| JournalReplayError::DriverBoot(HostError::Node(error)))?;
+    if let Some((snapshot, mark, snapshot_len)) = recovered_snapshot {
+        driver
+            .register_published_snapshot(
+                FileId::Snapshot {
+                    generation: mark.generation,
+                },
+                snapshot.last_included_index,
+                snapshot.last_included_term,
+                snapshot.kv.checkpoint.image.sequence,
+                snapshot_len,
+                mark.crc32c,
+            )
+            .map_err(JournalReplayError::DriverBoot)?;
+    }
 
     for record in &journal.records {
         let mut blocks = ReplayBlockSource::new(record.block_observations.clone());
@@ -1058,7 +1165,10 @@ fn file_number(file: FileId) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cc_core::{ClientId, RequestSeq};
+    use cc_cluster::{CcsnSnapshot, SessionTable, encode_ccsn};
+    use cc_core::{ClientId, LogIndex, RequestSeq, Term};
+    use cc_kv::{LogicalKvEntry, LogicalKvSnapshot};
+    use cc_log::{DurableRecord, Genesis, Origin, SnapshotMark, encode_framed_durable_record};
 
     struct BusyBlockSource;
 
@@ -1146,11 +1256,81 @@ mod tests {
             boot_epoch: Time::from_nanos(11),
             build_label: String::from("test"),
             wal: vec![1, 2, 3],
+            store_wal: vec![4, 5, 6],
+            snapshot: Some(vec![7, 8, 9]),
         };
         assert_eq!(
             RecordedBootImage::decode(&image.encode().expect("encode")),
             Ok(image)
         );
+    }
+
+    #[test]
+    fn trap_replay_boot_image_restores_its_marked_snapshot() {
+        let cluster_id = [7; 16];
+        let policy = ClusterPolicy::default();
+        let membership =
+            MembershipState::new([NodeId::new(7)].into_iter().collect()).expect("membership");
+        let snapshot_bytes = encode_ccsn(&CcsnSnapshot {
+            cluster_id,
+            cluster_policy: policy,
+            membership: membership.clone(),
+            kv: LogicalKvSnapshot {
+                entries: vec![LogicalKvEntry {
+                    key: b"before-recording".to_vec(),
+                    sequence: 1,
+                    value: b"durable".to_vec(),
+                    deadline: None,
+                }],
+                store_sequence: 1,
+                applied_index: LogIndex::new(7),
+                applied_term: Term::new(3),
+                last_leader_time: Time::from_nanos(11),
+            },
+            sessions: SessionTable::default(),
+            leadership_transfer: None,
+        })
+        .expect("snapshot");
+        let mark = SnapshotMark {
+            index: LogIndex::new(7),
+            term: Term::new(3),
+            generation: 7,
+            crc32c: ccsn_file_crc(&snapshot_bytes).expect("snapshot CRC"),
+        };
+        let genesis = Genesis {
+            origin: Origin::Bootstrap,
+            cluster_id,
+            policy,
+            membership: membership.clone(),
+        };
+        let mut wal = encode_framed_durable_record(&DurableRecord::Genesis(Box::new(genesis)))
+            .expect("genesis");
+        wal.extend(
+            encode_framed_durable_record(&DurableRecord::InstalledSnapshotMark(mark))
+                .expect("snapshot mark"),
+        );
+        let boot_image = RecordedBootImage {
+            config: NodeConfig {
+                id: NodeId::new(7),
+                cluster_id,
+                seed: Seed::new(9),
+                raft: RaftConfig::default(),
+                store: StoreConfig::default(),
+                policy,
+                host_limits: HostLimits::default(),
+            },
+            cluster_id,
+            membership,
+            boot_epoch: Time::from_nanos(11),
+            build_label: String::from("test"),
+            wal,
+            store_wal: Vec::new(),
+            snapshot: Some(snapshot_bytes),
+        }
+        .encode()
+        .expect("boot image");
+        let replay = replay_journal(&InputJournal::new(boot_image)).expect("replay snapshot boot");
+        assert_eq!(replay.records, 0);
     }
 
     #[test]

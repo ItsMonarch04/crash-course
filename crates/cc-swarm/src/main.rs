@@ -2966,6 +2966,8 @@ mod trace_tests {
             boot_epoch: Time::from_nanos(0),
             build_label: String::from("test"),
             wal,
+            store_wal: Vec::new(),
+            snapshot: None,
         }
         .encode()
         .expect("boot image");
@@ -3022,6 +3024,8 @@ mod trace_tests {
             boot_epoch: Time::from_nanos(0),
             build_label: String::from("test"),
             wal,
+            store_wal: Vec::new(),
+            snapshot: None,
         }
         .encode()
         .expect("mismatched boot image");

@@ -788,11 +788,14 @@ impl DriverHost {
             .write(true)
             .truncate(false)
             .open(&store_wal_path)?;
-        let store_wal_bytes = fs::read(&store_wal_path)?;
+        let mut store_wal_bytes = fs::read(&store_wal_path)?;
         let recovered_store_wal = recover_store_wal(&store_wal_bytes).map_err(io::Error::other)?;
         if recovered_store_wal.torn_tail_truncated {
             store_wal.set_len(recovered_store_wal.bytes_consumed)?;
             store_wal.sync_data()?;
+            store_wal_bytes.truncate(usize::try_from(recovered_store_wal.bytes_consumed).map_err(
+                |_| io::Error::new(io::ErrorKind::InvalidData, "store WAL prefix is too large"),
+            )?);
         }
         store_wal.seek(SeekFrom::Start(recovered_store_wal.bytes_consumed))?;
 
@@ -871,6 +874,9 @@ impl DriverHost {
         );
         let wal_genesis = recovered.state.genesis.clone();
         let record_membership = recovered.state.genesis.membership.clone();
+        let record_snapshot_path = recovered_snapshot
+            .as_ref()
+            .map(|(_, _, mark)| published_snapshot_path(&config.data_dir, mark.generation));
         let recovered_node = RecoveredNode {
             hard_state: recovered.state.hard_state,
             log_base: (recovered.state.base_index, recovered.state.base_term),
@@ -912,6 +918,7 @@ impl DriverHost {
         let clock = HostClock::new(driver.node().kv.last_leader_time())?;
         let recorder = record_path
             .map(|path| {
+                let record_snapshot = record_snapshot_path.as_ref().map(fs::read).transpose()?;
                 let boot_image = RecordedBootImage {
                     config: effective_config,
                     cluster_id: config.cluster_id.bytes(),
@@ -919,6 +926,8 @@ impl DriverHost {
                     boot_epoch: clock.boot_epoch,
                     build_label: String::from(env!("CARGO_PKG_VERSION")),
                     wal: wal_bytes,
+                    store_wal: store_wal_bytes,
+                    snapshot: record_snapshot,
                 }
                 .encode()
                 .map_err(io::Error::other)?;

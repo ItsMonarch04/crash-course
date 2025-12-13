@@ -10,7 +10,7 @@ checksum = "46c5e41b57b8bba42a04676d81cb89e9ee8e859a1a66f80a5a72e1cb76b34d43"
 
 [[package]]
 name = "cc-bench"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-core",
  "cc-sim",
@@ -18,7 +18,7 @@ dependencies = [
 
 [[package]]
 name = "cc-checker"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-cluster",
  "cc-core",
@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "cc-cluster"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-core",
  "cc-env",
@@ -38,22 +38,22 @@ dependencies = [
 
 [[package]]
 name = "cc-core"
-version = "0.16.6"
+version = "0.16.7"
 
 [[package]]
 name = "cc-detlint"
-version = "0.16.6"
+version = "0.16.7"
 
 [[package]]
 name = "cc-env"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-core",
 ]
 
 [[package]]
 name = "cc-host"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-cluster",
  "cc-core",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "cc-kv"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-core",
  "cc-store",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "cc-log"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-core",
  "cc-env",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "cc-node"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-checker",
  "cc-cluster",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "cc-raft"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-core",
  "cc-env",
@@ -108,14 +108,14 @@ dependencies = [
 
 [[package]]
 name = "cc-resp"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-core",
 ]
 
 [[package]]
 name = "cc-sim"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-core",
  "cc-env",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "cc-store"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-core",
  "cc-env",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "cc-swarm"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-checker",
  "cc-cluster",
@@ -151,14 +151,14 @@ dependencies = [
 
 [[package]]
 name = "cc-wal"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-core",
 ]
 
 [[package]]
 name = "cc-wasm"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "cc-checker",
  "cc-core",

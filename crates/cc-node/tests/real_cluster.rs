@@ -1166,6 +1166,16 @@ fn trap_real_host_effects_match_replay() {
     let record_port = record_client_base + 1;
     let record_config = record_base.join("n1/ccdb.toml");
     let record_path = record_base.join("run.ccij");
+    let mut primed = start(binary, &record_config).expect("start recording fixture for priming");
+    assert!(wait_for_port(record_port), "priming node did not start");
+    let (_, primed_reply) =
+        request_eventually(&[record_port], &["SET", "before-recording", "durable"]);
+    assert!(
+        primed_reply.starts_with(b"+OK"),
+        "priming write: {primed_reply:?}"
+    );
+    stop(&mut primed);
+
     let mut recorded = Command::new(binary)
         .args(["run", "--config"])
         .arg(&record_config)
@@ -1176,6 +1186,11 @@ fn trap_real_host_effects_match_replay() {
         .spawn()
         .expect("start recording node");
     assert!(wait_for_port(record_port), "recording node did not start");
+    let (_, primed_read) = request_eventually(&[record_port], &["GET", "before-recording"]);
+    assert_eq!(
+        primed_read, b"$7\r\ndurable\r\n",
+        "recording must start from the recovered store state"
+    );
     let (_, reply) = request_eventually(&[record_port], &["SET", "record", "fixture"]);
     assert!(reply.starts_with(b"+OK"), "recorded reply: {reply:?}");
     let (_, first_retry) = request_eventually(
@@ -1235,6 +1250,10 @@ fn trap_real_host_effects_match_replay() {
     );
     assert!(boot.membership.voters.contains(&cc_core::NodeId::new(1)));
     assert_eq!(boot.build_label, env!("CARGO_PKG_VERSION"));
+    assert!(
+        !boot.store_wal.is_empty(),
+        "boot image must retain state committed before recording began"
+    );
     assert!(
         journal
             .records
