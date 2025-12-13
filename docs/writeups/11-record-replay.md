@@ -11,8 +11,8 @@ fails over, restarts a node, and records a live process. The same journal is
 then consumed without ambient host configuration:
 
 ```sh
-cargo test -p cc-node --test real_cluster trap_real_host_effects_match_replay
-cargo run -p cc-swarm -- replay --file run.ccij --assert-effects
+cargo test --locked -p cc-node --test real_cluster trap_real_host_effects_match_replay
+cargo run --locked -p cc-swarm -- replay --file run.ccij --assert-effects
 ```
 
 The observed result is `effects-match` for a complete bounded recording or

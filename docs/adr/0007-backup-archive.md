@@ -1,6 +1,6 @@
 # ADR-0007: Offline checkpoint archive
 
-- Status: Accepted
+- Status: Superseded by [ADR-0017](0017-complete-replay-and-implementation-status.md)
 - Date: 2025-11-13
 
 ## Decision
@@ -18,5 +18,5 @@ report-only; restore never merges with existing data.
 
 ## Consequences
 
-This archive follows the real host's current `cc-log` durable truth. It is not
-an SSTable checkpoint and must evolve when the storage/snapshot file set lands.
+This archive followed the real host's v1 `cc-log` durable truth. ADR-0017
+records the CCSN-based CCBK v2 format that superseded it.

@@ -25,10 +25,14 @@ are:
 | Raft peer message | `CCRP` | 1 | `cc-raft::codec` |
 | Host input value | `CCEI` | 1 | `cc-env` |
 | Host effect value | `CCEO` | 1 | `cc-env` |
+| Recorded Driver boot image | `CCBI` | 4 (v2/v3 read) | `cc-host::journal` |
 | Paired input/effect journal | `CCIJ` | 1 | `cc-host::journal` |
 | Raft durability record | `CCLR` | 1 | `cc-log` |
+| Store apply WAL | `CCSW` | 1 | `cc-store` |
+| Logical checkpoint | `CCSN` | 1 | `cc-cluster` |
+| Store manifest | `CCMF` | 1 | `cc-store` |
 | History receipt | `CCHY` | 2 | `cc-checker` |
-| Offline logical backup archive | `CCBK` | 2 (v1 reject) | `cc-node` |
+| Offline logical backup archive | `CCBK` | 2 (v1 reject) | `cc-cluster::backup` |
 | Store metadata | `CCMT` | 2 (v1 read) | `cc-store` |
 
 The byte layouts are intentionally implemented by hand. A layout change needs
@@ -77,8 +81,10 @@ checksum field. Capture requires the exact CCSN named by a durable CCLR
 snapshot mark; restore validates the inner checkpoint then creates a new
 one-node CCID, Restore-origin Genesis, synthetic `(index=1, term=1)` snapshot,
 and fresh WAL. Source node/config identity is never copied. The legacy v1
-node-clone envelope remains recognizable solely so it can be rejected; a
-fresh-cluster legacy logical importer is not implemented yet.
+node-clone envelope is rejected by default. The explicit
+`--accept-legacy-node-backup` importer validates its checkpoint, discards its
+node and configuration identity, and restores only into a caller-supplied
+fresh cluster identity.
 
 `CCMF` v1 is an append-only manifest: `magic:u32="CCMF" | version:u16 |
 generation:u64 | header_crc32c:u32`, then independently checksummed bounded
@@ -208,14 +214,15 @@ and zero fields; a present identity carries nonzero caller-owned client and
 sequence values. It is how `CC.REQUEST` reaches the replicated CCAP session
 envelope without turning a connection counter into durable state.
 
-The current `boot_image` is `CCBI` v2. It contains the cluster id; complete
-effective `NodeConfig`/host limits; committed membership; boot epoch; bounded
-build label; and the verified Raft WAL. Replay checks the copied identity,
-policy, and membership against WAL Genesis before rebuilding the shared Driver,
-then supplies the recorded block observations and compares each transition's
-complete effect vector. The real host's current WAL-only store path does not
-yet issue SST reads, but the receipt field is present and exact rather than
-silently omitted. Snapshot images remain future work.
+The current `boot_image` is `CCBI` v4; the reader retains v2 and v3 support.
+It contains the cluster id; complete effective `NodeConfig`/host limits;
+committed bootstrap membership; boot epoch; bounded build label; verified
+Raft and store-WAL prefixes; and the exact logical CCSN checkpoint named by a
+snapshot mark, when one exists. Replay checks the copied identity, policy,
+membership, snapshot metadata, and durability prefixes before rebuilding the
+shared Driver. It then supplies recorded block observations and compares each
+transition's complete effect vector. This lets a recording begin after prior
+writes or snapshot compaction without silently reconstructing an empty store.
 The replay tool accepts a different captured build label but emits a warning;
 it never consults a repository checkout or ambient node configuration.
 
@@ -251,9 +258,8 @@ are CRC-32C over the preceding body.
   each sixteenth data entry is a restart. Its footer is
   `index_offset:u64 | index_length:u32 | bloom_offset:u64 | bloom_length:u32 |
   entry_count:u64 | format_version:u16=2 | footer_crc32c:u32 | "CCST"`.
-  V2 remains a separate reader/writer path while the durable node-store
-  migration and META publication protocol are completed; it never changes a
-  C0 v1 byte or reader.
+  V2 is the current durable node-store table format. Its separate reader and
+  writer retain every C0 v1 byte and reader unchanged.
 - META: `CCMT`, format `1`, `manifest_generation:u64`, followed by the CRC.
 - WAL segment: `CCWL`, format `1`, `segment_sequence:u64`; records carry a
   `length:u32`, `kind:u8`, payload, and CRC, with segment padding and seal
@@ -269,5 +275,5 @@ SST 4343535401000700000000000000020000000100000061010000000000000001030000006f6e
 META 43434d54010007000000000000008b275acd
 ```
 
-The audit boundary and deferred deltas are recorded in ADR-0005; this page
-describes the fixture bytes rather than an aspirational LSM implementation.
+The frozen v1 fixture boundary is recorded in ADR-0005. ADR-0017 records the
+implemented Storage v2 boundary described above.

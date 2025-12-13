@@ -6,10 +6,10 @@ The immutable current-format compatibility base is
 the full producer commit, Cargo.lock hash, toolchain/target, `ccdb` binary
 hash, and exact `ccdb --version` output hash.
 
-[`tests/golden/manifest.tsv`](../tests/golden/manifest.tsv) contains 46
+[`tests/golden/manifest.tsv`](../tests/golden/manifest.tsv) contains 47
 hashed rows: 27 immutable current-format fixtures from the compatibility
-base, eight audited `2c733f3` legacy fixtures, and 11 current worktree formats
-introduced by the storage, snapshot, batching, and backup roadmap. Each
+base, eight audited `2c733f3` legacy fixtures, and 12 current worktree formats
+covering storage, snapshots, batching, backup, and replay. Each
 source generator is run twice into separate directories and the outputs are
 compared byte-for-byte before installation. Every row records immutable
 producer provenance, a semantic sidecar, a current-reader policy, and its

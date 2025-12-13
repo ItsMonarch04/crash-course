@@ -1,7 +1,7 @@
 # Operations notes
 
-The real host is a local demonstration of the shared host boundary. `ccdb
-init` creates a three-node configuration; each process starts a
+The real host is a local demonstration of the shared host boundary. `ccdb init`
+creates a three-node configuration; each process starts a
 `cc_host::Driver` over the same `cc_cluster::Node` used by the simulator and
 theater. Raft durability records are written to `raft/wal.0` as bounded,
 length-prefixed `cc-log` records. Every write is followed by `sync_data` before
@@ -44,16 +44,16 @@ post-N1 recovery boundary.
 ## Start and inspect
 
 ```sh
-cargo run -p cc-node --bin ccdb -- init --cluster demo --cluster-id 00112233445566778899aabbccddeeff --nodes 3 --base-dir /tmp/ccdb-demo
-cargo run -p cc-node --bin ccdb -- run --config /tmp/ccdb-demo/n1/ccdb.toml
-cargo run -p cc-node --bin ccdb -- run --config /tmp/ccdb-demo/n2/ccdb.toml
-cargo run -p cc-node --bin ccdb -- run --config /tmp/ccdb-demo/n3/ccdb.toml
-cargo run -p cc-node --bin ccdb -- admin --addr 127.0.0.1:7102 status
-cargo run -p cc-node --bin ccdb -- selfcheck --data-dir /tmp/ccdb-demo/n1
-cargo run -p cc-node --bin ccdb -- selfcheck --deep --data-dir /tmp/ccdb-demo/n1
-cargo run -p cc-node --bin ccdb -- doctor --data-dir /tmp/ccdb-demo/n1
-cargo run -p cc-node --bin ccdb -- admin backup --data-dir /tmp/ccdb-demo/n1 --output /tmp/n1.ccbk
-cargo run -p cc-node --bin ccdb -- admin restore --input /tmp/n1.ccbk --data-dir /tmp/ccdb-restored/n1 --new-cluster-id 11112233445566778899aabbccddeeff --new-node-id 1
+cargo run --locked -p cc-node --bin ccdb -- init --cluster demo --cluster-id 00112233445566778899aabbccddeeff --nodes 3 --base-dir /tmp/ccdb-demo
+cargo run --locked -p cc-node --bin ccdb -- run --config /tmp/ccdb-demo/n1/ccdb.toml
+cargo run --locked -p cc-node --bin ccdb -- run --config /tmp/ccdb-demo/n2/ccdb.toml
+cargo run --locked -p cc-node --bin ccdb -- run --config /tmp/ccdb-demo/n3/ccdb.toml
+cargo run --locked -p cc-node --bin ccdb -- admin --addr 127.0.0.1:7102 status
+cargo run --locked -p cc-node --bin ccdb -- selfcheck --data-dir /tmp/ccdb-demo/n1
+cargo run --locked -p cc-node --bin ccdb -- selfcheck --deep --data-dir /tmp/ccdb-demo/n1
+cargo run --locked -p cc-node --bin ccdb -- doctor --data-dir /tmp/ccdb-demo/n1
+cargo run --locked -p cc-node --bin ccdb -- admin backup --data-dir /tmp/ccdb-demo/n1 --output /tmp/n1.ccbk
+cargo run --locked -p cc-node --bin ccdb -- admin restore --input /tmp/n1.ccbk --data-dir /tmp/ccdb-restored/n1 --new-cluster-id 11112233445566778899aabbccddeeff --new-node-id 1
 ```
 
 `backup` exports the one CCSN file named by a durable snapshot mark, so a data
@@ -66,8 +66,8 @@ For a compact deterministic receipt from one real-host run, provide a new
 record path and replay it through the same shared Driver:
 
 ```sh
-cargo run -p cc-node --bin ccdb -- run --config /tmp/ccdb-demo/n1/ccdb.toml --record /tmp/n1.ccij
-cargo run -p cc-swarm -- replay --file /tmp/n1.ccij --assert-effects
+cargo run --locked -p cc-node --bin ccdb -- run --config /tmp/ccdb-demo/n1/ccdb.toml --record /tmp/n1.ccij
+cargo run --locked -p cc-swarm -- replay --file /tmp/n1.ccij --assert-effects
 ```
 
 The recorder creates the receipt once, owner-readable only on Unix, and
@@ -75,9 +75,10 @@ syncs every transition frame. Treat it as sensitive operational data: it
 contains the node's retained WAL, client data, replies, and topology. It also
 captures every synchronous block read in request order, including returned
 bytes, result tag, and service time; replay refuses to consult local block
-storage for those reads. Recorder boot images do not embed checkpoint files, so this
-does not turn wipe/reseed recovery into a supported claim. Its default 128 MiB
-limit can be changed with
+storage for those reads. The boot image embeds the verified Raft and store-WAL
+prefixes plus the exact logical checkpoint named by a durable snapshot mark;
+it does not copy ambient SST or manifest paths. Its default 128 MiB limit can
+be changed with
 `--record-max-bytes N`. Before that limit would be exceeded, it fsyncs a
 `capped` footer and normally continues the node unrecorded; use
 `--record-required` to exit nonzero instead if the receipt must cover the run.
