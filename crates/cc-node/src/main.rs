@@ -81,10 +81,18 @@ fn main() -> io::Result<()> {
         Some("selfcheck") => selfcheck(&args[1..]),
         Some("doctor") => doctor(&args[1..]),
         Some("admin") => admin(&args[1..]),
-        _ => {
+        Some("--version" | "-V") => {
+            println!("ccdb {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--help" | "-h") | None => {
             print_help();
             Ok(())
         }
+        Some(command) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown command {command:?}; run ccdb --help"),
+        )),
     }
 }
 
@@ -1391,12 +1399,21 @@ fn admin(args: &[String]) -> io::Result<()> {
         println!("RAFT.{action} requested={address} resolved={resolved} result={response}");
         return Ok(());
     }
-    match args
+    let query = args
         .iter()
-        .find(|arg| matches!(arg.as_str(), "status" | "members" | "list" | "snapshot"))
-        .map(String::as_str)
-        .unwrap_or("status")
-    {
+        .find(|arg| matches!(arg.as_str(), "status" | "members" | "list"))
+        .map(String::as_str);
+    let query = match query {
+        Some(query) => query,
+        None if args.is_empty() || matches!(args, [flag, _] if flag == "--addr") => "status",
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown admin command; run ccdb --help",
+            ));
+        }
+    };
+    match query {
         "members" | "list" => {
             let (resolved, _) = request_info_follow(&address)?;
             let members = if has_flag(args, "--consistent") {
@@ -1406,7 +1423,6 @@ fn admin(args: &[String]) -> io::Result<()> {
             };
             println!("RAFT.MEMBERS requested={address} resolved={resolved} {members}")
         }
-        "snapshot" => println!("RAFT.SNAPSHOT addr={address} state=unavailable checkpoint=none"),
         _ => {
             let (resolved, response) = request_info_follow(&address)?;
             println!("RAFT.STATUS requested={address} resolved={resolved} {response}");
@@ -1419,13 +1435,13 @@ fn required_admin_identity(args: &[String]) -> io::Result<(String, String)> {
     let operator = flag(args, "--operator-id").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "membership mutation requires --operator-id",
+            "admin mutation requires --operator-id",
         )
     })?;
     let sequence = flag(args, "--sequence").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "membership mutation requires --sequence",
+            "admin mutation requires --sequence",
         )
     })?;
     for (name, value) in [("--operator-id", &operator), ("--sequence", &sequence)] {
@@ -1475,10 +1491,8 @@ fn marked_checkpoint(
     validate_identity(&config)?;
     let identity = DiskIdentity::decode(&fs::read(identity_path(data_dir))?)?;
     let wal_path = data_dir.join("raft/wal.0");
-    // A bare `?` here reported `No such file or directory` with no path and no
-    // reason, which is what an operator following the runbook sees first: a
-    // freshly initialised directory has no WAL yet, and therefore no durable
-    // checkpoint to export.
+    // Include the path and missing-checkpoint explanation in the operator
+    // error instead of surfacing an unqualified filesystem error.
     let wal = fs::read(&wal_path).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -2151,7 +2165,7 @@ fn print_help() {
     println!(concat!(
         "ccdb ",
         env!("CARGO_PKG_VERSION"),
-        "\n\nCommands:\n  init --cluster NAME --cluster-id HEX32 --nodes N [--base-dir DIR]\n  init --cluster NAME --cluster-id HEX32 --node-id ID --data-dir DIR\n  run --config PATH [--record PATH] [--record-max-bytes N] [--record-required] [--run-for-ms N] [--i-know-this-is-unauthenticated]\n  peer --config PATH --addr ADDR [--retries N]\n  admin --addr ADDR status|members|snapshot\n  admin --addr ADDR add-learner|promote-learner --node-id ID\n  admin --addr ADDR leave-joint\n  admin --addr ADDR feature activate atomic-batch\n  admin backup --data-dir DIR --output FILE\n  admin restore --input FILE --data-dir DIR\n  selfcheck --data-dir DIR [--deep]\n  doctor [--data-dir DIR] [--client-addr ADDR] [--peer-addr ADDR]"
+        "\n\nCommands:\n  init --cluster NAME --cluster-id HEX32 --nodes N [--base-dir DIR]\n  init --cluster NAME --cluster-id HEX32 --node-id ID --data-dir DIR\n  run --config PATH [--record PATH] [--record-max-bytes N] [--record-required] [--run-for-ms N] [--i-know-this-is-unauthenticated]\n  run --join SEED_ADDR --node-id ID --peer-addr ADDR [--client-addr ADDR] [--metrics-addr ADDR] --data-dir DIR\n  peer --config PATH --addr ADDR [--retries N]\n  admin --addr ADDR status\n  admin --addr ADDR members [--consistent]\n  admin --addr ADDR add-learner --node-id ID --peer-addr ADDR --operator-id ID --sequence N\n  admin --addr ADDR promote-learner|remove|transfer-leader --node-id ID --operator-id ID --sequence N\n  admin --addr ADDR update-address --node-id ID --peer-addr ADDR --operator-id ID --sequence N\n  admin --addr ADDR leave-joint --operator-id ID --sequence N\n  admin --addr ADDR feature activate atomic-batch --operator-id ID --sequence N\n  admin backup --data-dir DIR --output FILE\n  admin restore --input FILE --data-dir DIR --new-cluster-id HEX32 --new-node-id ID [--accept-legacy-node-backup]\n  selfcheck --data-dir DIR [--deep]\n  doctor [--data-dir DIR] [--client-addr ADDR] [--peer-addr ADDR]"
     ));
 }
 

@@ -2287,13 +2287,27 @@ impl RaftNode {
                 }
             }
             ConfigOperation::FinishLeaderTransfer { intent_index, .. } => {
-                if self
+                let committed_intent = self
                     .transfer
-                    .is_some_and(|transfer| transfer.intent_index == intent_index)
-                {
+                    .is_some_and(|transfer| transfer.intent_index == intent_index);
+                let retained_intent = self.log.iter().any(|candidate| {
+                    candidate.index == intent_index
+                        && candidate.kind.is_config()
+                        && ConfigEnvelope::decode(&candidate.payload).is_ok_and(|envelope| {
+                            matches!(
+                                envelope.operation,
+                                ConfigOperation::BeginLeaderTransfer { .. }
+                            )
+                        })
+                });
+                if committed_intent || (intent_index < entry.index && retained_intent) {
                     // The durable workflow is cleared only by committed apply;
                     // append accepts the matching terminal entry so it can be
-                    // replicated to every follower first.
+                    // replicated to followers that retain the Begin entry but
+                    // have not learned its commit yet. TimeoutNow requires the
+                    // target to have applied Begin, but the other quorum members
+                    // can legitimately lag that commit notification when the
+                    // target wins its election.
                 } else {
                     return Err(RaftError::InvalidMessage);
                 }
@@ -4345,6 +4359,76 @@ mod tests {
     }
 
     #[test]
+    fn trap_finish_replication_does_not_require_intent_apply() {
+        let mut follower = node(3);
+        follower.hard_state.term = Term::new(2);
+        let intent = Entry {
+            term: Term::new(2),
+            index: LogIndex::new(1),
+            kind: EntryKind::Config,
+            payload: ConfigEnvelope {
+                admin_session: None,
+                leader_time: Time::from_nanos(5),
+                operation: ConfigOperation::BeginLeaderTransfer {
+                    target: NodeId::new(2),
+                },
+            }
+            .encode(),
+        };
+        follower.log.push(intent.clone());
+        assert!(
+            follower.transfer.is_none(),
+            "the follower has not learned that the retained intent committed"
+        );
+        let noop = Entry {
+            term: Term::new(3),
+            index: LogIndex::new(2),
+            kind: EntryKind::Noop,
+            payload: Vec::new(),
+        };
+        let finish = Entry {
+            term: Term::new(3),
+            index: LogIndex::new(3),
+            kind: EntryKind::Config,
+            payload: ConfigEnvelope {
+                admin_session: None,
+                leader_time: Time::from_nanos(6),
+                operation: ConfigOperation::FinishLeaderTransfer {
+                    intent_index: intent.index,
+                    result: TransferResult::Success,
+                },
+            }
+            .encode(),
+        };
+        let effects = follower.on_message(Message {
+            proto_version: PROTOCOL_VERSION,
+            from: NodeId::new(2),
+            to: NodeId::new(3),
+            term: Term::new(3),
+            kind: MessageKind::AppendReq(AppendRequest {
+                prev_index: intent.index,
+                prev_term: intent.term,
+                entries: vec![noop, finish],
+                leader_commit: intent.index,
+                read_round: 0,
+            }),
+        });
+        assert_eq!(follower.last_index(), LogIndex::new(3));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RaftEffect::PersistEntries(entries)
+                if entries.len() == 2 && entries.last().is_some_and(|entry| entry.index == LogIndex::new(3))
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RaftEffect::Send(Message {
+                kind: MessageKind::AppendResp(AppendResponse { success: true, .. }),
+                ..
+            })
+        )));
+    }
+
+    #[test]
     fn trap_leadership_transfer_recovers_or_finishes_after_crash() {
         let mut leader = node(1);
         leader.role = Role::Leader;
@@ -4768,8 +4852,8 @@ mod tests {
             total.duplicates,
             total.drops
         );
-        // Without these the campaign could pass by never reaching a leader,
-        // which is exactly how the previous version of this test stayed green.
+        // Require every headline transition so a degenerate schedule cannot
+        // report a clean campaign without exercising consensus.
         assert!(total.elections > 0, "no leader was ever elected");
         assert!(
             total.committed_indices > 0,

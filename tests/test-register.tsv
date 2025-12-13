@@ -113,6 +113,7 @@ N4	NG4	cargo-lib	cc-cluster	trap_session_byte_limit_counts_request_and_reply	Ses
 N4	NG4	cargo-lib	cc-cluster	trap_session_table_is_bounded	Session table is bounded	green
 -	-	cargo-lib	cc-cluster	trap_single_voter_election_still_waits_for_hard_state_fsync	Single voter election still waits for hard state fsync	green
 -	-	cargo-lib	cc-cluster	trap_stepping_down_closes_an_open_follower_read_round	A leader that steps down mid-ReadIndex closes the round instead of queueing follower reads forever	green
+-	-	cargo-lib	cc-cluster	trap_transfer_finish_applies_after_intent_checkpoint_compaction	Transfer finish applies after intent checkpoint compaction	green
 N4	NG4	cargo-lib	cc-cluster	trap_uncommitted_log_is_bounded_under_partition	Uncommitted log is bounded under partition	green
 N1	NG1	cargo-lib	cc-cluster	trap_unknown_or_duplicate_io_completion_fails_closed	Unknown or duplicate persistence completions fail closed	green
 N0	NG0	cargo-lib	cc-cluster	trap_user_and_admin_entries_share_one_atomic_session_table	User and admin entries share one atomic session table	green
@@ -262,6 +263,7 @@ N1	NG1	cargo-bin	cc-node	trap_ccid_lifecycle_rejects_removed_directory_reactivat
 N1	NG1	cargo-bin	cc-node	trap_ccid_minima_only_increase	Ccid minima only increase	green
 N1	NG1	cargo-bin	cc-node	trap_ccid_refuses_a_symlinked_data_directory_before_opening_state	CCID refuses a symlinked data directory before opening state	green
 C0	C0	cargo-bin	cc-node	trap_ccid_refuses_future_reader_before_opening_state	A raised CCID reader floor is refused before opening other node state	green
+-	-	cargo-test	cc-node	trap_cli_help_matches_real_commands_and_unknowns_fail	Cli help matches real commands and unknowns fail	green
 N1	NG1	cargo-bin	cc-node	trap_cluster_id_is_required_and_not_the_label	Cluster id is required and not the label	green
 N4	NG4	cargo-bin	cc-node	trap_cluster_policy_hash_matches_genesis_ccid_and_snapshot	Cluster policy hash matches genesis ccid and snapshot	green
 N1	NG1	cargo-bin	cc-node	trap_cluster_policy_mismatch_refuses_before_service	Cluster policy mismatch refuses before service	green
@@ -348,6 +350,7 @@ N0	NG0	cargo-lib	cc-raft	trap_checkquorum_steps_down_isolated_leader	An isolated
 -	-	cargo-lib	cc-raft	trap_config_in_snapshot_keeps_current_membership	Config in snapshot keeps current membership	green
 N0	NG0	cargo-lib	cc-raft	trap_config_on_append_changes_joint_quorum_before_commit	Configuration takes effect on follower append	green
 -	-	cargo-lib	cc-raft	trap_figure8_does_not_commit_prior_term_without_current_term_entry	Figure8 does not commit prior term without current term entry	green
+-	-	cargo-lib	cc-raft	trap_finish_replication_does_not_require_intent_apply	Finish replication does not require intent apply	green
 N0	NG0	cargo-lib	cc-raft	trap_follower_applies_config_on_append	Follower applies config on append	green
 N10	NG10	cargo-lib	cc-raft	trap_follower_read_tags_require_semantic_v3	Follower read tags require semantic v3	green
 N8	NG8	cargo-lib	cc-raft	trap_join_discovery_membership_never_grants_a_vote	Join discovery membership never grants a vote	green

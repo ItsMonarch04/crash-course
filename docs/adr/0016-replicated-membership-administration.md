@@ -1,6 +1,6 @@
 # ADR 0016: Replicated membership administration (D17)
 
-Status: Accepted — implementation pending
+Status: Implemented; current receipts are consolidated in [ADR-0017](0017-complete-replay-and-implementation-status.md)
 
 Real membership administration follows add learner, catch up, joint
 promote/remove and carries replicated peer addresses. Admin requests use an

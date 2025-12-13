@@ -2137,6 +2137,34 @@ fn same_admin_operation(left: &[u8], right: &[u8]) -> bool {
     )
 }
 
+fn canonical_transfer_intent(
+    raft: &RaftNode,
+    intent_index: LogIndex,
+    admin_session: (SessionKey, u64),
+) -> Option<Bytes> {
+    let transfer = raft.leadership_transfer_state()?;
+    if transfer.intent_index != intent_index || transfer.admin_session != Some(admin_session) {
+        return None;
+    }
+    let leader_time = transfer
+        .deadline
+        .checked_sub(raft.config.leader_transfer_timeout)?;
+    let canonical = ConfigEnvelope {
+        admin_session: Some(admin_session),
+        leader_time,
+        operation: ConfigOperation::BeginLeaderTransfer {
+            target: transfer.target,
+        },
+    }
+    .encode();
+    if let Some(retained) = raft.log.iter().find(|entry| entry.index == intent_index)
+        && (!retained.kind.is_config() || retained.payload != canonical)
+    {
+        return None;
+    }
+    Some(canonical)
+}
+
 impl fmt::Display for NodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3753,23 +3781,18 @@ impl Node {
                                 result,
                             },
                         ) => {
-                            let original = working_raft
-                                .log
-                                .iter()
-                                .find(|candidate| candidate.index == *intent_index)
-                                .and_then(|candidate| {
-                                    ConfigEnvelope::decode(&candidate.payload)
-                                        .ok()
-                                        .filter(|begin| {
-                                            begin.admin_session == Some((key, sequence))
-                                                && matches!(
-                                                    begin.operation,
-                                                    ConfigOperation::BeginLeaderTransfer { .. }
-                                                )
-                                        })
-                                        .map(|_| candidate.payload.clone())
-                                })
-                                .ok_or(NodeError::MalformedCommittedEntry(entry.index))?;
+                            // A checkpoint taken at the committed Begin entry
+                            // legitimately removes that entry from the live
+                            // log while retaining its workflow state in CCSN.
+                            // Reconstruct the exact canonical request from the
+                            // durable deadline/target/session tuple so every
+                            // replica caches identical terminal session bytes.
+                            let original = canonical_transfer_intent(
+                                &working_raft,
+                                *intent_index,
+                                (key, sequence),
+                            )
+                            .ok_or(NodeError::MalformedCommittedEntry(entry.index))?;
                             let result_tag = match result {
                                 TransferResult::Success => AdminResultTag::TransferSuccess,
                                 TransferResult::Timeout => AdminResultTag::TransferTimeout,
@@ -5444,6 +5467,81 @@ mod tests {
         assert_eq!(decoded.leadership_transfer, Some(transfer));
         let restored = node_snapshot_from_ccsn(decoded, config(1).store).expect("node snapshot");
         assert_eq!(restored.leadership_transfer, Some(transfer));
+    }
+
+    #[test]
+    fn trap_transfer_finish_applies_after_intent_checkpoint_compaction() {
+        let voters: BTreeSet<NodeId> = [NodeId::new(1), NodeId::new(2)].into_iter().collect();
+        let mut node = Node::new(config(2), voters).expect("node");
+        let leader_time = Time::from_nanos(10);
+        node.kv
+            .apply_command_only(LogIndex::new(7), Term::new(2), KvCommand::Ping, leader_time);
+        node.raft
+            .install_snapshot_state(LogIndex::new(7), Term::new(2));
+        let admin = SessionKey::new(SessionNamespace::AdminRequest as u8, ClientId::new(77))
+            .expect("admin");
+        let transfer = LeadershipTransferState {
+            intent_index: LogIndex::new(7),
+            target: NodeId::new(2),
+            deadline: leader_time + node.raft.config.leader_transfer_timeout,
+            finishing: true,
+            admin_session: Some((admin, 9)),
+        };
+        node.raft
+            .restore_leadership_transfer(Some(transfer))
+            .expect("compacted transfer state");
+        node.raft.role = Role::Leader;
+        node.raft.hard_state.term = Term::new(3);
+        let noop = Entry {
+            term: Term::new(3),
+            index: LogIndex::new(8),
+            kind: cc_raft::EntryKind::Noop,
+            payload: Vec::new(),
+        };
+        let finish = Entry {
+            term: Term::new(3),
+            index: LogIndex::new(9),
+            kind: cc_raft::EntryKind::Config,
+            payload: ConfigEnvelope {
+                admin_session: Some((admin, 9)),
+                leader_time: transfer.deadline,
+                operation: ConfigOperation::FinishLeaderTransfer {
+                    intent_index: LogIndex::new(7),
+                    result: TransferResult::Success,
+                },
+            }
+            .encode(),
+        };
+        node.raft.log = vec![noop.clone(), finish.clone()];
+        node.raft.commit_index = finish.index;
+        node.raft.applied_index = finish.index;
+
+        let prepared = node
+            .prepare_committed_entries(vec![noop, finish])
+            .expect("apply terminal above compacted intent");
+        let terminal = prepared.back().expect("terminal store apply");
+        assert_eq!(terminal.kv.applied_index, LogIndex::new(9));
+        assert!(terminal.raft.leadership_transfer_state().is_none());
+        let record = terminal.sessions.records.get(&admin).expect("admin result");
+        assert_eq!(record.max_seq, 9);
+        assert_eq!(
+            record.canonical_command,
+            ConfigEnvelope {
+                admin_session: Some((admin, 9)),
+                leader_time,
+                operation: ConfigOperation::BeginLeaderTransfer {
+                    target: NodeId::new(2),
+                },
+            }
+            .encode(),
+            "all replicas must cache the original canonical request bytes"
+        );
+        assert_eq!(
+            AdminReply::decode(&record.cached_reply)
+                .expect("cached reply")
+                .result,
+            AdminResultTag::TransferSuccess
+        );
     }
 
     #[test]

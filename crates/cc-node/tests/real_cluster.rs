@@ -14,6 +14,64 @@ use cc_core::{NodeId, PeerAddress};
 use cc_host::journal::{InputJournal, JournalTermination, RecordedBootImage, replay_journal};
 use cc_resp::RespValue;
 
+#[test]
+fn trap_cli_help_matches_real_commands_and_unknowns_fail() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_ccdb"));
+    let version = Command::new(binary)
+        .arg("--version")
+        .output()
+        .expect("run --version");
+    assert!(version.status.success(), "--version failed: {version:?}");
+    assert_eq!(
+        version.stdout,
+        format!("ccdb {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+    );
+
+    let help = Command::new(binary)
+        .arg("--help")
+        .output()
+        .expect("run --help");
+    assert!(help.status.success(), "--help failed: {help:?}");
+    let help = String::from_utf8(help.stdout).expect("UTF-8 help");
+    for required in [
+        "run --join SEED_ADDR",
+        "--operator-id ID --sequence N",
+        "--new-cluster-id HEX32 --new-node-id ID",
+        "--accept-legacy-node-backup",
+    ] {
+        assert!(help.contains(required), "help omits {required:?}");
+    }
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with("admin ") && line.contains("snapshot")),
+        "help advertises the unsupported snapshot command"
+    );
+
+    let unknown = Command::new(binary)
+        .arg("definitely-not-a-command")
+        .output()
+        .expect("run unknown command");
+    assert!(!unknown.status.success(), "unknown command succeeded");
+    assert!(
+        unknown.stdout.is_empty(),
+        "unknown command printed normal output"
+    );
+
+    let fake_snapshot = Command::new(binary)
+        .args(["admin", "snapshot"])
+        .output()
+        .expect("run unsupported snapshot command");
+    assert!(
+        !fake_snapshot.status.success(),
+        "unsupported snapshot command succeeded"
+    );
+    assert!(
+        fake_snapshot.stdout.is_empty(),
+        "unsupported snapshot command fabricated status"
+    );
+}
+
 fn frame(parts: &[&str]) -> Vec<u8> {
     let mut output = format!("*{}\r\n", parts.len()).into_bytes();
     for part in parts {
@@ -268,7 +326,9 @@ fn cluster_diagnostics(ports: &[u16], key: &str) -> BTreeMap<u16, String> {
 /// deliberately refused until leadership moves, and nothing pins leadership
 /// after a transfer, so an operator whose cluster re-elected the old leader
 /// transfers again under a fresh operator id and reissues the same unproposed
-/// removal pair. Retrying the refusal alone would only re-observe it.
+/// removal pair. A successful removal can close the removed node's client
+/// socket before its terminal reply arrives, so retries must query every
+/// surviving replica for the replicated AdminRequest result.
 fn remove_voter_eventually(
     binary: &Path,
     ports: &[u16],
@@ -280,21 +340,27 @@ fn remove_voter_eventually(
     let remove = ["remove", "--node-id", node_text.as_str()];
     let mut last = String::new();
     for attempt in 0..4_u64 {
-        let output = Command::new(binary)
-            .args(["admin", "--addr", &format!("127.0.0.1:{}", ports[0])])
-            .args(remove)
-            .args(["--operator-id", &operator.to_string(), "--sequence", "1"])
-            .output()
-            .expect("voter removal command");
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        if output.status.success() && stdout.contains("result=Applied") {
-            return stdout;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            for port in ports {
+                let output = Command::new(binary)
+                    .args(["admin", "--addr", &format!("127.0.0.1:{port}")])
+                    .args(remove)
+                    .args(["--operator-id", &operator.to_string(), "--sequence", "1"])
+                    .output()
+                    .expect("voter removal command");
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                if output.status.success() && stdout.contains("result=Applied") {
+                    return stdout;
+                }
+                last = format!(
+                    "port={port} status={} stdout={stdout} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
         }
-        last = format!(
-            "status={} stdout={stdout} stderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
         transfer_eventually(binary, ports, away_from, operator + 100 + attempt);
     }
     panic!(

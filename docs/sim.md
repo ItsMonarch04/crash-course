@@ -42,8 +42,9 @@ Raft WAL path, write and fsync are separate scheduled completions: the node
 defers its own subsequent inputs and cannot send a dependent vote, append
 response, or client reply until the delayed fsync succeeds. Zero clears the
 additional delay. This is distinct from the `DiskDegrade` one-shot EIO fault
-used in fault profiles; N3's file-backed store will consume the remaining
-operation categories.
+used in fault profiles. The current shared Driver uses read, write, fsync,
+rename, and directory-sync effects; hosts reject unused storage-effect
+variants instead of silently dropping them.
 
 Database-surface campaigns use dedicated profiles rather than relabelling
 `rough`. `batch` activates the replicated `ATOMIC_BATCH` feature after

@@ -1286,8 +1286,12 @@ impl DriverHost {
                 // Driver still owns timer generations, but a blocked I/O-free
                 // socket host need not create one OS thread per arm.
                 Effect::SetTimer { .. } | Effect::CancelTimer { .. } | Effect::Trace(_) => {}
-                unsupported => {
-                    eprintln!("unimplemented host effect: {unsupported:?}");
+                Effect::DiskTruncate { .. }
+                | Effect::DiskCreateTemp { .. }
+                | Effect::DiskDelete { .. } => {
+                    return Err(HostError::Node(NodeError::Environment(
+                        "unsupported real-host storage effect",
+                    )));
                 }
             }
         }
