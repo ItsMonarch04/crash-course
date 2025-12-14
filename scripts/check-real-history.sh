@@ -10,4 +10,4 @@ if [[ "${1:-}" != "--file" || -z "${2:-}" ]]; then
   echo "usage: $0 --file HISTORY.tsv" >&2
   exit 2
 fi
-cargo run --quiet -p cc-swarm -- check-history --file "$2"
+cargo run --locked --quiet -p cc-swarm -- check-history --file "$2"

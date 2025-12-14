@@ -4,7 +4,7 @@
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cargo run --quiet -p cc-detlint -- check \
+cargo run --locked --quiet -p cc-detlint -- check \
   "$root_dir/crates/cc-core" \
   "$root_dir/crates/cc-env" \
   "$root_dir/crates/cc-sim" \

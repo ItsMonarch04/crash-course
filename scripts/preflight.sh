@@ -24,7 +24,7 @@ node "$repo_root/scripts/ci/contrast-fixture.mjs"
 echo "[8/15] cargo fmt"
 cargo fmt --all -- --check
 echo "[9/15] cargo clippy"
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 echo "[10/15] test register"
 bash "$repo_root/scripts/ci/test-register.sh"
 echo "[11/15] kata feature matrix"
@@ -32,13 +32,13 @@ bash "$repo_root/scripts/ci/kata-matrix.sh"
 echo "[12/15] forbidden API scan"
 "$repo_root/scripts/ci/forbidden-grep.sh"
 echo "[13/15] tests"
-cargo test --workspace --all-targets
+cargo test --locked --workspace --all-targets
 echo "[14/15] determinism double-run"
 preflight_dir="$repo_root/target/preflight"
 mkdir -p "$preflight_dir"
-cargo run --quiet -p cc-swarm -- --determinism > "$preflight_dir/trace-1.cctrace"
-cargo run --quiet -p cc-swarm -- --determinism > "$preflight_dir/trace-2.cctrace"
+cargo run --locked --quiet -p cc-swarm -- --determinism > "$preflight_dir/trace-1.cctrace"
+cargo run --locked --quiet -p cc-swarm -- --determinism > "$preflight_dir/trace-2.cctrace"
 cmp "$preflight_dir/trace-1.cctrace" "$preflight_dir/trace-2.cctrace"
 echo "[15/15] deterministic self-check"
-cargo run --quiet -p cc-swarm -- --selfcheck
+cargo run --locked --quiet -p cc-swarm -- --selfcheck
 echo "preflight: PASS"

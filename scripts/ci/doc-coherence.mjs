@@ -5,8 +5,7 @@
 /**
  * Small, dependency-free documentation consistency check.  It intentionally
  * validates mechanical claims (local links, the ADR sequence, and the test
- * register shape); semantic claims remain a human gate and are recorded in
- * BUILDLOG outside the repository.
+ * register shape); semantic claims remain a review responsibility.
  */
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, extname, relative, resolve } from "node:path";

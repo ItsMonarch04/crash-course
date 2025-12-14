@@ -5,9 +5,9 @@
 ## Verification
 
 - [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `cargo clippy --locked --workspace --all-targets -- -D warnings`
 - [ ] `./scripts/ci/forbidden-grep.sh`
-- [ ] `cargo test --workspace --all-targets`
+- [ ] `cargo test --locked --workspace --all-targets`
 - [ ] `./scripts/preflight.sh`
 
 ## Correctness and compatibility
@@ -17,4 +17,3 @@
 - [ ] Persisted/wire layout and limits are documented.
 - [ ] Public rustdoc is updated.
 - [ ] Any benchmark number includes its environment and workload.
-
