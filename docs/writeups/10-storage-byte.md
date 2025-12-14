@@ -9,9 +9,9 @@ verified SST blocks, and reads cross `BlockSource` before a reply is released.
 The receipts are deliberately about boundaries, not type names:
 
 ```sh
-cargo test -p cc-store trap_file_backed_v2_boot_retains_only_metadata_and_reads_blocks
-cargo test -p cc-store trap_store_wal_replays_only_after_manifest_watermark
-cargo test -p cc-host trap_file_backed_scans_and_compaction_respect_open_file_cap
+cargo test --locked -p cc-store trap_file_backed_v2_boot_retains_only_metadata_and_reads_blocks
+cargo test --locked -p cc-store trap_store_wal_replays_only_after_manifest_watermark
+cargo test --locked -p cc-host trap_file_backed_scans_and_compaction_respect_open_file_cap
 ```
 
 The first test reboots from persisted v2 metadata and serves through block

@@ -20,8 +20,8 @@
 
 ```sh
 ./scripts/demo.sh
-cargo run -p cc-swarm -- one --seed 0x2a --profile rough --export-json
-cargo run -p cc-swarm -- sequence artifacts/0x000000000000002a.json \
+cargo run --locked -p cc-swarm -- one --seed 0x2a --profile rough --export-json
+cargo run --locked -p cc-swarm -- sequence artifacts/0x000000000000002a.json \
   --output artifacts/talk.svg
 ```
 

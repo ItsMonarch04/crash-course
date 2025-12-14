@@ -14,8 +14,8 @@ only the deterministic state-machine crates to the scanner:
 
 ```sh
 ./scripts/ci/forbidden-grep.sh
-cargo run -p cc-detlint -- double-run -- \
-  cargo run --quiet -p cc-swarm -- --determinism
+cargo run --locked -p cc-detlint -- double-run -- \
+  cargo run --locked --quiet -p cc-swarm -- --determinism
 ```
 
 The tool is intentionally syntactic. It is fast, auditable, and catches the

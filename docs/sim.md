@@ -8,10 +8,10 @@ artifact that can be replayed, shrunk, compared, or rendered.
 Useful authoring commands:
 
 ```sh
-cargo run -p cc-swarm -- one --seed 0x2a --profile rough --export-json
-cargo run -p cc-swarm -- diff artifacts/a.json artifacts/b.json
-cargo run -p cc-swarm -- sequence artifacts/42.json --output artifacts/42.svg
-cargo run -p cc-swarm -- search --profile brutal --iterations 1000
+cargo run --locked -p cc-swarm -- one --seed 0x2a --profile rough --export-json
+cargo run --locked -p cc-swarm -- diff artifacts/a.json artifacts/b.json
+cargo run --locked -p cc-swarm -- sequence artifacts/42.json --output artifacts/42.svg
+cargo run --locked -p cc-swarm -- search --profile brutal --iterations 1000
 ```
 
 To check a history captured outside the simulator — a real-host run, or a
