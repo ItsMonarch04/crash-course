@@ -1,9 +1,6 @@
 name: campaigns
 
-# This is the heaviest gate in the repository, and work lands directly on
-# `main` rather than through pull requests. A `pull_request`-only trigger
-# therefore never fires: the campaigns, the beacon assertions, and the
-# porcupine crosscheck would sit in the workflow list contributing nothing.
+# Run the bounded campaign suite for both proposed changes and mainline pushes.
 on:
   push:
     branches: [main]
@@ -23,6 +20,9 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: theater/.nvmrc
       - run: node scripts/check-version-coherence.mjs
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
@@ -31,9 +31,8 @@ jobs:
       - run: cargo run --locked -p cc-swarm -- --determinism-seeds 100
       - run: cargo run --locked -p cc-swarm -- run --profile calm --seeds 1000 --jobs 2
       - run: cargo run --locked -p cc-swarm -- run --profile rough --seeds 10000 --jobs 4
-      # Each profile asserts the state it exists to reach. Without these a
-      # profile can stop exercising its own headline behaviour and still report
-      # a clean campaign — which is exactly how `snapshot-install` stayed dark.
+      # Each profile asserts the state it exists to reach so a clean campaign
+      # cannot hide loss of its headline behavior.
       - run: cargo run --locked -p cc-swarm -- run --profile membership --seeds 10000 --jobs 4 --require-beacon membership-change
       - run: cargo run --locked -p cc-swarm -- run --profile wipe --seeds 2000 --jobs 4 --require-beacon snapshot-install
       - run: cargo run --locked -p cc-swarm -- run --profile brutal --seeds 2000 --jobs 4 --require-beacon disk-loss
@@ -41,12 +40,8 @@ jobs:
       - run: cargo run --locked -p cc-swarm -- run --profile follower-read --seeds 10000 --jobs 4
       - run: cargo run --locked -p cc-swarm -- run --profile follower-read-v2 --seeds 2000 --jobs 4
       - run: cargo run --locked -p cc-swarm -- run --profile stale-read --seeds 2000 --jobs 4
-      # Every remaining profile gets a run too. A selectable profile with no
-      # gate rots silently: `corruption` reached the point where every seed
-      # failed before recording a single event, and nothing noticed, because
-      # it was the one transport profile no workflow executed.
-      # `scripts/ci/campaign-coverage.mjs` fails if a new profile is added
-      # without a line here.
+      # Every selectable profile is gated. `campaign-coverage.mjs` fails if a
+      # new profile is added without a corresponding command here.
       - run: cargo run --locked -p cc-swarm -- run --profile gentle --seeds 2000 --jobs 4
       - run: cargo run --locked -p cc-swarm -- run --profile corruption --seeds 2000 --jobs 4 --require-beacon network-drop
       - run: cargo run --locked -p cc-swarm -- run --profile starve --seeds 2000 --jobs 4
@@ -61,8 +56,6 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
-      # The README's first "try this" command, run enough times to catch a
-      # race. It reached the point where roughly one run in three failed its
-      # journal replay and nothing noticed, because no workflow ran it.
+      # Repeat the README's first demo to exercise startup and replay races.
       - run: bash scripts/ci/repeat-demo.sh --runs 8
       - run: CC_MEMBERSHIP_RUNS=20 bash scripts/demo-membership.sh
