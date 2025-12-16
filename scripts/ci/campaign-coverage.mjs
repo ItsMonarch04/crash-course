@@ -5,12 +5,9 @@
 /**
  * Every fault profile must be run by the campaign workflow.
  *
- * A selectable profile with no gate rots without anyone noticing. `corruption`
- * reached the point where every seed aborted before recording a single event
- * and stayed that way across releases, because it was the one transport
- * profile no workflow executed. This check reads the profile set out of
- * `cc-sim` — the enum, its `ALL` table, and its `as_str` names — and fails if a
- * profile is missing from any of them or from `campaigns.yml`.
+ * This check reads the profile set out of `cc-sim` — the enum, its `ALL`
+ * table, and its `as_str` names — and fails if a profile is missing from any
+ * of them or from `campaigns.yml`.
  */
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";

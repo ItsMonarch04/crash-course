@@ -118,7 +118,7 @@ try {
     const original = readFileSync(copied, "utf8");
     const changed = `${original.slice(0, mutant.offset)}${mutant.to}${original.slice(mutant.offset + mutant.from.length)}`;
     writeFileSync(copied, changed);
-    const run = spawnSync("cargo", ["test", "--quiet", "-p", mutant.packageName], {
+    const run = spawnSync("cargo", ["test", "--locked", "--quiet", "-p", mutant.packageName], {
       cwd: sandbox,
       encoding: "utf8",
       env: { ...process.env, CARGO_TARGET_DIR: join(sandbox, "target") },

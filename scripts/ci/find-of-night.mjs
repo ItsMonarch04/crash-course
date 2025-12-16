@@ -20,10 +20,8 @@ if (existsSync(artifacts)) {
   for (const name of names) {
     try {
       const artifact = JSON.parse(readFileSync(resolve(artifacts, name), "utf8"));
-      // Name the reason, not just the fact. A trace-invariant or liveness
-      // failure can carry `verdict: "linearizable"`, and the summary used to
-      // print only the verdict — so the one finding of the night read as
-      // though nothing had gone wrong.
+      // Name the reason, not just the verdict: trace-invariant or liveness
+      // failures can coexist with a linearizable client history.
       const reasons = [];
       if (artifact.error) reasons.push(`runner error: ${artifact.error}`);
       if (artifact.trace_invariants_ok === false) reasons.push("trace invariants violated");
