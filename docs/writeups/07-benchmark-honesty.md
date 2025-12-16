@@ -14,13 +14,14 @@ comparison.
 ## The concurrency sweep, and what it does not show
 
 `scripts/ci/group-commit-curve.sh` runs the bench driver at 1, 2, 4, 8, and 16
-clients and appends one row per point to `bench/results/perf-trend.csv`. That
-file shipped with a header and no producer, so it read as a record of
-measurements nobody had taken; now it holds real ones.
+clients and appends one row per point to `bench/results/perf-trend.csv`. Every
+row carries its workload size, repetitions, seed, value size, operating system,
+architecture, model caveat, and configuration hash.
 
-The interesting result is a negative one. Across the ladder, median latency
-moves between roughly 40 ns and 130 ns with no monotonic trend, and throughput
-does not climb with concurrency. That is not a group-commit curve. It is what a
+The interesting result is a negative one. In the checked 2025-12-16 run,
+median latency moves between 91 ns and 126 ns with no monotonic trend, and
+throughput does not climb monotonically with concurrency. That is not a
+group-commit curve. It is what a
 closed-loop, in-process model looks like when the thing being measured is
 faster than the noise floor of measuring it: there is no socket, no scheduler
 contention, and no real `fsync` in the path, so added clients mostly add

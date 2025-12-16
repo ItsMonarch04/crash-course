@@ -8,9 +8,9 @@ state-machine model; it does not claim a real replicated-cluster number.
 Examples:
 
 ```sh
-cargo run --release -p cc-bench -- --workload A --clients 1 --ops 10000 \
+cargo run --locked --release -p cc-bench -- --workload A --clients 1 --ops 10000 \
   --output bench/results/local.json
-cargo run --release -p cc-bench -- repro bench/results/local.json
+cargo run --locked --release -p cc-bench -- repro bench/results/local.json
 ```
 
 `scripts/ci/group-commit-curve.sh` sweeps 1, 2, 4, 8, and 16 clients and appends
