@@ -4,6 +4,16 @@
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Every architectural check below asserts that a pattern is *absent*, spelled
+# `if rg ...; then fail`. A missing `rg` exits non-zero exactly like a clean
+# scan, so without this guard an environment without ripgrep would report a
+# passing perimeter having scanned nothing. Fail closed instead.
+command -v rg >/dev/null 2>&1 || {
+  echo "forbidden-grep: ripgrep (rg) is required; refusing to report a pass without scanning" >&2
+  exit 1
+}
+
 cargo run --locked --quiet -p cc-detlint -- check \
   "$root_dir/crates/cc-core" \
   "$root_dir/crates/cc-env" \

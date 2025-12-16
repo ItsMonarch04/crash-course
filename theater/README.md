@@ -21,6 +21,16 @@ checked-in `src/wasm/cc_wasm.{js,d.ts}` pair. The wasm binary and `dist/` stay
 ignored; CI regenerates the bridge and treats a JS/type-definition diff as a
 failure. Generated bridge files are never hand-edited.
 
+This is the only dependency tree in the repository that reaches a browser, so
+CI runs `npm audit --audit-level=high` against it as its own step. The exact
+install is reproduced by `package-lock.json` under `npm ci`; transitive
+versions therefore carry no second, hand-maintained pin list in
+`package.json`, because such a list pins security patches out as readily as it
+pins versions down. The two remaining `overrides` entries are not redundant
+with the lockfile: they hold the transitive `playwright`/`playwright-core` at
+the `@playwright/test` version, since a browser driver that disagrees with its
+test runner fails in ways that read as flaky tests.
+
 The published site is a GitHub Pages project page under `/crash-course/`, so
 `base` is `./` and every runtime fetch resolves against the document rather
 than the origin. `npm run dev` serves from the origin root, where the two are

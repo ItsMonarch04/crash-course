@@ -24,6 +24,12 @@ if [[ "$(head -n 1 "$manifest")" != "$expected_header" ]]; then
   echo "golden manifest has an invalid header" >&2
   exit 1
 fi
+# `rg` exits non-zero both for a clean scan and for a missing binary, so the
+# CRLF assertion below would silently pass without ripgrep installed.
+command -v rg >/dev/null 2>&1 || {
+  echo "golden manifest: ripgrep (rg) is required to check line endings" >&2
+  exit 1
+}
 if rg -n $'\r' "$manifest"; then
   echo "golden manifest must use LF line endings" >&2
   exit 1
