@@ -3,10 +3,8 @@
 # Copyright (c) 2025 Sidakpreet Singh
 set -euo pipefail
 
-# Runs after `build-wasm.sh` and `npm run build`, so both artifacts must exist.
-# An absent artifact is a build failure, not a budget to skip: the previous
-# version reported `PASS  bytes` with an empty measurement when the assets
-# directory was empty, which is a green gate over a site that shipped nothing.
+# Runs after `build-wasm.sh` and `npm run build`; both artifacts are mandatory
+# inputs to the size calculation.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 assets_dir="$repo_root/theater/dist/assets"
@@ -15,9 +13,7 @@ if [[ ! -d "$assets_dir" ]]; then
   exit 1
 fi
 
-# `cat | wc -c` sums exactly, with no `wc` total line to parse. The older
-# `xargs ... | tail -1` form read only the last xargs batch's total, so a
-# build split across enough chunk files would have under-reported the bundle.
+# `cat | wc -c` sums every matching chunk without relying on batched subtotals.
 bundle_bytes="$(find "$assets_dir" -type f \( -name '*.js' -o -name '*.css' \) -exec cat {} + | wc -c | tr -d ' ')"
 if (( bundle_bytes == 0 )); then
   echo "theater size budget: FAIL no .js or .css assets under $assets_dir" >&2

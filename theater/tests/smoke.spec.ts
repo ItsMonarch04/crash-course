@@ -110,11 +110,7 @@ test("hero scenario elects, survives a leader kill, and shares its run", async (
 	await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM", { timeout: 15_000 });
 });
 
-// Every control in the strip is supposed to reach the engine. These used to be
-// chrome: the cluster select had no handler and displayed a size the sim was
-// not running, the canvas toggled only between n1 and n2 so three of five nodes
-// were unreachable, the timeline's step buttons both merely paused, and the
-// skew/latency readouts were hardcoded regardless of what was injected.
+// Every control in the strip must reach the engine and report effective state.
 test("cluster size, node selection, stepping, and fault readouts are live", async ({ page }) => {
 	await page.goto("/");
 	await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM", { timeout: 15_000 });

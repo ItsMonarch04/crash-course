@@ -672,9 +672,7 @@ export default function App() {
 		return () => window.removeEventListener("keydown", onKeyDown);
 	}, [reducedMotion, wasmState, killLeader]);
 
-	// Step to the previous/next event marker. These buttons used to be labelled
-	// as step controls while both merely paused, which made the timeline look
-	// navigable when it was not.
+	// Step to the previous or next event marker in the visible timeline.
 	function stepToMarker(direction: -1 | 1) {
 		setPlaying(false);
 		const here = playing ? virtualTime : checkpoint;

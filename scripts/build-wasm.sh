@@ -11,7 +11,7 @@ command -v wasm-bindgen >/dev/null 2>&1 || {
   exit 2
 }
 
-cargo build --release -p cc-wasm --target wasm32-unknown-unknown
+cargo build --locked --release -p cc-wasm --target wasm32-unknown-unknown
 wasm_bindgen_dir="$repo_root/theater/public/wasm"
 mkdir -p "$wasm_bindgen_dir"
 wasm-bindgen \

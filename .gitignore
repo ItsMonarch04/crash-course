@@ -2,6 +2,11 @@
 .DS_Store
 *.cctrace
 *.log
+*.profraw
+.env
+.env.*
+!.env.example
+/coverage/
 theater/node_modules/
 theater/dist/
 theater/public/wasm/
