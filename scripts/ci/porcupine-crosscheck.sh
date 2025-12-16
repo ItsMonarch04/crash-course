@@ -13,7 +13,7 @@ trap cleanup EXIT INT TERM
 # Cross-validation only means something on histories the simulator actually
 # produced, so export real runs across several profiles rather than checking a
 # hand-written sample.
-cargo build --quiet --release -p cc-swarm
+cargo build --locked --quiet --release -p cc-swarm
 
 total_operations=0
 for spec in "0x0000000000000005:calm" "0x0000000000000071:membership" "0x00000000000000a3:rough"; do
@@ -71,8 +71,8 @@ if [[ "$total_operations" -lt 1 ]]; then
 fi
 
 if [[ -n "${PORCUPINE_COMMAND:-}" ]]; then
-  # I can point this gate at a pinned Porcupine binary in CI. Any disagreement
-  # between the two checkers is release-blocking for one of them.
+  # A configured pinned Porcupine command turns the shape check into an
+  # independent checker comparison; any disagreement fails the gate.
   for json in "$cross_dir"/*.json; do
     sh -c "$PORCUPINE_COMMAND '$json'"
   done

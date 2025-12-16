@@ -39,5 +39,5 @@ assert source["exhibits"] == served["exhibits"], (
 print(f"museum manifest: PASS exhibits={len(source['exhibits'])} copies=2")
 PY
 
-cargo run --quiet -p cc-swarm -- regress
+cargo run --locked --quiet -p cc-swarm -- regress
 echo "museum replay: PASS"

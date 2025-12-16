@@ -22,4 +22,4 @@ if (($#)); then
   echo "usage: $0 --file HISTORY.tsv [--output PORCUPINE.json]" >&2
   exit 2
 fi
-cargo run --quiet -p cc-swarm -- "${args[@]}"
+cargo run --locked --quiet -p cc-swarm -- "${args[@]}"

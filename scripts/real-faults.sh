@@ -103,7 +103,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cargo build --quiet -p cc-node --bin ccdb
+cargo build --locked --quiet -p cc-node --bin ccdb
 ccdb_bin="$repo_root/target/debug/ccdb"
 "$ccdb_bin" init --cluster faults --cluster-id 00112233445566778899aabbccddeeff --nodes 3 --base-dir "$fault_dir"
 
@@ -129,7 +129,7 @@ for name in sys.argv[1:]:
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
 PY
 
-cargo run --quiet -p cc-swarm -- proxy \
+cargo run --locked --quiet -p cc-swarm -- proxy \
   --listen 127.0.0.1:7379 \
   --upstream 127.0.0.1:7201 \
   --drop-every "$drop_every" \
@@ -336,7 +336,7 @@ for history in "$fault_dir"/history-*.tsv; do
   [[ -f "$history" ]] || continue
   count=$(awk 'NR > 1 { count++ } END { print count + 0 }' "$history")
   history_count=$((history_count + count))
-  cargo run --quiet -p cc-swarm -- check-history --file "$history"
+  cargo run --locked --quiet -p cc-swarm -- check-history --file "$history"
 done
 if (( history_count == 0 )); then
   echo "real-faults: no acknowledged operations recorded" >&2

@@ -7,6 +7,6 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
 mkdir -p bench/results
-cargo run --release -p cc-bench -- --workload A --clients 1 --ops 10000 --output bench/results/perf-smoke.json
+cargo run --locked --release -p cc-bench -- --workload A --clients 1 --ops 10000 --output bench/results/perf-smoke.json
 test -s bench/results/perf-smoke.json
 echo "perf-smoke: PASS"

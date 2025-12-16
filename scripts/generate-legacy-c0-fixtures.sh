@@ -40,7 +40,7 @@ ccdb="$legacy_root/target/debug/ccdb"
 mkdir -p "$out"
 (
   cd "$legacy_root"
-  cargo run --offline --quiet -p cc-swarm --example c0_legacy_fixtures -- --out "$out"
+  cargo run --offline --locked --quiet -p cc-swarm --example c0_legacy_fixtures -- --out "$out"
 )
 "$swarm" --determinism > "$out/cctr-v1.bin"
 "$swarm" one --seed 0x51 --profile calm --export-history "$out/cchy-v1.bin" >/dev/null

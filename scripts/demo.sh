@@ -23,7 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cargo build --quiet -p cc-node --bin ccdb -p cc-swarm --bin cc-swarm
+cargo build --locked --quiet -p cc-node --bin ccdb -p cc-swarm --bin cc-swarm
 ccdb_bin="$repo_root/target/debug/ccdb"
 swarm_bin="$repo_root/target/debug/cc-swarm"
 ccdb() {
