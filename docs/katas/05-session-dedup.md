@@ -3,8 +3,8 @@
 Build and run the exact detector:
 
 ```sh
-cargo test -p cc-cluster --features kata05 trap_kata_05_session_dedup_is_found_within_budget
-cargo run -p cc-swarm --features kata05 -- run --profile rough --seeds 1 --jobs 1 --ledger campaigns/kata-ledger.tsv --build kata05 --export-json
+cargo test --locked -p cc-cluster --features kata05 trap_kata_05_session_dedup_is_found_within_budget
+cargo run --locked -p cc-swarm --features kata05 -- run --profile rough --seeds 1 --jobs 1 --ledger campaigns/kata-ledger.tsv --build kata05 --export-json
 ```
 
 The fixed input is config hash `23b166788e01ba12`, seeds `0x0..0x1`. The

@@ -3,8 +3,8 @@
 Build and run the exact detector:
 
 ```sh
-cargo test -p cc-store --features kata04 trap_kata_04_tombstone_gc_is_found_within_budget
-cargo run -p cc-swarm --features kata04 -- run --profile rough --seeds 1 --jobs 1 --ledger campaigns/kata-ledger.tsv --build kata04 --export-json
+cargo test --locked -p cc-store --features kata04 trap_kata_04_tombstone_gc_is_found_within_budget
+cargo run --locked -p cc-swarm --features kata04 -- run --profile rough --seeds 1 --jobs 1 --ledger campaigns/kata-ledger.tsv --build kata04 --export-json
 ```
 
 The fixed input is config hash `23b166788e01ba12`, seeds `0x0..0x1`. The
