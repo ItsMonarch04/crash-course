@@ -1,4 +1,5 @@
-# Line-ending policy. Everything checks out as LF on every platform, so a
+# Line-ending policy — a correctness control here, not formatting hygiene.
+# Everything checks out as LF on every platform, so a
 # Windows clone cannot rewrite text files to CRLF. This repository depends on
 # exact bytes more than most: the determinism gate compares two `.cctrace`
 # runs with `cmp`, trace hashes are shown as proof in the theater, and the

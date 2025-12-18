@@ -4,7 +4,7 @@
 owns a directory below `corpus/`; `corpus/manifest.tsv` records the checked-in
 case hash, expected typed outcome, stable signature, and allocation budget.
 
-Replay one format with
+Replay a single format with
 `cargo run --locked -p cc-swarm -- fuzz --format <name> --iterations <n>`.
 Mutation selection is deterministic from `--seed`. CI never
 passes `--update-corpus`; that flag only proposes locally reviewable cases and

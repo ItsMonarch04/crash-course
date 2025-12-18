@@ -1,6 +1,7 @@
 # Benchmarks
 
-`cc-bench` is a deterministic, closed-loop local harness. It publishes the
+`cc-bench` is a deterministic, closed-loop local harness — not a benchmark claim
+against any other system. It publishes the
 workload, client count, value size, seed, environment, config hash, and
 integer latency percentiles in JSON. The current driver exercises the local
 state-machine model; it does not claim a real replicated-cluster number.

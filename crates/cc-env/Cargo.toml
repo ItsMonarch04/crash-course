@@ -12,4 +12,3 @@ cc-core = { path = "../cc-core" }
 
 [lints]
 workspace = true
-

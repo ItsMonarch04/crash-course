@@ -13,4 +13,3 @@ cc-store = { path = "../cc-store" }
 
 [lints]
 workspace = true
-

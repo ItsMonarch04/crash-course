@@ -1,3 +1,4 @@
+# Three-node local cluster for manual play. The determinism gate does not use it.
 x-cluster-environment: &cluster
   CCDB_PEERS: n1:7201,n2:7202,n3:7203
   CCDB_CLUSTER_ID: "00112233445566778899aabbccddeeff"

@@ -611,6 +611,7 @@ N1	NG1	cargo-lib	cc-wasm	trap_wasm_wraps_the_same_driver_backed_simcluster	Wasm 
 -	-	playwright	theater	built site loads its engine when served from a deployment subpath	The built bundle resolves every runtime fetch under a GitHub Pages project subpath, not the origin root	green
 -	-	playwright	theater	cluster size, node selection, stepping, and fault readouts are live	Cluster size, node selection, stepping, and fault readouts are live	green
 -	-	playwright	theater	contrast gate	Contrast gate	green
+-	-	playwright	theater	determinism proof matches a mid-run fault on a non-default cluster	Determinism proof matches a mid-run fault on a non-default cluster	green
 N9	NG9	playwright	theater	every control changes observable state	Every rendered theater control has a contract row and functional controls change observable state	green
 -	-	playwright	theater	guided lesson hands control back and embed mode is chromeless	Guided lesson hands control back and embed mode is chromeless	green
 -	-	playwright	theater	hero scenario elects, survives a leader kill, and shares its run	Hero scenario elects, survives a leader kill, and shares its run	green
@@ -622,5 +623,6 @@ N9	NG9	playwright	theater	every control changes observable state	Every rendered 
 -	-	playwright	theater	scrubbed trace matches uninterrupted trace	Scrubbed trace matches uninterrupted trace	green
 -	-	playwright	theater	text mirror reports role changes	Text mirror reports role changes	green
 N9	NG9	playwright	theater	timeline markers render without duplicate React keys	Timeline markers use stable trace-sequence keys and emit no duplicate-key console error	green
+-	-	playwright	theater	timeline markers scrub within the horizon instead of fail-stopping	Timeline markers scrub within the horizon instead of fail-stopping	green
 -	-	playwright	theater	wasm handles are freed on every error	Wasm handles are freed on every error	green
 -	-	playwright	theater	wasm state and trace pages obey the ABI byte cap	Wasm state and trace pages obey the ABI byte cap	green

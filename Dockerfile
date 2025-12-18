@@ -3,6 +3,7 @@
 # ships a different one. Pinning a version in this tag too would be decoration:
 # it would be overridden anyway, and could drift from the real pin.
 FROM rust:bookworm AS build
+# Multi-stage: the build toolchain never reaches the runtime image.
 WORKDIR /src
 COPY . .
 RUN cargo build --locked --release -p cc-node

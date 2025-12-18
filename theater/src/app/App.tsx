@@ -68,6 +68,10 @@ type FaultSpec = {
 	latency_ms?: number;
 	drop_percent?: number;
 };
+// The virtual time a fault landed is part of the run's identity: replaying the
+// same action at a different time is a different run, and the determinism
+// proof must rebuild this run, not a variant with every fault at time zero.
+type TimedFault = { at: number; spec: FaultSpec };
 type LessonName = "free" | "figure8" | "asymmetric" | "herd" | "snapshot";
 type MotionPreference = "system" | "on" | "off";
 
@@ -81,6 +85,7 @@ const SPEED_STEP_NS: Record<string, number> = {
 	"64×": 32_000_000_000,
 };
 const CHECKPOINT_INTERVAL_NS = 5_000_000_000;
+const HORIZON_NS = 60_000_000_000;
 
 function readTrace(module: WasmModule, handle: SimHandle): TraceFixture {
 	const events: TraceEvent[] = [];
@@ -195,17 +200,37 @@ function wasmNodes(state: WasmState | null): NodeState[] | null {
 	}));
 }
 
+// The values name the `.marker.*` styles in tokens.css; a kind that misses
+// its style renders as a near-invisible outline.
+const MARKER_KIND: Record<string, string> = {
+	RoleChange: "election",
+	Commit: "commit",
+	Fault: "fault",
+	SnapshotInstall: "snapshot",
+};
+
+// Markers share the playhead's fixed sixty-second scale. Normalizing to the
+// last captured event instead stretches a partial run across the whole track,
+// and clicking a stretched marker scrubs to a time the run never reached.
 function deriveMarkers(trace: TraceFixture | null): EventMarker[] {
 	if (!trace || trace.events.length === 0) return [];
-	const end = Math.max(...trace.events.map((event) => event.time_ns), 1);
 	return trace.events
-		.filter((event) => ["RoleChange", "Commit", "Fault", "SnapshotInstall"].includes(event.kind))
+		.filter((event) => event.kind in MARKER_KIND)
 		.map((event) => ({
 			seq: event.seq,
-			t: event.time_ns / end,
-			kind: event.kind.toLowerCase(),
+			t: event.time_ns / HORIZON_NS,
+			kind: MARKER_KIND[event.kind],
 			note: `${event.kind}${event.node === null ? "" : ` · n${event.node}`}`,
 		}));
+}
+
+// A target is reachable only from a retained checkpoint at most one interval
+// behind it. Fault injection deliberately discards earlier checkpoints, so
+// times before the earliest survivor cannot be re-executed and a scrub there
+// would trip the engine's fail-stop.
+function restorableFrom(checkpointTimes: number[], targetNs: number): boolean {
+	const nearest = Math.max(...checkpointTimes.filter((time) => time <= targetNs));
+	return Number.isFinite(nearest) && targetNs - nearest <= CHECKPOINT_INTERVAL_NS;
 }
 
 function seedFromUrl(): string {
@@ -383,7 +408,9 @@ export default function App() {
 	const [speed, setSpeed] = useState("1×");
 	const [seed, setSeed] = useState(seedFromUrl);
 	const [profile, setProfile] = useState(profileFromUrl);
-	const [faults, setFaults] = useState<FaultSpec[]>(faultsFromUrl);
+	const [faults, setFaults] = useState<TimedFault[]>(() =>
+		faultsFromUrl().map((spec) => ({ at: 0, spec })),
+	);
 	const [checkpoint, setCheckpoint] = useState(0.42);
 	const [shared, setShared] = useState(false);
 	const [determinism, setDeterminism] = useState<"idle" | "running" | "match" | "diverged">("idle");
@@ -438,6 +465,9 @@ export default function App() {
 	const maxScrubSeconds = wasmRuntime.current
 		? Math.min(60, ((checkpointTimes.at(-1) ?? 0) + CHECKPOINT_INTERVAL_NS) / 1_000_000_000)
 		: 0;
+	const minScrubSeconds = wasmRuntime.current
+		? Math.ceil((checkpointTimes[0] ?? 0) / 1_000_000_000)
+		: 0;
 
 	useEffect(() => {
 		const update = () => setEmbedded(embeddedFromUrl());
@@ -482,7 +512,9 @@ export default function App() {
 		let candidate: WasmRuntime | null = null;
 		disposeRuntime();
 		const sharedFaults = faultsFromUrl();
-		setFaults(sharedFaults);
+		// Shared faults are injected below on the fresh handle before it advances,
+		// so they land at virtual time zero by construction.
+		setFaults(sharedFaults.map((spec) => ({ at: 0, spec })));
 		setMuseumError("");
 		loadMuseum()
 			.then((loaded) => {
@@ -630,7 +662,7 @@ export default function App() {
 					runtime.checkpoints.delete(time);
 				}
 				runtime.checkpoints.set(state.virtual_time_ns, runtime.module.checkpoint(runtime.handle));
-				setFaults((current) => [...current, action]);
+				setFaults((current) => [...current, { at: state.virtual_time_ns, spec: action }]);
 				setWasmState(state);
 				setTrace(readTrace(runtime.module, runtime.handle));
 				setCheckpointTimes([...runtime.checkpoints.keys()]);
@@ -672,11 +704,17 @@ export default function App() {
 		return () => window.removeEventListener("keydown", onKeyDown);
 	}, [reducedMotion, wasmState, killLeader]);
 
-	// Step to the previous or next event marker in the visible timeline.
+	// Step to the previous or next event marker in the visible timeline. With a
+	// live engine only restorable stops are offered; stepping must never walk
+	// into the fail-stop that a scrub outside the replay horizon triggers.
 	function stepToMarker(direction: -1 | 1) {
 		setPlaying(false);
 		const here = playing ? virtualTime : checkpoint;
-		const stops = [0, ...markers.map((marker) => marker.t), 1].sort((left, right) => left - right);
+		const stops = [0, ...markers.map((marker) => marker.t), 1]
+			.filter(
+				(stop) => !wasmState || restorableFrom(checkpointTimes, Math.round(stop * HORIZON_NS)),
+			)
+			.sort((left, right) => left - right);
 		const epsilon = 1e-6;
 		const target =
 			direction === 1
@@ -731,7 +769,7 @@ export default function App() {
 		const query = new URLSearchParams({
 			seed,
 			profile,
-			run_spec: JSON.stringify({ seed, profile, faults }),
+			run_spec: JSON.stringify({ seed, profile, faults: faults.map((fault) => fault.spec) }),
 		});
 		const url = `${window.location.origin}${window.location.pathname}#${query.toString()}`;
 		window.history.replaceState({}, "", url);
@@ -759,12 +797,17 @@ export default function App() {
 		const traces: string[] = [];
 		const currentTrace = runtime.module.traceHash(runtime.handle);
 		for (let pass = 0; pass < 2; pass += 1) {
-			const handle = runtime.module.init(JSON.stringify({ seed, profile }));
+			// Rebuild this run, not a stand-in: the same cluster size, and every
+			// fault re-injected at the virtual time it originally landed. Omitting
+			// either replays a different run and reports a divergence that is the
+			// proof's own doing rather than the engine's.
+			const handle = runtime.module.init(JSON.stringify({ seed, profile, nodes: clusterSize }));
 			const passRuntime: WasmRuntime = { module: runtime.module, handle, checkpoints: new Map() };
 			try {
-				faults.forEach((action) => {
-					runtime.module.inject(handle, JSON.stringify(action));
-				});
+				for (const fault of faults) {
+					advanceWithCheckpoints(passRuntime, fault.at);
+					runtime.module.inject(handle, JSON.stringify(fault.spec));
+				}
 				advanceWithCheckpoints(passRuntime, targetNs);
 				traces.push(runtime.module.traceHash(handle));
 			} finally {
@@ -1236,13 +1279,16 @@ export default function App() {
 						data-control="timeline"
 						className="timeline-range"
 						type="range"
-						min="0"
+						min={minScrubSeconds}
 						max={maxScrubSeconds}
 						step="1"
 						aria-label="Timeline"
 						aria-valuemax={maxScrubSeconds}
 						aria-valuetext={`${Math.round((playing ? virtualTime : checkpoint) * 60)} virtual seconds`}
-						value={Math.min(maxScrubSeconds, Math.round((playing ? virtualTime : checkpoint) * 60))}
+						value={Math.min(
+							maxScrubSeconds,
+							Math.max(minScrubSeconds, Math.round((playing ? virtualTime : checkpoint) * 60)),
+						)}
 						onChange={(event) => scrubTo(Number(event.target.value) / 60)}
 					/>
 					{markers.map((marker) => (
@@ -1254,6 +1300,10 @@ export default function App() {
 							style={{ left: `${marker.t * 100}%` }}
 							aria-label={marker.note}
 							title={marker.note}
+							disabled={
+								wasmState !== null &&
+								!restorableFrom(checkpointTimes, Math.round(marker.t * HORIZON_NS))
+							}
 							onClick={() => scrubTo(marker.t)}
 						/>
 					))}

@@ -1,3 +1,4 @@
+# Recorded calibration for one machine. Regenerate rather than hand-edit.
 schema = 1
 name = "reference-local"
 environment_id = "0f71829da8f641a2"

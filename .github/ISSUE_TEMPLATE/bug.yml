@@ -22,4 +22,3 @@ body:
       label: Build or commit
     validations:
       required: true
-

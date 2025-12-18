@@ -2,7 +2,8 @@
 
 Crash Course is an educational lab tool, not a production database. The real
 listener intentionally has no authentication, authorization, or TLS and binds
-to loopback by default. Do not expose it to an untrusted network.
+to loopback by default. Do not expose it to an untrusted network — there is no
+configuration that makes doing so safe.
 
 ## Reporting a vulnerability
 

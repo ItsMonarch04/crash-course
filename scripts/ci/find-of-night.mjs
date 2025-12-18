@@ -63,9 +63,16 @@ if (shrunk.length > 0) {
   const { name, artifact, receipt } = shrunk[0];
   const seed = artifact.seed ?? artifact.run_spec?.seed;
   const profile = artifact.profile ?? artifact.run_spec?.profile ?? "rough";
-  const runSpec = encodeURIComponent(JSON.stringify(artifact.run_spec ?? { seed, profile, faults: [] }));
-  const url = `${baseUrl}#seed=${encodeURIComponent(seed)}&profile=${encodeURIComponent(profile)}&run_spec=${runSpec}`;
-  markdown = `## Find of the night\n\n[Replay ${name} in the theater](${url}) — ${artifact.find_reasons.join("; ")}, verdict=${artifact.verdict ?? "runner-error"}, events=${artifact.events ?? 0}, shrunk from ${receipt.canonical_actions} fault actions to ${receipt.shrunk_actions} and re-verified to still reproduce.\n`;
+  // Seed and profile only. The artifact's `run_spec` uses the simulator's
+  // canonical grammar (`at_ns` plus a typed action), which the theater's
+  // fault parser rejects — embedding it kills the engine on load. The theater
+  // rematerializes the profile's fault plan from the seed by itself.
+  const url = `${baseUrl}#seed=${encodeURIComponent(seed)}&profile=${encodeURIComponent(profile)}`;
+  // The verdict is appended only when the reasons do not already state it.
+  const verdictNote = artifact.find_reasons.some((reason) => reason.startsWith("verdict="))
+    ? ""
+    : `, verdict=${artifact.verdict ?? "runner-error"}`;
+  markdown = `## Find of the night\n\n[Replay ${name} in the theater](${url}) — ${artifact.find_reasons.join("; ")}${verdictNote}, events=${artifact.events ?? 0}, shrunk from ${receipt.canonical_actions} fault actions to ${receipt.shrunk_actions} and re-verified to still reproduce.\n`;
 }
 writeFileSync(output, markdown);
 process.stdout.write(markdown);

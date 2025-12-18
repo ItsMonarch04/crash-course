@@ -1,7 +1,8 @@
+# Ordered collections are a correctness requirement here, not a style preference:
+# core iteration order is part of the deterministic replay.
 disallowed-types = [
     { path = "std::collections::HashMap", reason = "core iteration must be ordered; use BTreeMap or Vec" },
     { path = "std::collections::HashSet", reason = "core iteration must be ordered; use BTreeSet or Vec" },
     { path = "std::time::SystemTime", reason = "ambient time is forbidden in deterministic code" },
     { path = "std::time::Instant", reason = "ambient time is forbidden in deterministic code" },
 ]
-

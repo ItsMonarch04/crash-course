@@ -1,6 +1,6 @@
 # Lab in a box
 
-Start the three-node real-host lab with:
+Start the three-node real-host lab with — loopback only, and not a production topology:
 
 ```sh
 docker compose up --build

@@ -1,3 +1,4 @@
+# Build output and local run state. Committed evidence lives under artifacts/ and exhibits/.
 /target/
 .DS_Store
 *.cctrace

@@ -13,4 +13,3 @@ cc-cluster = { path = "../cc-cluster" }
 
 [lints]
 workspace = true
-

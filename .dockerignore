@@ -1,3 +1,4 @@
+# The image builds from source only; local state and build output stay out of the context.
 .git
 target
 artifacts

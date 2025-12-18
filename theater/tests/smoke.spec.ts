@@ -393,3 +393,51 @@ test("responsive text mirror avoids two-dimensional page scrolling", async ({ pa
 		page: layout.viewport,
 	});
 });
+
+// The proof must rebuild *this* run. It used to re-initialize its passes with
+// the default cluster size and re-inject every fault at virtual time zero, so
+// a non-default cluster with a mid-run kill reported DIVERGED against a
+// perfectly deterministic engine.
+test("determinism proof matches a mid-run fault on a non-default cluster", async ({ page }) => {
+	await page.goto("/");
+	await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM", { timeout: 15_000 });
+	await page.getByLabel("Cluster size").selectOption("3");
+	await expect(page.locator("#topology-mirror tbody tr")).toHaveCount(3, { timeout: 15_000 });
+	await page.getByLabel("Speed").selectOption("16×");
+	await page.getByRole("button", { name: "PLAY", exact: true }).click();
+	await expect(page.getByTestId("leader-id")).not.toHaveText("none", { timeout: 15_000 });
+	await page.getByRole("button", { name: /KILL LEADER/ }).click();
+	await page.getByTestId("determinism-proof").click();
+	await expect(page.getByTestId("determinism-proof")).toContainText("MATCH", { timeout: 30_000 });
+});
+
+// Markers used to be normalized to the last captured event, which stretched a
+// partial run across the sixty-second track: clicking one scrubbed to a time
+// the run never reached and fail-stopped a healthy engine. Markers now sit at
+// their true times, and targets outside the replay horizon are disabled
+// controls rather than a fatal scrub.
+test("timeline markers scrub within the horizon instead of fail-stopping", async ({ page }) => {
+	await page.goto("/");
+	await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM", { timeout: 15_000 });
+	await page.getByLabel("Speed").selectOption("4×");
+	await page.getByRole("button", { name: "PLAY", exact: true }).click();
+	await expect(page.getByTestId("leader-id")).not.toHaveText("none", { timeout: 15_000 });
+	await page.getByRole("button", { name: "PAUSE", exact: true }).click();
+	await expect(page.getByTestId("leader-id")).not.toHaveText("none");
+	const enabledMarkers = page.locator('[data-control="timeline-marker"]:enabled');
+	await expect.poll(() => enabledMarkers.count(), { timeout: 15_000 }).toBeGreaterThan(0);
+	await enabledMarkers.last().click();
+	await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM");
+	// Next-event past the final marker must not scrub to the sixty-second mark
+	// the run has not reached.
+	await page.getByRole("button", { name: "Next event" }).click();
+	await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM");
+	await page.getByRole("button", { name: /KILL LEADER/ }).click();
+	// The injection drops earlier checkpoints; times before it are disabled.
+	await expect
+		.poll(() => page.locator('[data-control="timeline-marker"]:disabled').count(), {
+			timeout: 15_000,
+		})
+		.toBeGreaterThan(0);
+	await expect(page.getByTestId("engine-state")).toHaveText("LIVE SIM");
+});

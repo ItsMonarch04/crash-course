@@ -1,7 +1,7 @@
 # Crash Course
 
-Crash Course is a from-scratch distributed-database laboratory. The database
-is the excuse; the deterministic simulator, checker, and browser theater are
+Crash Course is a distributed-database laboratory. The database
+is the excuse; the deterministic simulator, checker and browser theater are
 the proof that the failure cases are understood.
 
 The project is deliberately honest about its status: it is an educational lab
@@ -10,15 +10,15 @@ claim.
 
 The consensus core is written as synchronous, host-independent state machines,
 and the same core runs in three places: inside the deterministic simulator,
-compiled to WebAssembly inside the browser theater, and behind the real
+compiled to WebAssembly inside the browser theater and behind the real
 `ccdb` socket/filesystem adapter. The real adapter drives `cc-host::Driver`,
-uses the same Raft message codec and durability continuations, and performs a
+uses the same Raft message codec and durability continuations and performs a
 checked peer hello before it accepts a peer frame. Remaining storage and
-snapshot limits — snapshot transfer resumes from byte zero, and CCBK restore
+snapshot limits — snapshot transfer resumes from byte zero and CCBK restore
 creates a fresh cluster identity — are spelled out in
 [limitations](docs/LIMITATIONS.md).
 
-![The browser theater running a five-node cluster, killing the leader, and
+![The browser theater running a five-node cluster, killing the leader and
 watching the survivors elect a new one without losing an acknowledged write.](theater/public/crash-course.gif)
 
 The animation above is generated, not staged: `./scripts/record-gif.sh` drives
@@ -26,7 +26,7 @@ the real theater with Playwright and encodes the captured frames.
 
 **[Open the theater →](https://itsmonarch04.github.io/crash-course/)** The same
 WebAssembly engine runs in your browser: resize the cluster, kill the leader,
-step the timeline, inject faults, and share the resulting run as a URL. No
+step the timeline, inject faults and share the resulting run as a URL. No
 toolchain required.
 
 ## Try the current workspace
@@ -42,24 +42,24 @@ cargo run --locked --release -p cc-bench -- --workload A --clients 1 --ops 10000
 The repository currently contains:
 
 - `ccdb`, a bounded RESP lab host that adapts the shared Raft driver to TCP,
-  CCHL/CCPF peer connections, a framed durable Raft WAL, leader redirects, and
+  CCHL/CCPF peer connections, a framed durable Raft WAL, leader redirects and
   fail-closed durable-write/fsync shims;
 - a deterministic simulator that drives real `cc-cluster::Node` instances
   only through `cc-host::Driver`,
   drives workload actors, captures client histories, checks invariants, runs
   campaigns, catches wiped nodes up through ordinary Raft replication without
   an out-of-band state copy, shrinks reproduced
-  failures, searches trace n-gram coverage, gates on reachability beacons, and
+  failures, searches trace n-gram coverage, gates on reachability beacons and
   explains first semantic trace divergence;
 - a bounded model checker that exhaustively explores the reachable `cc-raft`
-  state space within printed log, term, message, and depth bounds;
+  state space within printed log, term, message and depth bounds;
 - a persistent `wasm-bindgen` bridge and browser theater with a resizable
   cluster, live topology, node inspector, timeline stepping and scrubbing,
-  fault injection, verdict, and share-URL panels, guided lessons, embeddable
-  mode, and a clickable double-run trace proof; traces can also be exported as
+  fault injection, verdict and share-URL panels, guided lessons, embeddable
+  mode and a clickable double-run trace proof; traces can also be exported as
   standalone SVG sequence diagrams;
 - a Redis-shaped single-key RMW family, deep self-check and environment doctor,
-  Prometheus/dashboard endpoint, Rust fault proxy, and three-node Compose lab;
+  Prometheus/dashboard endpoint, Rust fault proxy and three-node Compose lab;
 - `cc-detlint`, the reusable zero-dependency determinism scanner and double-run
   harness;
 - an empty-by-default museum manifest that accepts only pinned real traces; and
@@ -67,7 +67,7 @@ The repository currently contains:
   and disclosed local-model benchmark reports.
 
 Correctness work comes before performance claims. Supported development targets
-are Linux x86_64, macOS arm64, and WebAssembly; Windows is not a supported CI
+are Linux x86_64, macOS arm64 and WebAssembly; Windows is not a supported CI
 target. The real listener is a lab tool and does not provide authentication,
 authorization, encryption, or TLS. See [limitations](docs/LIMITATIONS.md)
 before interpreting any result.
@@ -90,22 +90,22 @@ shows the machinery that catches it.
   [the flight recorder](docs/writeups/08-theater.md),
   [exporting the determinism perimeter](docs/writeups/09-determinism-lint.md),
   [the storage engine that finally wrote a byte](docs/writeups/10-storage-byte.md),
-  [record in production, replay in the simulator](docs/writeups/11-record-replay.md), and
+  [record in production, replay in the simulator](docs/writeups/11-record-replay.md) and
   [what the simulator does not know](docs/writeups/12-simulator-residuals.md)
 - [`docs/consistency.md`](docs/consistency.md) — what a successful write and a
-  leader read actually guarantee, and the ReadIndex fixture behind them
+  leader read actually guarantee and the ReadIndex fixture behind them
 - [`docs/sim.md`](docs/sim.md) — scenarios as data: seeds, profiles, fault
-  plans, and the replay/shrink/diff commands
+  plans and the replay/shrink/diff commands
 - [`docs/katas/`](docs/katas/) — five opt-in, mechanically synthetic teaching
   defects with fixed detectors and strict exclusion from production evidence
 - [`docs/formats.md`](docs/formats.md) — every persisted and wire format, with
-  magic values, versions, and bounds
+  magic values, versions and bounds
 - [`docs/compatibility.md`](docs/compatibility.md) — the current compatibility
   boundary and fixture-manifest contract
 - [`docs/calibration.md`](docs/calibration.md) — named simulator calibration
-  profiles, validation results, and residuals
+  profiles, validation results and residuals
 - [`docs/ops.md`](docs/ops.md) — running the real `ccdb` host: shared-driver
-  WAL layout, peer handshake, and current recovery limits
+  WAL layout, peer handshake and current recovery limits
 - [`docs/adr/`](docs/adr/) — numbered decisions, append-only
 - [`docs/talk-kit.md`](docs/talk-kit.md) — a fifteen-minute run of show
 - [`theater/README.md`](theater/README.md) — the browser theater
@@ -116,25 +116,12 @@ shows the machinery that catches it.
 
 ## Contributing
 
-See [the contribution guide](docs/contributing.md), the numbered decisions in
-[`docs/adr/`](docs/adr/), and the pull-request checklist. Every change needs
-tests and a clean local preflight. Persisted or wire-format changes require a
-versioned decision record.
+Issues and pull requests are welcome on [GitHub](https://github.com/ItsMonarch04/crash-course). Bug and feature templates are in place; see [the contribution guide](docs/contributing.md) and the numbered decisions in [`docs/adr/`](docs/adr/).
 
 ## License
 
-Copyright (c) 2025 Sidakpreet Singh.
-
-Crash Course is free software: you may redistribute it and modify it under the
-terms of the GNU Affero General Public License, **version 3 only** — not any
-later version. The complete license text is in [LICENSE](LICENSE); the SPDX
-identifier is `AGPL-3.0-only`.
-
-The Affero clause is the point rather than an accident. The browser theater is
-this project's main surface, and section 13 means anyone who serves a modified
-theater over a network owes its users the corresponding source. A fork that
-publishes an altered simulator as a website cannot keep those changes closed.
+AGPL-3.0-only © 2025 Sidakpreet Singh — see [LICENSE](LICENSE). Version 3 only, not any later version.
 
 ---
 
-**Version:** v0.17.0
+**Version:** v0.17.1

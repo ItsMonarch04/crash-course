@@ -22,4 +22,3 @@ unsafe_code = "forbid"
 all = { level = "warn", priority = -1 }
 # Host crate: reads real clocks and spawns real threads by design.
 disallowed_types = "allow"
-

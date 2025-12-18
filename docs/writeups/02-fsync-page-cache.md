@@ -29,4 +29,3 @@ The result is deliberately less magical than a production abstraction. The
 caller can ask which logical sequence is durable, and the simulator can place a
 crash between every physical step. That visibility is the feature: if a storage
 ordering is load-bearing, it should be named in code and exercised by a test.
-

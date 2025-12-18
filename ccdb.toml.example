@@ -1,3 +1,4 @@
+# Copy to ccdb.toml and edit. Every value has a documented default; none are secrets.
 [node]
 id = 1
 cluster_id = "00112233445566778899aabbccddeeff"

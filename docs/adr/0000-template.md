@@ -22,4 +22,3 @@ List the plausible alternatives and why they were not selected.
 ## Supersedes / superseded by
 
 Link the related numbered decision when this record changes an earlier one.
-

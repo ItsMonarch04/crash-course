@@ -43,4 +43,3 @@ predicts production nor supports extrapolation beyond the measured workload.
 Use `--disk-profile reference-local` only to replay this named model; it is
 included in canonical `RunSpec` bytes and therefore in ledger configuration
 hashes.
-

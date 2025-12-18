@@ -17,4 +17,3 @@ body:
       description: Mention determinism, compatibility, tests, and any needed ADR.
     validations:
       required: true
-

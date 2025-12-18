@@ -46,4 +46,3 @@ if (actualHash === expectedHash) {
 console.log(
   `golden mutation: PASS format=CCPL version=1 field=max_members before=${members} after=${members + 1}`,
 );
-
